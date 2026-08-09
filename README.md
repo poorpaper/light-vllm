@@ -76,11 +76,11 @@ catalog.models.register("my-model", my_model_factory)
 catalog.loaders.register("my-format", my_loader)
 ```
 
-已有名称默认不可覆盖；需要有意识地替换时才传 `replace=True`。完整边界与后续路线见
+已有名称默认不可覆盖；需要有意识地替换时才传 `replace=True`。架构图与运行时序见
+[`docs/design.md`](docs/design.md)，更细的边界规则见
 [`docs/architecture.md`](docs/architecture.md)。
 
 ## 当前非目标
 
 调度器、Paged KV Cache、定制 attention kernel、分布式执行和 API server 暂不进入首版。
 先让模型装载和一次 forward 的边界足够稳定，再逐层增加能力。
-
