@@ -15,10 +15,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+serve = [
+  "fastapi>=0.135",
+  "uvicorn>=0.35",
+]
 dev = [
+  "fastapi>=0.135",
+  "httpx2>=2.0",
   "pytest>=8.0",
   "ruff>=0.9",
 ]
+
+[project.scripts]
+light-vllm-serve = "light_vllm.entrypoints.http:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/light_vllm"]
