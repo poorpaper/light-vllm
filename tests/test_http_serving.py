@@ -1,0 +1,267 @@
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import suppress
+
+from fastapi.testclient import TestClient
+
+from light_vllm import (
+    GenerateRequest,
+    GenerateResult,
+    GenerationError,
+    GenerationEvent,
+    GenerationFinished,
+    GenerationNotReadyError,
+    ModelSpec,
+    TokenGenerated,
+)
+from light_vllm.entrypoints.http import create_serving_app
+from light_vllm.serving.http import MAX_PROMPT_TOKENS, _encoded_stream, create_http_app
+
+
+class StubEngineClient:
+    ready = True
+
+    async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
+        yield TokenGenerated(token_id=7, position=0)
+        yield GenerationFinished(finish_reason="length")
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        return GenerateResult(
+            input_ids=request.input_ids,
+            generated_token_ids=(7,),
+            finish_reason="length",
+        )
+
+
+class UnreadyEngineClient(StubEngineClient):
+    ready = False
+
+    async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
+        raise GenerationNotReadyError("not ready")
+        yield
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        raise GenerationNotReadyError("not ready")
+
+
+class FailingStreamEngineClient(StubEngineClient):
+    async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
+        yield TokenGenerated(token_id=7, position=0)
+        raise GenerationError("failed after the response started")
+
+
+class CloseTrackingAsyncIterator(AsyncIterator[GenerationEvent]):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __anext__(self) -> GenerationEvent:
+        return GenerationFinished(finish_reason="length")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class DisconnectTrackingEngineClient(StubEngineClient):
+    def __init__(self) -> None:
+        self.closed = False
+        self.release = asyncio.Event()
+
+    async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
+        try:
+            yield TokenGenerated(token_id=7, position=0)
+            await self.release.wait()
+        finally:
+            self.closed = True
+
+
+class FirstEventFailureIterator(AsyncIterator[GenerationEvent]):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __anext__(self) -> GenerationEvent:
+        raise GenerationError("failed before the response started")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FirstEventFailureEngineClient(StubEngineClient):
+    def __init__(self) -> None:
+        self.events = FirstEventFailureIterator()
+
+    def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
+        return self.events
+
+
+def test_http_adapter_exposes_health_and_non_streaming_generation() -> None:
+    client = TestClient(create_http_app(StubEngineClient()))
+
+    assert client.get("/healthz").json() == {"status": "ok"}
+    assert client.get("/readyz").json() == {"status": "ready"}
+
+    response = client.post("/generate", json={"input_ids": [1, 2], "max_new_tokens": 1})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "input_ids": [1, 2],
+        "generated_token_ids": [7],
+        "token_ids": [1, 2, 7],
+        "finish_reason": "length",
+    }
+
+
+def test_http_adapter_streams_generation_events_as_sse() -> None:
+    client = TestClient(create_http_app(StubEngineClient()))
+
+    response = client.post("/generate/stream", json={"input_ids": [1], "max_new_tokens": 1})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: token" in response.text
+    assert 'data: {"token_id":7,"position":0}' in response.text
+    assert "event: done" in response.text
+    assert 'data: {"finish_reason":"length"}' in response.text
+
+
+def test_stream_failure_after_first_event_is_encoded_in_the_stream() -> None:
+    client = TestClient(create_http_app(FailingStreamEngineClient()))
+
+    response = client.post("/generate/stream", json={"input_ids": [1]})
+
+    assert response.status_code == 200
+    assert "event: token" in response.text
+    assert "event: error" in response.text
+    assert '"code":"generation_failed"' in response.text
+
+
+def test_sse_bridge_closes_the_core_stream_when_cancelled() -> None:
+    events = CloseTrackingAsyncIterator()
+
+    async def cancel_after_first_event() -> None:
+        stream = _encoded_stream(TokenGenerated(token_id=7, position=0), events)
+        assert b"event: token" in await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(cancel_after_first_event())
+
+    assert events.closed
+
+
+def test_asgi_disconnect_closes_the_engine_stream() -> None:
+    async def disconnect_after_first_body() -> None:
+        engine = DisconnectTrackingEngineClient()
+        app = create_http_app(engine)
+        incoming: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        sent: list[dict[str, object]] = []
+        await incoming.put(
+            {
+                "type": "http.request",
+                "body": b'{"input_ids":[1],"max_new_tokens":2}',
+                "more_body": False,
+            }
+        )
+
+        async def receive() -> dict[str, object]:
+            return await incoming.get()
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+            if message["type"] == "http.response.body" and message.get("body"):
+                await incoming.put({"type": "http.disconnect"})
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/generate/stream",
+            "raw_path": b"/generate/stream",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "state": {},
+        }
+
+        app_task = asyncio.create_task(app(scope, receive, send))
+        try:
+            done, _ = await asyncio.wait({app_task}, timeout=1.0)
+            assert app_task in done
+            await app_task
+
+            assert engine.closed
+            assert any(message.get("status") == 200 for message in sent)
+            assert any(b"event: token" in message.get("body", b"") for message in sent)
+        finally:
+            # Keep failure paths cooperative so asyncio.run() never waits on
+            # an intentionally blocked test stream.
+            engine.release.set()
+            if not app_task.done():
+                app_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait_for(app_task, timeout=1.0)
+
+    asyncio.run(disconnect_after_first_body())
+
+
+def test_not_ready_is_mapped_before_a_response_or_stream_starts() -> None:
+    client = TestClient(create_http_app(UnreadyEngineClient()))
+
+    assert client.get("/readyz").status_code == 503
+    assert client.post("/generate", json={"input_ids": [1]}).status_code == 503
+    assert client.post("/generate/stream", json={"input_ids": [1]}).status_code == 503
+
+
+def test_stream_is_closed_when_the_first_event_fails() -> None:
+    engine = FirstEventFailureEngineClient()
+    client = TestClient(create_http_app(engine))
+
+    response = client.post("/generate/stream", json={"input_ids": [1]})
+
+    assert response.status_code == 500
+    assert engine.events.closed
+
+
+def test_http_request_validation_stays_in_the_adapter() -> None:
+    client = TestClient(create_http_app(StubEngineClient()))
+
+    response = client.post(
+        "/generate",
+        json={"input_ids": [], "max_new_tokens": 0, "unexpected": True},
+    )
+
+    assert response.status_code == 422
+
+
+def test_http_adapter_rejects_prompts_over_the_reference_limit() -> None:
+    client = TestClient(create_http_app(StubEngineClient()))
+
+    response = client.post(
+        "/generate",
+        json={"input_ids": [1] * (MAX_PROMPT_TOKENS + 1), "max_new_tokens": 1},
+    )
+
+    assert response.status_code == 422
+
+
+def test_tiny_model_serves_an_end_to_end_http_request() -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture="tiny-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4},
+        )
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/readyz").status_code == 200
+        response = client.post(
+            "/generate",
+            json={"input_ids": [1, 2], "max_new_tokens": 2},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["input_ids"] == [1, 2]
+    assert len(response.json()["generated_token_ids"]) == 2
+    assert len(response.json()["token_ids"]) == 4

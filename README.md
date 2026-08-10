@@ -23,10 +23,13 @@ ModelSpec
                                                v
                                         torch.nn.Module
                                                │
-ForwardBatch ─────────────────────────> ModelRunner.forward
-                                               │
-                                               v
-                                          ModelOutput
+HTTP / future RPC ──> EngineClient
+                          ├── InProcessEngineClient
+                          │       └── reference GenerationService ──> ModelRunner.forward
+                          └── future ProcessEngineClient ──> EngineCore / Scheduler
+
+EngineClient.stream ──> GenerationEvent
+EngineClient.generate ──> collect the same stream ──> GenerateResult
 ```
 
 首版包含：
@@ -36,6 +39,9 @@ ForwardBatch ──────────────────────�
 - `StateDictModelLoader`：从本地 PyTorch state dict 加载权重。
 - `ModelRunner`：统一执行入口；新模型加载成功后原子替换旧模型。
 - `Catalog` / `Registry`：显式扩展点，避免在核心路径增加类型判断。
+- `GreedyGenerationService`：以 token event stream 为唯一路径的最小生成参考实现。
+- `InProcessEngineClient`：把同步 reference 实现适配为稳定的异步 serving 端口。
+- FastAPI adapter：协议外层的 JSON/SSE 接口，只依赖 `EngineClient`。
 
 ## 快速开始
 
@@ -67,6 +73,40 @@ output = runner.forward(ForwardBatch(input_ids=torch.tensor([[1, 2, 3]])))
 print(output.logits.shape)  # torch.Size([1, 3, 128])
 ```
 
+## HTTP 服务
+
+HTTP 是可选 adapter，不会成为核心运行时依赖：
+
+```bash
+python -m pip install -e ".[serve]"
+light-vllm-serve \
+  --architecture tiny-causal-lm \
+  --model-args '{"vocab_size": 128, "hidden_size": 32}'
+```
+
+当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
+
+```bash
+curl -X POST http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"input_ids":[1,2,3],"max_new_tokens":4}'
+```
+
+流式生成把同一生成事件编码为 SSE：
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/generate/stream \
+  -H "Content-Type: application/json" \
+  -d '{"input_ids":[1,2,3],"max_new_tokens":4}'
+```
+
+另有 `GET /healthz` 与 `GET /readyz`。模型在应用 lifespan 中加载完成后，readiness 才返回成功。
+
+reference HTTP adapter 当前最多接受 4096 个输入 token，`max_new_tokens` 也最多为 4096。进程内
+reference engine 仍然一次只执行一个完整请求；并发请求在 event loop 中等待准入，不占用推理线程。
+每个被接纳的请求使用一个专属单线程执行器，保证同步 stream 的创建、推进和关闭都发生在同一线程。
+流式客户端断开时会关闭 engine stream，并在当前同步 token step 安全结束后释放执行槽位。
+
 ## 扩展方式
 
 第三方能力只需实现契约并注册：
@@ -82,5 +122,8 @@ catalog.loaders.register("my-format", my_loader)
 
 ## 当前非目标
 
-调度器、Paged KV Cache、定制 attention kernel、分布式执行和 API server 暂不进入首版。
-先让模型装载和一次 forward 的边界足够稳定，再逐层增加能力。
+当前 HTTP 是验证分层的参考纵切，不是生产级 vLLM serving。Tokenizer、文本 prompt、sampling、
+Scheduler、Paged KV Cache、continuous batching、定制 attention kernel、分布式执行和 OpenAI-compatible
+API 仍是后续能力。多进程实现将新增 `EngineClient` 实现，而不改 HTTP。性能 Guardian 也只会在
+Scheduler 与指标边界稳定后，以有界控制面的形式加入。它们都不应把条件分支塞进 runner 或
+transport adapter。

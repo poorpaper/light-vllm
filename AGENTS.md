@@ -18,16 +18,21 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 
 ## 当前阶段
 
-当前只完成 P0 model path：
+当前完成 P0 model path，并增加了一条最小的 request/serving 参考纵切：
 
 - `ModelSpec` 描述待加载模型。
 - `Catalog` / `Registry` 选择 model factory 与 loader。
 - `ModelLoader` 构造模型、加载权重并准备推理。
 - `ModelRunner` 管理当前模型并提供统一 `forward`。
 - `TinyCausalLM` 提供 `Embedding → Linear → logits` 的最小参考实现。
+- `GenerateRequest` / `GenerateResult` / `GenerationEvent` 定义协议无关的生成边界。
+- `GreedyGenerationService` 以同步 token event stream 作为唯一生成路径。
+- `InProcessEngineClient` 把同步参考实现适配到异步 serving 端口。
+- FastAPI adapter 提供 JSON 与 SSE 两种 HTTP 表达，但只依赖 `EngineClient`。
 
-Scheduler、KV cache、Paged Attention、prefill/decode 拆分、分布式执行和 serving
-尚未实现。不要让这些未来能力提前污染当前契约。
+这条纵切用于验证分层，不代表完整 P1-P5 已完成。Scheduler、KV cache、Paged Attention、
+prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine 和生产级 serving 尚未实现。
+不要让这些未来能力提前污染当前契约。
 
 ## 代码地图
 
@@ -40,7 +45,14 @@ Scheduler、KV cache、Paged Attention、prefill/decode 拆分、分布式执行
 | `src/light_vllm/loaders/torch.py` | 基础 PyTorch 模型加载器 |
 | `src/light_vllm/models/tiny.py` | 最小参考模型 |
 | `src/light_vllm/runner.py` | 模型生命周期与统一 forward |
+| `src/light_vllm/generation/reference.py` | 协议无关、可直接对比的参考生成服务 |
+| `src/light_vllm/engine/client.py` | serving 使用的异步 Engine 端口与进程内适配器 |
+| `src/light_vllm/serving/http.py` | FastAPI JSON/SSE adapter |
+| `src/light_vllm/entrypoints/http.py` | runtime、engine client 与 HTTP 的装配入口 |
 | `tests/test_minimal_forward.py` | 当前核心契约的行为测试 |
+| `tests/test_generation.py` | 生成事件流与收集语义测试 |
+| `tests/test_engine_client.py` | sync-to-async、收集与取消清理测试 |
+| `tests/test_http_serving.py` | HTTP adapter 与端到端测试 |
 
 ## 必须保持的架构不变量
 
@@ -53,6 +65,16 @@ Scheduler、KV cache、Paged Attention、prefill/decode 拆分、分布式执行
 7. 所有模型接受 `ForwardBatch`，返回 `ModelOutput`。
 8. loader 负责把模型移动到目标 device/dtype 并切换到 `eval()`。
 9. 注册同名组件默认报错；只有调用方显式传入 `replace=True` 才能覆盖。
+10. transport adapter 只依赖异步 `EngineClient`；不得直接依赖 generation service、runner、torch
+    或具体模型。
+11. `stream` 是每个边界的唯一执行路径；同步/异步 `generate` 必须收集各自的同一事件流，不能复制
+    token 生成循环。
+12. HTTP/RPC schema、状态码和 wire format 不得进入核心生成契约。
+13. 流在取消、关闭和异常时必须释放执行资源；首事件后的错误由 adapter 编码到流中。
+14. `InProcessEngineClient` 只做 sync-to-async 适配，不承担 scheduling；未来进程 client 必须保持
+    `EngineClient` 语义。
+15. `InProcessEngineClient` 必须在进入 worker thread 前异步串行化请求；等待者不得在线程池中阻塞于
+    reference service 的同步执行锁。
 
 ## Runner 中锁的准确含义
 
@@ -70,6 +92,14 @@ Scheduler、KV cache、Paged Attention、prefill/decode 拆分、分布式执行
 当前使用 `RLock` 只是实现选择，架构并不依赖可重入语义。若修改这一处，可以换成普通
 `Lock`，但必须继续满足上面的临界区和失败回滚测试。
 
+`GreedyGenerationService` 还有一个独立的执行锁。它只为当前无 scheduler 的参考实现串行化完整生成，
+并在 stream 关闭时释放；它不是 runner 生命周期锁，也不是未来调度器或 CUDA stream 管理器。
+
+`InProcessEngineClient` 在 event loop 中还有一个异步准入锁。它保持相同的单请求执行语义，但确保并发
+等待者不占用 worker thread。被接纳的 stream 使用专属单线程执行器，同步 stream 的创建、`next()` 和
+`close()` 固定在同一线程；取消会先等待正在执行的同步步骤到达安全边界，再关闭 iterator。慢客户端
+仍会占用当前 reference 执行槽；这是无 scheduler 基线的明确限制。
+
 ## Registry 与 Contracts 的边界
 
 `Registry[T]` 是显式路由表：将稳定名字映射到某一类组件。当前有两张表：
@@ -82,8 +112,13 @@ Registry 不是完整依赖注入容器，也不负责自动发现 Python packag
 
 `contracts.py` 定义模块之间允许交换的稳定形状：
 
-- 数据：`ModelSpec`、`ForwardBatch`、`ModelOutput`；
-- 行为：`ModelFactory`、`ModelLoader` Protocol。
+- 数据：`ModelSpec`、`ForwardBatch`、`ModelOutput`、`GenerateRequest`、`GenerateResult`、
+  `GenerationEvent`；
+- 行为：`ModelFactory`、`ModelLoader`、`GenerationService` Protocol。
+
+`EngineClient` 放在 `engine/client.py`，因为它是 serving 到 engine 的应用端口，而不是模型与生成实现之间
+交换的数据契约。当前 `InProcessEngineClient` 包装同步 `GenerationService`；未来 IPC client 应实现同一
+端口，不能要求 HTTP/RPC adapter 理解进程拓扑。
 
 Protocol 主要服务于静态类型和可读性，并不会自动做完整运行时校验。必要的边界校验应放在数据
 契约或真正消费该契约的位置，避免散落在具体实现中。
@@ -104,13 +139,20 @@ Protocol 主要服务于静态类型和可读性，并不会自动做完整运�
 3. 注册新 loader 名称；不要在 runner 中增加格式判断。
 4. 覆盖成功加载、无效配置和加载失败不影响当前模型的测试。
 
+新增 serving 协议：
+
+1. 只消费 `EngineClient`，把协议输入转换成 `GenerateRequest`。
+2. 把 `GenerateResult` 或 `GenerationEvent` 编码成协议自己的 wire format。
+3. 在 adapter 内映射领域错误、取消和流结束语义。
+4. 在 composition root 装配 adapter；不要修改生成服务或 `ModelRunner`。
+
 ## 开发与验证
 
 Windows PowerShell：
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,serve]"
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\ruff.exe check .
 .\.venv\Scripts\ruff.exe format --check .
@@ -121,6 +163,8 @@ python -m venv .venv
 
 ## 下一步建议
 
-优先设计 P1 request path：不可变 Request、Scheduler 接口和执行批次契约。先让请求如何进入批次、
-批次如何交给 runner 变得清楚，再引入 KV cache 与 prefill/decode 优化。
-
+优先继续 P1 request path：在现有不可变生成契约之后增加 Scheduler 接口和执行批次契约。
+Scheduler 应作为新的 Engine 实现接入，而不改变 reference baseline 或 HTTP/RPC adapter。先让请求如何
+进入批次、批次如何交给 runner 变得清楚，再引入 KV cache 与 prefill/decode 优化。性能 Guardian 只能
+在指标、Scheduler 参数所有权和安全更新点明确后加入；它通过控制端口提交有界决策，不得直接修改
+运行时内部状态或进入 token 热路径。
