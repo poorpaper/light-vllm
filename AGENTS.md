@@ -26,9 +26,11 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `ModelRunner` 管理当前模型并提供统一 `forward`。
 - `TinyCausalLM` 提供 `Embedding → Linear → logits` 的最小参考实现。
 - `GenerateRequest` / `GenerateResult` / `GenerationEvent` 定义协议无关的生成边界。
-- `GreedyGenerationService` 以同步 token event stream 作为唯一生成路径。
+- `GreedyTokenExecutor` 负责准备 PyTorch 输入、检查模型输出并选择最高分 token。
+- `ReferenceGenerationService` 只编排 token、停止条件和同步事件流。
 - `InProcessEngineClient` 把同步参考实现适配到异步 serving 端口。
 - FastAPI adapter 提供 JSON 与 SSE 两种 HTTP 表达，但只依赖 `EngineClient`。
+- 稳定接口按功能域放在各自的 `api.py`；具体实现放在同域的其他模块。
 
 这条纵切用于验证分层，不代表完整 P1-P5 已完成。Scheduler、KV cache、Paged Attention、
 prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine 和生产级 serving 尚未实现。
@@ -38,15 +40,20 @@ prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine �
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/light_vllm/contracts.py` | 稳定的数据契约和组件 Protocol |
+| `src/light_vllm/models/api.py` | 模型配置、张量契约、factory 与 forward 接口 |
+| `src/light_vllm/loaders/api.py` | 权重加载器接口 |
+| `src/light_vllm/generation/api.py` | 生成数据契约与同步生成接口 |
+| `src/light_vllm/execution/api.py` | token 执行接口与执行异常 |
+| `src/light_vllm/engine/api.py` | serving 使用的异步 Engine 接口 |
 | `src/light_vllm/registry.py` | 通用的名字到组件映射 |
 | `src/light_vllm/catalog.py` | 持有 model/loader 两类扩展点 |
 | `src/light_vllm/bootstrap.py` | 内置组件的唯一装配位置 |
 | `src/light_vllm/loaders/torch.py` | 基础 PyTorch 模型加载器 |
 | `src/light_vllm/models/tiny.py` | 最小参考模型 |
 | `src/light_vllm/runner.py` | 模型生命周期与统一 forward |
+| `src/light_vllm/execution/local.py` | 本地 PyTorch 输入准备、输出检查与贪心选 token |
 | `src/light_vllm/generation/reference.py` | 协议无关、可直接对比的参考生成服务 |
-| `src/light_vllm/engine/client.py` | serving 使用的异步 Engine 端口与进程内适配器 |
+| `src/light_vllm/engine/in_process.py` | 同步生成到异步 Engine 的进程内适配器 |
 | `src/light_vllm/serving/http.py` | FastAPI JSON/SSE adapter |
 | `src/light_vllm/entrypoints/http.py` | runtime、engine client 与 HTTP 的装配入口 |
 | `tests/test_minimal_forward.py` | 当前核心契约的行为测试 |
@@ -65,16 +72,18 @@ prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine �
 7. 所有模型接受 `ForwardBatch`，返回 `ModelOutput`。
 8. loader 负责把模型移动到目标 device/dtype 并切换到 `eval()`。
 9. 注册同名组件默认报错；只有调用方显式传入 `replace=True` 才能覆盖。
-10. transport adapter 只依赖异步 `EngineClient`；不得直接依赖 generation service、runner、torch
+10. `ReferenceGenerationService` 只依赖 `TokenExecutor`；不得直接依赖 runner、torch、具体模型或 device。
+11. transport adapter 只依赖异步 `EngineClient`；不得直接依赖 generation service、runner、torch
     或具体模型。
-11. `stream` 是每个边界的唯一执行路径；同步/异步 `generate` 必须收集各自的同一事件流，不能复制
+12. `stream` 是每个边界的唯一执行路径；同步/异步 `generate` 必须收集各自的同一事件流，不能复制
     token 生成循环。
-12. HTTP/RPC schema、状态码和 wire format 不得进入核心生成契约。
-13. 流在取消、关闭和异常时必须释放执行资源；首事件后的错误由 adapter 编码到流中。
-14. `InProcessEngineClient` 只做 sync-to-async 适配，不承担 scheduling；未来进程 client 必须保持
+13. HTTP/RPC schema、状态码和 wire format 不得进入核心生成契约。
+14. 流在取消、关闭和异常时必须释放执行资源；首事件后的错误由 adapter 编码到流中。
+15. `InProcessEngineClient` 只做 sync-to-async 适配，不承担 scheduling；未来进程 client 必须保持
     `EngineClient` 语义。
-15. `InProcessEngineClient` 必须在进入 worker thread 前异步串行化请求；等待者不得在线程池中阻塞于
+16. `InProcessEngineClient` 必须在进入 worker thread 前异步串行化请求；等待者不得在线程池中阻塞于
     reference service 的同步执行锁。
+17. 内部代码必须从所属功能域的 `api.py` 导入稳定接口；需要具体实现时直接导入对应实现模块。
 
 ## Runner 中锁的准确含义
 
@@ -92,7 +101,7 @@ prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine �
 当前使用 `RLock` 只是实现选择，架构并不依赖可重入语义。若修改这一处，可以换成普通
 `Lock`，但必须继续满足上面的临界区和失败回滚测试。
 
-`GreedyGenerationService` 还有一个独立的执行锁。它只为当前无 scheduler 的参考实现串行化完整生成，
+`ReferenceGenerationService` 还有一个独立的执行锁。它只为当前无 scheduler 的参考实现串行化完整生成，
 并在 stream 关闭时释放；它不是 runner 生命周期锁，也不是未来调度器或 CUDA stream 管理器。
 
 `InProcessEngineClient` 在 event loop 中还有一个异步准入锁。它保持相同的单请求执行语义，但确保并发
@@ -100,7 +109,7 @@ prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine �
 `close()` 固定在同一线程；取消会先等待正在执行的同步步骤到达安全边界，再关闭 iterator。慢客户端
 仍会占用当前 reference 执行槽；这是无 scheduler 基线的明确限制。
 
-## Registry 与 Contracts 的边界
+## Registry 与 API 的边界
 
 `Registry[T]` 是显式路由表：将稳定名字映射到某一类组件。当前有两张表：
 
@@ -110,17 +119,19 @@ prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine �
 Registry 不是完整依赖注入容器，也不负责自动发现 Python package entry point。自动插件发现如需
 加入，应作为 Catalog 之上的独立装配能力实现。
 
-`contracts.py` 定义模块之间允许交换的稳定形状：
+稳定 API 按功能域就近定义：
 
-- 数据：`ModelSpec`、`ForwardBatch`、`ModelOutput`、`GenerateRequest`、`GenerateResult`、
-  `GenerationEvent`；
-- 行为：`ModelFactory`、`ModelLoader`、`GenerationService` Protocol。
+- `models/api.py`：`ModelSpec`、`ForwardBatch`、`ModelOutput`、`ModelFactory`、`ModelForwarder`；
+- `loaders/api.py`：`ModelLoader`；
+- `execution/api.py`：`TokenExecutor` 以及执行异常；
+- `generation/api.py`：生成请求、结果、事件和 `GenerationService`；
+- `engine/api.py`：serving 到 engine 的异步 `EngineClient`。
 
-`EngineClient` 放在 `engine/client.py`，因为它是 serving 到 engine 的应用端口，而不是模型与生成实现之间
-交换的数据契约。当前 `InProcessEngineClient` 包装同步 `GenerationService`；未来 IPC client 应实现同一
-端口，不能要求 HTTP/RPC adapter 理解进程拓扑。
+`api.py` 描述该功能域对外承诺的数据和行为，具体实现放在同域的其他模块。当前
+`InProcessEngineClient` 包装同步 `GenerationService`；未来 IPC client 应实现同一端口，不能要求
+HTTP/RPC adapter 理解进程拓扑。
 
-Protocol 主要服务于静态类型和可读性，并不会自动做完整运行时校验。必要的边界校验应放在数据
+`Protocol` 是 Python 中表达行为接口的方式，主要服务于静态类型和可读性，并不会自动做完整运行时校验。必要的边界校验应放在数据
 契约或真正消费该契约的位置，避免散落在具体实现中。
 
 ## 新增扩展的方式
@@ -163,7 +174,8 @@ python -m venv .venv
 
 ## 下一步建议
 
-优先继续 P1 request path：在现有不可变生成契约之后增加 Scheduler 接口和执行批次契约。
+优先继续 P1 request path：在现有不可变生成契约之后增加 Scheduler 接口和执行批次契约。当前
+`TokenExecutor` 只服务于无 scheduler 的单请求参考路径，不应直接扩张成未来批处理接口。
 Scheduler 应作为新的 Engine 实现接入，而不改变 reference baseline 或 HTTP/RPC adapter。先让请求如何
 进入批次、批次如何交给 runner 变得清楚，再引入 KV cache 与 prefill/decode 优化。性能 Guardian 只能
 在指标、Scheduler 参数所有权和安全更新点明确后加入；它通过控制端口提交有界决策，不得直接修改

@@ -3,11 +3,11 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from light_vllm.contracts import ModelFactory, ModelSpec
+from light_vllm.models.api import ModelFactory, ModelSpec
 
 
 class ModelLoadError(RuntimeError):
-    """Raised when a loader cannot materialize a valid model."""
+    """模型加载失败时抛出。"""
 
 
 def _prepare_for_inference(model: nn.Module, spec: ModelSpec) -> nn.Module:
@@ -15,14 +15,14 @@ def _prepare_for_inference(model: nn.Module, spec: ModelSpec) -> nn.Module:
 
 
 class InitModelLoader:
-    """Construct a model from its factory without reading a checkpoint."""
+    """创建新模型，不读取权重文件。"""
 
     def load(self, spec: ModelSpec, factory: ModelFactory) -> nn.Module:
         return _prepare_for_inference(factory(spec), spec)
 
 
 class StateDictModelLoader:
-    """Load a trusted local PyTorch state dict into a registered model."""
+    """从可信的本地 PyTorch 权重文件加载模型。"""
 
     def __init__(self, *, strict: bool = True) -> None:
         self._strict = strict

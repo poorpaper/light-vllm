@@ -1,4 +1,4 @@
-# light-vllm 架构设计（v0.3）
+# light-vllm 架构设计（v0.4）
 
 这份文档描述 light-vllm 当前已经落地的最小架构，以及后续功能应该沿着哪些边界继续生长。
 
@@ -6,10 +6,11 @@
 
 > **稳定核心只负责编排契约；变化能力通过注册组件接入。**
 
-![light-vllm P0 模型路径总览](assets/architecture-overview.svg)
+![light-vllm 整体架构](assets/light-vllm-overall-architecture.svg)
 
-静态文件：[SVG 矢量图](assets/architecture-overview.svg) ·
-[PNG 预览图](assets/architecture-overview.png)
+可编辑源文件：[Draw.io](assets/light-vllm-overall-architecture.drawio) ·
+[SVG 矢量图](assets/light-vllm-overall-architecture.svg) ·
+[PNG 预览图](assets/light-vllm-overall-architecture.png)
 
 ## 1. 设计目标
 
@@ -27,97 +28,76 @@
 
 ```mermaid
 flowchart TB
-    subgraph PublicAPI["① 公开契约层"]
-        Spec["ModelSpec<br/>模型架构 / loader / 权重 / 设备"]
-        Batch["ForwardBatch<br/>input_ids"]
-        Output["ModelOutput<br/>logits"]
-        Request["GenerateRequest"]
-        Event["GenerationEvent"]
-        Result["GenerateResult"]
+    subgraph API["① 各功能域的稳定 API"]
+        ModelAPI["models/api.py<br/>ModelSpec · ForwardBatch · ModelForwarder"]
+        LoaderAPI["loaders/api.py<br/>ModelLoader"]
+        ExecutionAPI["execution/api.py<br/>TokenExecutor"]
+        GenerationAPI["generation/api.py<br/>GenerationService · events"]
+        EngineAPI["engine/api.py<br/>EngineClient"]
     end
 
-    subgraph Runtime["② 稳定运行时核心"]
-        Runner["ModelRunner<br/>模型生命周期 + 统一 forward"]
-        Service["GenerationService<br/>generate + stream"]
+    subgraph Implementations["② 当前实现"]
+        InProcess["InProcessEngineClient<br/>同步流转异步流"]
+        GreedyService["ReferenceGenerationService<br/>token 编排 · 停止条件 · 事件"]
+        GreedyExecutor["GreedyTokenExecutor<br/>准备 Tensor · 检查输出 · argmax"]
+        Runner["ModelRunner<br/>模型生命周期 + forward"]
+        Tiny["TinyCausalLM<br/>模型计算"]
     end
 
-    subgraph EngineBoundary["③ Engine 调用边界"]
-        Client["EngineClient<br/>async stream + collect"]
-        LocalClient["InProcessEngineClient"]
-        ProcessClient["Future ProcessEngineClient"]
-        FutureCore["Future EngineCore / Scheduler"]
-        Client --> LocalClient
-        Client -.future.-> ProcessClient
-        ProcessClient -.IPC.-> FutureCore
-    end
-
-    subgraph Extension["④ 扩展与路由层"]
+    subgraph Extension["③ 注册与加载"]
         Catalog["Catalog"]
         ModelRegistry["Registry&lt;ModelFactory&gt;"]
         LoaderRegistry["Registry&lt;ModelLoader&gt;"]
-        Catalog --> ModelRegistry
-        Catalog --> LoaderRegistry
+        TorchLoaders["Init / StateDict loaders"]
     end
 
-    subgraph Implementations["⑤ 可替换实现层"]
-        Factory["ModelFactory"]
-        Loader["ModelLoader"]
-        Tiny["TinyCausalLM"]
-        Init["InitModelLoader"]
-        StateDict["StateDictModelLoader"]
-        Greedy["GreedyGenerationService"]
-        ThirdParty["第三方 Model / Loader"]
-        Factory --> Tiny
-        Loader --> Init
-        Loader --> StateDict
-        ModelRegistry -.注册.-> ThirdParty
-        LoaderRegistry -.注册.-> ThirdParty
-    end
-
-    subgraph Execution["⑥ PyTorch 执行层"]
-        Model["Active torch.nn.Module"]
-    end
-
-    subgraph Serving["⑦ 协议适配层"]
-        HTTP["FastAPI adapter<br/>JSON + SSE"]
+    subgraph Serving["④ 协议与装配"]
+        HTTP["FastAPI adapter"]
+        Composition["HTTP composition root"]
         RPC["Future RPC adapter"]
     end
 
-    Spec -->|load| Runner
-    Runner -->|按名字查找| Catalog
-    ModelRegistry --> Factory
-    LoaderRegistry --> Loader
-    Factory -->|构造| Model
-    Loader -->|装载权重并准备推理| Model
-    Batch -->|forward| Runner
-    Runner -->|调用当前模型| Model
-    Model --> Output
-    HTTP -->|调用统一端口| Client
-    RPC -.同级扩展.-> Client
-    Request --> Client
-    LocalClient -->|包装同步实现| Service
-    Request --> Service
-    Greedy -.实现.-> Service
-    Greedy -->|逐 token forward| Runner
-    Greedy --> Event
-    Event -->|collect| Result
+    HTTP --> EngineAPI
+    RPC -.同级扩展.-> EngineAPI
+    InProcess -.实现.-> EngineAPI
+    InProcess --> GenerationAPI
+    GreedyService -.实现.-> GenerationAPI
+    GreedyService --> ExecutionAPI
+    GreedyExecutor -.实现.-> ExecutionAPI
+    GreedyExecutor --> ModelAPI
+    Runner -.实现 ModelForwarder.-> ModelAPI
+    GreedyExecutor --> Runner
+    Runner --> Tiny
+
+    Composition --> InProcess
+    Composition --> GreedyService
+    Composition --> GreedyExecutor
+    Composition --> Runner
+
+    Runner --> Catalog
+    Catalog --> ModelRegistry
+    Catalog --> LoaderRegistry
+    ModelRegistry --> Tiny
+    LoaderRegistry --> TorchLoaders
+    TorchLoaders -.实现.-> LoaderAPI
 
     classDef contract fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e;
     classDef core fill:#ede9fe,stroke:#7c3aed,color:#4c1d95;
     classDef registry fill:#dcfce7,stroke:#16a34a,color:#14532d;
     classDef impl fill:#fef3c7,stroke:#d97706,color:#78350f;
-    classDef execution fill:#fee2e2,stroke:#dc2626,color:#7f1d1d;
-    class Spec,Batch,Output,Request,Event,Result contract;
-    class Runner,Service,Client,LocalClient,ProcessClient,FutureCore core;
+    class ModelAPI,LoaderAPI,ExecutionAPI,GenerationAPI,EngineAPI contract;
+    class InProcess,GreedyService,GreedyExecutor,Runner core;
     class Catalog,ModelRegistry,LoaderRegistry registry;
-    class Factory,Loader,Tiny,Init,StateDict,Greedy,ThirdParty impl;
-    class Model execution;
-    class HTTP,RPC registry;
+    class Tiny,TorchLoaders impl;
+    class HTTP,RPC,Composition registry;
 ```
 
-最关键的依赖方向是：`ModelRunner` 依赖 `ModelLoader` 和 `ModelFactory` 契约，不依赖具体的 Tiny、Llama、Safetensors 或量化实现。
-协议 adapter 则只依赖异步 `EngineClient`，不依赖同步 reference service、`ModelRunner`、torch、具体模型
-或未来进程拓扑。
+稳定接口不再集中在一个全局文件，而是由 `models`、`loaders`、`execution`、`generation` 和 `engine`
+分别在自己的 `api.py` 中维护。实现依赖本域或下游域的 API，不依赖其他具体实现。
+
+当前最关键的执行边界是：`ReferenceGenerationService` 只依赖 `TokenExecutor`，不再导入 torch、device、
+`ModelRunner` 或模型输出。`GreedyTokenExecutor` 负责本地 PyTorch 输入准备、输出检查和贪心选择；协议
+adapter 仍只依赖异步 `EngineClient`。
 
 ## 3. 模型加载时序
 
@@ -240,13 +220,18 @@ elif spec.loader == "state-dict":
 
 | 架构角色 | 当前文件 |
 | --- | --- |
-| 公开数据契约 | `src/light_vllm/contracts.py` |
+| 模型 API | `src/light_vllm/models/api.py` |
+| loader API | `src/light_vllm/loaders/api.py` |
+| 执行 API | `src/light_vllm/execution/api.py` |
+| 生成 API | `src/light_vllm/generation/api.py` |
+| Engine API | `src/light_vllm/engine/api.py` |
 | 通用注册表 | `src/light_vllm/registry.py` |
 | 模型与 loader 目录 | `src/light_vllm/catalog.py` |
 | 内置组件装配 | `src/light_vllm/bootstrap.py` |
 | 模型生命周期和 forward | `src/light_vllm/runner.py` |
+| 本地 PyTorch 贪心执行 | `src/light_vllm/execution/local.py` |
 | 协议无关的参考生成 | `src/light_vllm/generation/reference.py` |
-| 异步 Engine 端口与进程内实现 | `src/light_vllm/engine/client.py` |
+| 进程内 Engine 实现 | `src/light_vllm/engine/in_process.py` |
 | FastAPI JSON/SSE adapter | `src/light_vllm/serving/http.py` |
 | runtime/engine/transport 装配与 CLI | `src/light_vllm/entrypoints/http.py` |
 | 基础 loader | `src/light_vllm/loaders/torch.py` |
@@ -269,17 +254,28 @@ flowchart LR
     class P1,P2,P3,P4,P5 next;
 ```
 
-当前 HTTP 能力是一条用于验证边界的参考纵切，不是绕过 P1-P3 的生产 serving。下一步应在既有
-`GenerateRequest` 之后定义 Scheduler 和执行批次，让后续 KV cache 与 prefill/decode 优化有清晰挂载点。
+当前 HTTP 能力是一条用于验证边界的参考纵切，不是绕过 P1-P3 的生产 serving。当前 `TokenExecutor`
+只描述单请求逐 token 的参考路径；下一步应在既有 `GenerateRequest` 之后单独定义 Scheduler 和执行批次，
+让后续 KV cache 与 prefill/decode 优化有清晰挂载点。
 
 ## 9. 生成与协议边界
 
+![light-vllm HTTP serving 架构](assets/http-serving-architecture.svg)
+
+静态文件：[SVG 矢量图](assets/http-serving-architecture.svg) ·
+[PNG 预览图](assets/http-serving-architecture.png)
+
 ```mermaid
 flowchart LR
-    Request["GenerateRequest"] --> SyncStream["GenerationService.stream<br/>sync reference"]
-    SyncStream --> Local["InProcessEngineClient.stream<br/>async bridge"]
-    Local --> Token["TokenGenerated × N"]
-    Local --> Done["GenerationFinished"]
+    Request["GenerateRequest"] --> Local["InProcessEngineClient<br/>async bridge"]
+    Local --> SyncStream["ReferenceGenerationService<br/>token 与停止条件"]
+    SyncStream --> Executor["TokenExecutor<br/>next_token"]
+    Executor --> Runner["ModelRunner<br/>forward"]
+    Runner --> Model["Active Model"]
+    Model -.logits.-> Executor
+    Executor -.token_id.-> SyncStream
+    SyncStream --> Token["TokenGenerated × N"]
+    SyncStream --> Done["GenerationFinished"]
     Token --> Collect["collect"]
     Done --> Collect
     Collect --> Result["GenerateResult"]
@@ -307,9 +303,11 @@ generator 内部跨 `yield` 持有的执行锁，每个等待请求都会占用�
 单线程执行器，同步 stream 的创建、`next()` 和 `close()` 固定在同一线程。取消先等待当前同步步骤
 结束，再关闭 iterator，因此不会让后台 `next()` 与清理并发执行。
 
-当前 `GreedyGenerationService` 每次把完整 token 序列重新交给 runner，并用独立执行锁串行化生成。
-这是 CPU 可测试的清晰参考实现，不承诺 KV cache、continuous batching 或高并发吞吐；未来 scheduler
-可以作为新的 Engine 实现接入 `EngineClient`，不必把异步调度强塞进同步 reference 契约。
+当前 `ReferenceGenerationService` 每次把完整 token 序列交给 `TokenExecutor`，并用独立执行锁串行化生成。
+它只维护 token、EOS/长度停止条件和事件，不接触 torch、device、runner 或 logits。当前
+`GreedyTokenExecutor` 会重新构造完整 Tensor，调用 runner、检查 logits 并执行 argmax。这是 CPU 可测试的
+清晰参考实现，不承诺 KV cache、continuous batching 或高并发吞吐；未来 scheduler 可以作为新的 Engine
+实现接入 `EngineClient`，不必把异步调度强塞进同步 reference 契约。
 
 ## 10. EngineClient 与进程演进
 
@@ -319,11 +317,14 @@ generator 内部跨 `yield` 持有的执行锁，每个等待请求都会占用�
 flowchart LR
     HTTP["FastAPI adapter"] --> Client["EngineClient"]
     Client --> Local["InProcessEngineClient"]
-    Local --> Reference["GreedyGenerationService"]
-    Reference --> Runner["ModelRunner"]
+    Local --> Reference["ReferenceGenerationService"]
+    Reference --> Executor["TokenExecutor"]
+    Executor --> LocalExecutor["GreedyTokenExecutor"]
+    LocalExecutor --> Runner["ModelRunner"]
+    Runner --> Model["Active Model"]
 ```
 
-这次拆分固定的是调用方向，不是提前实现分布式。`GreedyGenerationService` 仍可以被离线代码直接调用，
+这次拆分固定的是调用方向，不是提前实现分布式。`ReferenceGenerationService` 仍可以被离线代码直接调用，
 因此它既是教学实现也是后续 pipeline/scheduled generation 的性能和语义 baseline。
 
 当前 HTTP reference 对输入和输出 token 数各设置 4096 的 adapter 安全上限。它不是模型 context-length

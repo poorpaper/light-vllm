@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from light_vllm.contracts import ModelFactory, ModelLoader
+from light_vllm.loaders.api import ModelLoader
+from light_vllm.models.api import ModelFactory
 from light_vllm.registry import Registry
 
 
@@ -13,7 +14,7 @@ class Plugin(Protocol):
 
 @dataclass(slots=True)
 class Catalog:
-    """Owns the extension points for one runtime instance."""
+    """保存当前运行时可用的模型和加载器。"""
 
     models: Registry[ModelFactory] = field(default_factory=lambda: Registry("model"))
     loaders: Registry[ModelLoader] = field(default_factory=lambda: Registry("loader"))

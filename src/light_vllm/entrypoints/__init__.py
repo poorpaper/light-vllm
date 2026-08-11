@@ -1,1 +1,1 @@
-"""Executable composition roots."""
+"""创建并启动各种服务的入口。"""

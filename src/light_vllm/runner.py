@@ -6,15 +6,11 @@ import torch
 from torch import nn
 
 from light_vllm.catalog import Catalog
-from light_vllm.contracts import ForwardBatch, ModelOutput, ModelSpec
-
-
-class ModelNotLoadedError(RuntimeError):
-    """Raised when execution is requested before a model is installed."""
+from light_vllm.models.api import ForwardBatch, ModelNotLoadedError, ModelOutput, ModelSpec
 
 
 class ModelRunner:
-    """Owns one active model and exposes the runtime's uniform forward call."""
+    """管理当前模型，并提供统一的推理入口。"""
 
     def __init__(self, catalog: Catalog) -> None:
         self._catalog = catalog

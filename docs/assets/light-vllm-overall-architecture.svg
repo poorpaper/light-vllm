@@ -1,0 +1,193 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title description">
+  <title id="title">light-vllm 整体架构</title>
+  <desc id="description">展示 transport、engine、generation、execution、model runtime 五个域，以及模型加载和扩展路径。</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#17233C" flood-opacity="0.10" />
+    </filter>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#4C78FF" />
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#7656D6" />
+    </marker>
+    <marker id="arrow-amber" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#C68A13" />
+    </marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#D25B4E" />
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#35A873" />
+    </marker>
+    <style>
+      text { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+      .title { fill: #17233C; font-size: 30px; font-weight: 700; }
+      .subtitle { fill: #667085; font-size: 13px; }
+      .lane-title { font-size: 12px; font-weight: 700; letter-spacing: 2px; }
+      .api { font-size: 12px; font-weight: 600; }
+      .card-title { font-size: 17px; font-weight: 700; }
+      .card-subtitle { fill: #667085; font-size: 12px; }
+      .small-title { font-size: 14px; font-weight: 700; }
+      .small-copy { fill: #667085; font-size: 11px; }
+      .edge-label { fill: #475467; font-size: 10.5px; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1120" fill="#F6F8FC" />
+  <text x="55" y="61" class="title">light-vllm 整体架构</text>
+  <text x="57" y="92" class="subtitle">当前参考纵切 · 稳定 API 按域就近定义 · 变化能力通过注册组件接入</text>
+
+  <g>
+    <rect x="1370" y="50" width="105" height="30" rx="15" fill="#DBEAFE" stroke="#4C78FF" />
+    <text x="1422.5" y="69" text-anchor="middle" class="api" fill="#2446A8">稳定 API</text>
+    <rect x="1490" y="50" width="105" height="30" rx="9" fill="#FFFFFF" stroke="#98A2B3" />
+    <text x="1542.5" y="69" text-anchor="middle" class="api" fill="#344054">当前实现</text>
+    <rect x="1610" y="50" width="105" height="30" rx="9" fill="#FFFFFF" stroke="#98A2B3" stroke-dasharray="5 5" />
+    <text x="1662.5" y="69" text-anchor="middle" font-size="12" fill="#667085">未来能力</text>
+  </g>
+
+  <rect x="50" y="130" width="260" height="490" rx="12" fill="#FFFFFF" stroke="#D8DEE9" />
+  <rect x="330" y="130" width="310" height="490" rx="12" fill="#F8FBFF" stroke="#BDD3FF" />
+  <rect x="660" y="130" width="310" height="490" rx="12" fill="#FBF9FF" stroke="#D6C7FA" />
+  <rect x="990" y="130" width="310" height="490" rx="12" fill="#FFFCF5" stroke="#F2D58A" />
+  <rect x="1320" y="130" width="430" height="490" rx="12" fill="#FFF9F8" stroke="#F2C8C2" />
+
+  <text x="75" y="168" class="lane-title" fill="#667085">TRANSPORT</text>
+  <text x="355" y="168" class="lane-title" fill="#4C78FF">ENGINE</text>
+  <text x="685" y="168" class="lane-title" fill="#7656D6">GENERATION</text>
+  <text x="1015" y="168" class="lane-title" fill="#C68A13">EXECUTION</text>
+  <text x="1345" y="168" class="lane-title" fill="#D25B4E">MODEL RUNTIME</text>
+
+  <g>
+    <rect x="75" y="195" width="210" height="42" rx="21" fill="#EEF2F6" stroke="#CBD5E1" />
+    <text x="180" y="221" text-anchor="middle" font-size="12" fill="#475467">HTTP / RPC schema</text>
+    <rect x="355" y="195" width="260" height="42" rx="21" fill="#DBEAFE" stroke="#4C78FF" />
+    <text x="485" y="221" text-anchor="middle" class="api" fill="#2446A8">engine/api.py · EngineClient</text>
+    <rect x="685" y="195" width="260" height="42" rx="21" fill="#EDE9FE" stroke="#7656D6" />
+    <text x="815" y="221" text-anchor="middle" class="api" fill="#5535B0">generation/api.py · events</text>
+    <rect x="1015" y="195" width="260" height="42" rx="21" fill="#FEF3C7" stroke="#D6A229" />
+    <text x="1145" y="221" text-anchor="middle" class="api" fill="#8A5B00">execution/api.py · TokenExecutor</text>
+    <rect x="1345" y="195" width="380" height="42" rx="21" fill="#FEE2E2" stroke="#D96B5F" />
+    <text x="1535" y="221" text-anchor="middle" class="api" fill="#A63B31">models/api.py · ModelSpec · ForwardBatch · ModelOutput</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="75" y="300" width="210" height="116" rx="14" fill="#FFFFFF" stroke="#98A2B3" stroke-width="2" />
+    <rect x="355" y="300" width="260" height="116" rx="14" fill="#FFFFFF" stroke="#4C78FF" stroke-width="2" />
+    <rect x="685" y="300" width="260" height="116" rx="14" fill="#FFFFFF" stroke="#7656D6" stroke-width="2" />
+    <rect x="1015" y="300" width="260" height="116" rx="14" fill="#FFFFFF" stroke="#D6A229" stroke-width="2" />
+    <rect x="1345" y="300" width="175" height="116" rx="14" fill="#FFFFFF" stroke="#D96B5F" stroke-width="2" />
+    <rect x="1550" y="300" width="175" height="116" rx="14" fill="#FFF4F2" stroke="#D96B5F" stroke-width="2" />
+  </g>
+  <text x="180" y="347" text-anchor="middle" class="card-title" fill="#263247">FastAPI Adapter</text>
+  <text x="180" y="377" text-anchor="middle" class="card-subtitle">JSON · SSE · status</text>
+  <text x="485" y="347" text-anchor="middle" class="card-title" fill="#2446A8">InProcessEngineClient</text>
+  <text x="485" y="377" text-anchor="middle" class="card-subtitle">sync → async · cancellation</text>
+  <text x="815" y="347" text-anchor="middle" class="card-title" fill="#5535B0">ReferenceGenerationService</text>
+  <text x="815" y="377" text-anchor="middle" class="card-subtitle">token 编排 · EOS / length · stream</text>
+  <text x="1145" y="347" text-anchor="middle" class="card-title" fill="#8A5B00">GreedyTokenExecutor</text>
+  <text x="1145" y="377" text-anchor="middle" class="card-subtitle">Tensor · output check · argmax</text>
+  <text x="1432.5" y="347" text-anchor="middle" class="card-title" fill="#A63B31">ModelRunner</text>
+  <text x="1432.5" y="377" text-anchor="middle" class="card-subtitle">lifecycle · forward</text>
+  <text x="1637.5" y="347" text-anchor="middle" class="card-title" fill="#A63B31">TinyCausalLM</text>
+  <text x="1637.5" y="377" text-anchor="middle" class="card-subtitle">Embedding → Linear</text>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+    <path d="M285 358 H355" stroke="#4C78FF" marker-end="url(#arrow-blue)" />
+    <path d="M615 358 H685" stroke="#7656D6" marker-end="url(#arrow-purple)" />
+    <path d="M945 358 H1015" stroke="#C68A13" marker-end="url(#arrow-amber)" />
+    <path d="M1275 358 H1345" stroke="#D25B4E" marker-end="url(#arrow-red)" />
+    <path d="M1520 358 H1550" stroke="#D25B4E" marker-end="url(#arrow-red)" />
+  </g>
+  <text x="320" y="343" text-anchor="middle" class="edge-label">GenerateRequest</text>
+  <text x="650" y="343" text-anchor="middle" class="edge-label">sync events</text>
+  <text x="980" y="343" text-anchor="middle" class="edge-label">next_token</text>
+  <text x="1310" y="332" text-anchor="middle" class="edge-label">ForwardBatch</text>
+  <text x="1310" y="346" text-anchor="middle" class="edge-label">ModelOutput</text>
+  <text x="1535" y="343" text-anchor="middle" class="edge-label">call</text>
+
+  <g>
+    <rect x="75" y="480" width="210" height="78" rx="12" fill="#FFFFFF" stroke="#98A2B3" stroke-dasharray="5 5" />
+    <text x="180" y="511" text-anchor="middle" font-size="13" font-weight="700" fill="#475467">Future RPC Adapter</text>
+    <text x="180" y="535" text-anchor="middle" class="small-copy">同一 EngineClient</text>
+    <rect x="355" y="480" width="260" height="78" rx="12" fill="#F8FBFF" stroke="#4C78FF" stroke-dasharray="5 5" />
+    <text x="485" y="511" text-anchor="middle" font-size="13" font-weight="700" fill="#2446A8">Scheduled Engine · future</text>
+    <text x="485" y="535" text-anchor="middle" class="small-copy">Scheduler · batches · KV cache</text>
+    <rect x="1445" y="480" width="280" height="78" rx="12" fill="#FFF9F8" stroke="#D96B5F" stroke-dasharray="5 5" />
+    <text x="1585" y="511" text-anchor="middle" font-size="13" font-weight="700" fill="#A63B31">Future Model Plugin</text>
+    <text x="1585" y="535" text-anchor="middle" class="small-copy">Llama · Qwen · …</text>
+    <rect x="685" y="530" width="590" height="36" rx="18" fill="#F2F4F7" />
+    <text x="980" y="553" text-anchor="middle" font-size="12" fill="#475467">输出语义：TokenGenerated × N  →  GenerationFinished  →  GenerateResult / SSE</text>
+  </g>
+
+  <rect x="50" y="660" width="1700" height="405" rx="12" fill="#FFFFFF" stroke="#C7D7CF" />
+  <text x="75" y="698" class="lane-title" fill="#287A5B">MODEL LOADING &amp; EXTENSION</text>
+  <text x="75" y="726" font-size="12" fill="#667085">候选模型在锁外完整构造；成功后才原子替换当前引用</text>
+  <rect x="1425" y="682" width="280" height="38" rx="19" fill="#DCFCE7" stroke="#35A873" />
+  <text x="1565" y="706" text-anchor="middle" class="api" fill="#176B4B">loaders/api.py · ModelLoader</text>
+
+  <g>
+    <rect x="80" y="805" width="160" height="90" rx="12" fill="#F0F7FF" stroke="#4C78FF" stroke-width="1.5" />
+    <text x="160" y="839" text-anchor="middle" class="small-title" fill="#2446A8">ModelSpec</text>
+    <text x="160" y="862" text-anchor="middle" class="small-copy">architecture · loader</text>
+    <text x="160" y="879" text-anchor="middle" class="small-copy">weights · device · dtype</text>
+
+    <rect x="285" y="805" width="170" height="90" rx="12" fill="#FFF4F2" stroke="#D96B5F" stroke-width="1.5" />
+    <text x="370" y="844" text-anchor="middle" class="small-title" fill="#A63B31">ModelRunner.load</text>
+    <text x="370" y="870" text-anchor="middle" class="small-copy">编排选择与安装</text>
+
+    <rect x="500" y="805" width="150" height="90" rx="12" fill="#ECFDF3" stroke="#35A873" stroke-width="1.5" />
+    <text x="575" y="844" text-anchor="middle" class="small-title" fill="#176B4B">Catalog</text>
+    <text x="575" y="870" text-anchor="middle" class="small-copy">显式扩展点目录</text>
+
+    <rect x="700" y="750" width="165" height="76" rx="12" fill="#ECFDF3" stroke="#35A873" />
+    <text x="782.5" y="780" text-anchor="middle" font-size="13" font-weight="700" fill="#176B4B">Model Registry</text>
+    <text x="782.5" y="804" text-anchor="middle" class="small-copy">architecture → factory</text>
+    <rect x="700" y="900" width="165" height="76" rx="12" fill="#ECFDF3" stroke="#35A873" />
+    <text x="782.5" y="930" text-anchor="middle" font-size="13" font-weight="700" fill="#176B4B">Loader Registry</text>
+    <text x="782.5" y="954" text-anchor="middle" class="small-copy">loader name → loader</text>
+
+    <rect x="915" y="750" width="160" height="76" rx="12" fill="#FFF4F2" stroke="#D96B5F" />
+    <text x="995" y="780" text-anchor="middle" font-size="13" font-weight="700" fill="#A63B31">ModelFactory</text>
+    <text x="995" y="804" text-anchor="middle" class="small-copy">factory(spec)</text>
+    <rect x="915" y="900" width="160" height="76" rx="12" fill="#F0FDF4" stroke="#35A873" />
+    <text x="995" y="930" text-anchor="middle" font-size="13" font-weight="700" fill="#176B4B">ModelLoader</text>
+    <text x="995" y="954" text-anchor="middle" class="small-copy">weights · to · eval</text>
+
+    <rect x="1130" y="805" width="190" height="90" rx="12" fill="#FFF9EB" stroke="#D6A229" stroke-width="1.5" />
+    <text x="1225" y="844" text-anchor="middle" class="small-title" fill="#8A5B00">Candidate Model</text>
+    <text x="1225" y="870" text-anchor="middle" class="small-copy">完整 · 可用 · eval</text>
+
+    <rect x="1370" y="805" width="160" height="90" rx="12" fill="#FCEFEF" stroke="#D96B5F" stroke-width="1.5" />
+    <text x="1450" y="844" text-anchor="middle" class="small-title" fill="#A63B31">Atomic Install</text>
+    <text x="1450" y="870" text-anchor="middle" class="small-copy">_model + generation</text>
+
+    <rect x="1580" y="805" width="145" height="90" rx="12" fill="#FFF4F2" stroke="#D96B5F" stroke-width="2" />
+    <text x="1652.5" y="844" text-anchor="middle" class="small-title" fill="#A63B31">Active Model</text>
+    <text x="1652.5" y="870" text-anchor="middle" class="small-copy">当前 forward 引用</text>
+  </g>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M240 850 H285" stroke="#4C78FF" stroke-width="2" marker-end="url(#arrow-blue)" />
+    <path d="M455 850 H500" stroke="#35A873" stroke-width="2" marker-end="url(#arrow-green)" />
+    <path d="M650 850 H675 V788 H700" stroke="#35A873" stroke-width="1.5" marker-end="url(#arrow-green)" />
+    <path d="M650 850 H675 V938 H700" stroke="#35A873" stroke-width="1.5" marker-end="url(#arrow-green)" />
+    <path d="M865 788 H915" stroke="#D25B4E" stroke-width="1.5" marker-end="url(#arrow-red)" />
+    <path d="M865 938 H915" stroke="#35A873" stroke-width="1.5" marker-end="url(#arrow-green)" />
+    <path d="M995 826 V900" stroke="#D25B4E" stroke-width="1.5" marker-end="url(#arrow-red)" />
+    <path d="M1075 938 H1100 V850 H1130" stroke="#C68A13" stroke-width="2" marker-end="url(#arrow-amber)" />
+    <path d="M1320 850 H1370" stroke="#D25B4E" stroke-width="2" marker-end="url(#arrow-red)" />
+    <path d="M1530 850 H1580" stroke="#D25B4E" stroke-width="2" marker-end="url(#arrow-red)" />
+    <path d="M1652.5 805 H1740 V635 H1432.5 V416" stroke="#D25B4E" stroke-width="1.5" stroke-dasharray="5 5" marker-end="url(#arrow-red)" />
+  </g>
+  <text x="262" y="839" text-anchor="middle" class="edge-label">load</text>
+  <text x="477" y="839" text-anchor="middle" class="edge-label">resolve</text>
+  <text x="890" y="779" text-anchor="middle" class="edge-label">get</text>
+  <text x="890" y="929" text-anchor="middle" class="edge-label">get</text>
+  <text x="1012" y="866" class="edge-label">factory</text>
+  <text x="1101" y="921" class="edge-label">load</text>
+  <text x="1345" y="839" text-anchor="middle" class="edge-label">success only</text>
+  <text x="1555" y="839" text-anchor="middle" class="edge-label">commit</text>
+  <text x="1468" y="650" class="edge-label">owns</text>
+</svg>

@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from light_vllm import ForwardBatch, ModelOutput, ModelSpec, create_catalog, create_runner
-from light_vllm.contracts import ModelFactory
+from light_vllm.models.api import ModelFactory
 
 
 def tiny_spec(**changes: object) -> ModelSpec:
