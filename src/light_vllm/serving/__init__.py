@@ -1,1 +1,1 @@
-"""Optional transport adapters for light-vllm generation services."""
+"""可选的 HTTP 等服务接口。"""

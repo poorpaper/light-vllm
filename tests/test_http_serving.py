@@ -195,8 +195,7 @@ def test_asgi_disconnect_closes_the_engine_stream() -> None:
             assert any(message.get("status") == 200 for message in sent)
             assert any(b"event: token" in message.get("body", b"") for message in sent)
         finally:
-            # Keep failure paths cooperative so asyncio.run() never waits on
-            # an intentionally blocked test stream.
+            # 测试失败时也要放行，避免 asyncio.run() 一直等这个故意阻塞的流。
             engine.release.set()
             if not app_task.done():
                 app_task.cancel()

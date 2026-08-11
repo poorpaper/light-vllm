@@ -1,48 +1,42 @@
 import pytest
-import torch
 
 from light_vllm import (
-    ForwardBatch,
     GenerateRequest,
     GenerationError,
     GenerationFinished,
     GenerationNotReadyError,
-    GreedyGenerationService,
-    ModelOutput,
+    ReferenceGenerationService,
     TokenGenerated,
 )
-from light_vllm.runner import ModelNotLoadedError
+from light_vllm.execution import ExecutionError, ExecutionNotReadyError
 
 
-class IncrementingRunner:
-    generation = 1
+class IncrementingExecutor:
+    ready = True
 
     def __init__(self, vocab_size: int = 8) -> None:
         self.vocab_size = vocab_size
 
-    def forward(self, batch: ForwardBatch) -> ModelOutput:
-        next_ids = (batch.input_ids + 1) % self.vocab_size
-        logits = torch.full((*batch.input_ids.shape, self.vocab_size), -1.0)
-        logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
-        return ModelOutput(logits=logits)
+    def next_token(self, token_ids: tuple[int, ...]) -> int:
+        return (token_ids[-1] + 1) % self.vocab_size
 
 
-class UnloadedRunner:
-    generation = 0
+class UnreadyExecutor:
+    ready = False
 
-    def forward(self, batch: ForwardBatch) -> ModelOutput:
-        raise ModelNotLoadedError("not loaded")
+    def next_token(self, token_ids: tuple[int, ...]) -> int:
+        raise ExecutionNotReadyError("not ready")
 
 
-class InvalidOutputRunner:
-    generation = 1
+class FailingExecutor:
+    ready = True
 
-    def forward(self, batch: ForwardBatch) -> ModelOutput:
-        return ModelOutput(logits=torch.zeros(1, 8))
+    def next_token(self, token_ids: tuple[int, ...]) -> int:
+        raise ExecutionError("model logits have an invalid shape")
 
 
 def test_stream_emits_tokens_then_one_terminal_event() -> None:
-    service = GreedyGenerationService(IncrementingRunner())
+    service = ReferenceGenerationService(IncrementingExecutor())
 
     events = list(service.stream(GenerateRequest(input_ids=(1, 2), max_new_tokens=3)))
 
@@ -55,7 +49,7 @@ def test_stream_emits_tokens_then_one_terminal_event() -> None:
 
 
 def test_generate_collects_the_same_stream() -> None:
-    service = GreedyGenerationService(IncrementingRunner())
+    service = ReferenceGenerationService(IncrementingExecutor())
 
     result = service.generate(GenerateRequest(input_ids=(1, 2), max_new_tokens=2))
 
@@ -66,7 +60,7 @@ def test_generate_collects_the_same_stream() -> None:
 
 
 def test_eos_stops_generation_after_emitting_the_token() -> None:
-    service = GreedyGenerationService(IncrementingRunner())
+    service = ReferenceGenerationService(IncrementingExecutor())
 
     result = service.generate(GenerateRequest(input_ids=(1, 2), max_new_tokens=5, eos_token_id=4))
 
@@ -75,7 +69,7 @@ def test_eos_stops_generation_after_emitting_the_token() -> None:
 
 
 def test_closed_stream_releases_the_execution_slot() -> None:
-    service = GreedyGenerationService(IncrementingRunner())
+    service = ReferenceGenerationService(IncrementingExecutor())
     first_stream = service.stream(GenerateRequest(input_ids=(1,), max_new_tokens=2))
 
     assert next(first_stream) == TokenGenerated(token_id=2, position=0)
@@ -87,16 +81,16 @@ def test_closed_stream_releases_the_execution_slot() -> None:
     ]
 
 
-def test_unloaded_runner_is_exposed_as_not_ready() -> None:
-    service = GreedyGenerationService(UnloadedRunner())
+def test_unready_executor_is_exposed_as_not_ready() -> None:
+    service = ReferenceGenerationService(UnreadyExecutor())
 
     assert not service.ready
     with pytest.raises(GenerationNotReadyError):
         service.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
 
 
-def test_invalid_model_output_is_rejected_at_the_generation_boundary() -> None:
-    service = GreedyGenerationService(InvalidOutputRunner())
+def test_execution_failure_is_exposed_as_generation_error() -> None:
+    service = ReferenceGenerationService(FailingExecutor())
 
     with pytest.raises(GenerationError, match="model logits"):
         service.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))

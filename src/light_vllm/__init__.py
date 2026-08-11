@@ -1,7 +1,13 @@
 from light_vllm.bootstrap import create_catalog, create_runner
 from light_vllm.catalog import Catalog
-from light_vllm.contracts import (
-    ForwardBatch,
+from light_vllm.engine import EngineClient, InProcessEngineClient
+from light_vllm.execution import (
+    ExecutionError,
+    ExecutionNotReadyError,
+    GreedyTokenExecutor,
+    TokenExecutor,
+)
+from light_vllm.generation import (
     GenerateRequest,
     GenerateResult,
     GenerationError,
@@ -9,17 +15,17 @@ from light_vllm.contracts import (
     GenerationFinished,
     GenerationNotReadyError,
     GenerationService,
-    ModelOutput,
-    ModelSpec,
+    ReferenceGenerationService,
     TokenGenerated,
 )
-from light_vllm.engine import EngineClient, InProcessEngineClient
-from light_vllm.generation import GreedyGenerationService
+from light_vllm.models import ForwardBatch, ModelOutput, ModelSpec
 from light_vllm.runner import ModelRunner
 
 __all__ = [
     "Catalog",
     "EngineClient",
+    "ExecutionError",
+    "ExecutionNotReadyError",
     "ForwardBatch",
     "GenerateRequest",
     "GenerateResult",
@@ -28,11 +34,13 @@ __all__ = [
     "GenerationFinished",
     "GenerationNotReadyError",
     "GenerationService",
-    "GreedyGenerationService",
+    "GreedyTokenExecutor",
     "InProcessEngineClient",
     "ModelOutput",
     "ModelRunner",
     "ModelSpec",
+    "ReferenceGenerationService",
+    "TokenExecutor",
     "TokenGenerated",
     "create_catalog",
     "create_runner",

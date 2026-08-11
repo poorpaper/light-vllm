@@ -1,0 +1,216 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title desc">
+  <title id="title">light-vllm HTTP serving architecture</title>
+  <desc id="desc">The implemented FastAPI serving path flows through the EngineClient API, an in-process async adapter, a generation service, a token executor, ModelRunner, and the active model. Dashed boxes show future RPC and scheduled process-engine extensions.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07111f"/>
+      <stop offset="0.55" stop-color="#0f1d35"/>
+      <stop offset="1" stop-color="#172554"/>
+    </linearGradient>
+    <linearGradient id="port" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="model" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f97316"/>
+      <stop offset="1" stop-color="#dc2626"/>
+    </linearGradient>
+    <linearGradient id="entry" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d97706"/>
+      <stop offset="1" stop-color="#92400e"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-30%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="11" flood-color="#020617" flood-opacity="0.38"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="event-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2dd4bf"/>
+    </marker>
+    <style>
+      .title { font: 700 43px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #f8fafc; }
+      .subtitle { font: 400 18px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #94a3b8; }
+      .lane-title { font: 700 19px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #e2e8f0; letter-spacing: 0.8px; }
+      .box-title { font: 700 18px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #fff; text-anchor: middle; }
+      .box-note { font: 400 14px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #dbeafe; text-anchor: middle; }
+      .box-note-left { font: 400 14px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #dbeafe; }
+      .small { font: 600 13px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #cbd5e1; text-anchor: middle; }
+      .tag { font: 700 12px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #0f172a; text-anchor: middle; letter-spacing: 0.5px; }
+      .rule { font: 600 17px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #a7f3d0; text-anchor: middle; }
+      .arrow-label { font: 600 13px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #cbd5e1; text-anchor: middle; }
+      .event-label { font: 600 13px Inter, "Segoe UI", "Microsoft YaHei", sans-serif; fill: #5eead4; text-anchor: middle; }
+      .arrow { stroke: #94a3b8; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .event-arrow { stroke: #2dd4bf; stroke-width: 3; fill: none; marker-end: url(#event-arrow); }
+      .wire { stroke: #64748b; stroke-width: 2; fill: none; }
+      .dashed { stroke-dasharray: 9 8; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1120" fill="url(#background)"/>
+  <circle cx="1615" cy="80" r="300" fill="#2563eb" opacity="0.08"/>
+  <circle cx="95" cy="1070" r="310" fill="#10b981" opacity="0.055"/>
+
+  <text x="70" y="69" class="title">light-vllm · HTTP Serving Architecture</text>
+  <text x="70" y="108" class="subtitle">Domain-owned APIs · Separate implementations · Cancellation-safe streaming · Pluggable model runtime</text>
+  <rect x="1250" y="44" width="475" height="65" rx="18" fill="#064e3b" opacity="0.92"/>
+  <text x="1487" y="83" class="rule">协议适配只依赖 EngineClient</text>
+
+  <!-- Transport lane -->
+  <rect x="55" y="145" width="1690" height="230" rx="26" fill="#0f172a" stroke="#334155" stroke-width="2" opacity="0.96"/>
+  <rect x="55" y="145" width="12" height="230" rx="6" fill="#38bdf8"/>
+  <text x="88" y="181" class="lane-title">TRANSPORT &amp; COMPOSITION · HTTP 只负责编码，入口只负责装配</text>
+
+  <g filter="url(#shadow)">
+    <rect x="95" y="222" width="180" height="105" rx="18" fill="#075985"/>
+    <text x="185" y="263" class="box-title">HTTP Client</text>
+    <text x="185" y="291" class="box-note">JSON / SSE consumer</text>
+
+    <rect x="340" y="205" width="245" height="140" rx="18" fill="#0369a1"/>
+    <text x="462" y="246" class="box-title">FastAPI Adapter</text>
+    <text x="462" y="276" class="box-note">POST /generate · JSON</text>
+    <text x="462" y="300" class="box-note">POST /generate/stream · SSE</text>
+    <text x="462" y="324" class="box-note">healthz · readyz · error mapping</text>
+
+    <rect x="665" y="222" width="225" height="105" rx="18" fill="url(#port)"/>
+    <text x="777" y="263" class="box-title">EngineClient</text>
+    <text x="777" y="291" class="box-note">api.py · async stream + collect</text>
+
+    <rect x="1010" y="200" width="290" height="150" rx="18" fill="url(#entry)"/>
+    <text x="1155" y="240" class="box-title">HTTP Composition Root</text>
+    <text x="1155" y="270" class="box-note">runner / executor / service / client</text>
+    <text x="1155" y="294" class="box-note">lifespan: load ModelSpec</text>
+    <text x="1155" y="318" class="box-note">CLI: light-vllm-serve</text>
+
+    <rect x="1405" y="222" width="265" height="105" rx="18" fill="#1e293b" stroke="#64748b" stroke-width="2" stroke-dasharray="9 8"/>
+    <text x="1537" y="263" class="box-title">Future RPC Adapter</text>
+    <text x="1537" y="291" class="box-note">same EngineClient port</text>
+  </g>
+
+  <path d="M275 274 H330" class="arrow"/>
+  <path d="M585 274 H655" class="arrow"/>
+  <text x="620" y="255" class="arrow-label">GenerateRequest</text>
+  <path d="M1010 275 H900" class="wire dashed"/>
+  <text x="955" y="255" class="arrow-label">wire</text>
+  <path d="M1405 274 H900" class="wire dashed"/>
+
+  <!-- Current execution lane -->
+  <rect x="55" y="405" width="1690" height="345" rx="26" fill="#0f172a" stroke="#334155" stroke-width="2" opacity="0.96"/>
+  <rect x="55" y="405" width="12" height="345" rx="6" fill="#10b981"/>
+  <text x="88" y="442" class="lane-title">CURRENT EXECUTION PATH · 已实现的 reference serving 纵切</text>
+
+  <g filter="url(#shadow)">
+    <rect x="85" y="500" width="245" height="145" rx="18" fill="#4338ca"/>
+    <text x="207" y="542" class="box-title">InProcessEngineClient</text>
+    <text x="207" y="573" class="box-note">async admission lock</text>
+    <text x="207" y="597" class="box-note">single thread / stream</text>
+    <text x="207" y="621" class="box-note">cancel → safe close</text>
+
+    <rect x="365" y="500" width="250" height="145" rx="18" fill="#047857"/>
+    <text x="490" y="542" class="box-title">ReferenceGenerationService</text>
+    <text x="490" y="573" class="box-note">token state · EOS / length</text>
+    <text x="490" y="597" class="box-note">GenerationEvent stream</text>
+    <text x="490" y="621" class="box-note">reference request lock</text>
+
+    <rect x="650" y="500" width="260" height="145" rx="18" fill="#0f766e"/>
+    <text x="780" y="542" class="box-title">GreedyTokenExecutor</text>
+    <text x="780" y="573" class="box-note">tensor input · output check</text>
+    <text x="780" y="597" class="box-note">argmax</text>
+    <text x="780" y="621" class="box-note">implements TokenExecutor</text>
+
+    <rect x="945" y="500" width="210" height="145" rx="18" fill="url(#port)"/>
+    <text x="1050" y="542" class="box-title">ModelRunner</text>
+    <text x="1050" y="573" class="box-note">forward(ForwardBatch)</text>
+    <text x="1050" y="597" class="box-note">short lifecycle lock</text>
+    <text x="1050" y="621" class="box-note">model snapshot</text>
+
+    <rect x="1190" y="500" width="220" height="145" rx="18" fill="url(#model)"/>
+    <text x="1300" y="542" class="box-title">Active Model</text>
+    <text x="1300" y="573" class="box-note">TinyCausalLM today</text>
+    <text x="1300" y="597" class="box-note">registered model later</text>
+    <text x="1300" y="621" class="box-note">model math only</text>
+
+    <rect x="1510" y="500" width="175" height="145" rx="18" fill="#9a3412"/>
+    <text x="1597" y="542" class="box-title">ModelOutput</text>
+    <text x="1597" y="573" class="box-note">logits [B,S,V]</text>
+    <text x="1597" y="608" class="box-note">protocol-neutral</text>
+  </g>
+
+  <path d="M777 327 V462 H207 V490" class="arrow"/>
+  <text x="477" y="481" class="arrow-label">async stream(request)</text>
+  <path d="M330 572 H355" class="arrow"/>
+  <path d="M615 572 H640" class="arrow"/>
+  <text x="627" y="553" class="arrow-label">token_ids</text>
+  <path d="M910 572 H935" class="arrow"/>
+  <text x="922" y="553" class="arrow-label">ForwardBatch</text>
+  <path d="M1155 572 H1180" class="arrow"/>
+  <path d="M1410 572 H1500" class="arrow"/>
+
+  <path d="M1597 655 V697 H780 V655" class="event-arrow"/>
+  <text x="1190" y="718" class="event-label">logits → argmax → token_id</text>
+  <path d="M780 655 V680 H490 V655" class="event-arrow"/>
+  <text x="635" y="675" class="event-label">token_id</text>
+  <path d="M490 655 V704 H207 V655" class="event-arrow"/>
+  <text x="348" y="699" class="event-label">GenerationEvent</text>
+  <path d="M207 655 V728 H777 V337" class="event-arrow"/>
+  <text x="493" y="744" class="event-label">async events / GenerateResult</text>
+  <path d="M665 309 H610 V355 H462 V345" class="event-arrow"/>
+  <text x="566" y="332" class="event-label">JSON / SSE</text>
+
+  <!-- Future engine lane -->
+  <rect x="55" y="780" width="1040" height="275" rx="26" fill="#0f172a" stroke="#475569" stroke-width="2" stroke-dasharray="10 9" opacity="0.92"/>
+  <rect x="55" y="780" width="12" height="275" rx="6" fill="#64748b"/>
+  <text x="88" y="817" class="lane-title">FUTURE ENGINE PATH · 复用同一端口，不修改 HTTP adapter</text>
+
+  <g filter="url(#shadow)">
+    <rect x="115" y="868" width="250" height="120" rx="18" fill="#1e293b" stroke="#64748b" stroke-width="2" stroke-dasharray="9 8"/>
+    <text x="240" y="909" class="box-title">ProcessEngineClient</text>
+    <text x="240" y="938" class="box-note">request IDs · IPC · cancel</text>
+    <text x="240" y="962" class="box-note">backpressure · liveness</text>
+
+    <rect x="440" y="868" width="250" height="120" rx="18" fill="#1e293b" stroke="#64748b" stroke-width="2" stroke-dasharray="9 8"/>
+    <text x="565" y="909" class="box-title">Engine Core</text>
+    <text x="565" y="938" class="box-note">Scheduler · request state</text>
+    <text x="565" y="962" class="box-note">continuous batching</text>
+
+    <rect x="765" y="868" width="250" height="120" rx="18" fill="#1e293b" stroke="#64748b" stroke-width="2" stroke-dasharray="9 8"/>
+    <text x="890" y="909" class="box-title">Model Workers</text>
+    <text x="890" y="938" class="box-note">KV cache · prefill/decode</text>
+    <text x="890" y="962" class="box-note">distributed execution</text>
+  </g>
+
+  <path d="M665 310 C540 350 240 730 240 858" class="arrow dashed"/>
+  <text x="290" y="835" class="arrow-label">future implementation</text>
+  <path d="M365 928 H430" class="arrow dashed"/>
+  <path d="M690 928 H755" class="arrow dashed"/>
+
+  <!-- Load lifecycle card -->
+  <rect x="1125" y="780" width="620" height="275" rx="26" fill="#0f172a" stroke="#334155" stroke-width="2" opacity="0.96"/>
+  <rect x="1125" y="780" width="12" height="275" rx="6" fill="#f59e0b"/>
+  <text x="1158" y="817" class="lane-title">MODEL LOAD LIFECYCLE · 启动时完成</text>
+
+  <g filter="url(#shadow)">
+    <rect x="1170" y="862" width="145" height="105" rx="16" fill="#075985"/>
+    <text x="1242" y="902" class="box-title">ModelSpec</text>
+    <text x="1242" y="932" class="box-note">config</text>
+
+    <rect x="1355" y="850" width="160" height="130" rx="16" fill="#047857"/>
+    <text x="1435" y="890" class="box-title">Catalog</text>
+    <rect x="1380" y="910" width="110" height="25" rx="12" fill="#a7f3d0"/>
+    <text x="1435" y="927" class="tag">MODEL</text>
+    <rect x="1380" y="943" width="110" height="25" rx="12" fill="#a7f3d0"/>
+    <text x="1435" y="960" class="tag">LOADER</text>
+
+    <rect x="1555" y="862" width="145" height="105" rx="16" fill="#be123c"/>
+    <text x="1627" y="902" class="box-title">Atomic Swap</text>
+    <text x="1627" y="932" class="box-note">generation += 1</text>
+  </g>
+
+  <path d="M1315 914 H1345" class="arrow"/>
+  <path d="M1515 914 H1545" class="arrow"/>
+  <path d="M1627 852 C1627 780 1300 765 1300 490" class="arrow dashed"/>
+  <text x="1510" y="785" class="arrow-label">install active model</text>
+
+  <rect x="55" y="1080" width="1690" height="24" rx="12" fill="#1e293b"/>
+  <text x="900" y="1098" class="small">SOLID = implemented in PR #1 · DASHED = extension boundary · stream is the single execution path at every layer</text>
+</svg>

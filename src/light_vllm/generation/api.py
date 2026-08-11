@@ -1,58 +1,23 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
-from pathlib import Path
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Literal, Protocol, TypeAlias
-
-import torch
-from torch import Tensor, nn
-
-
-@dataclass(frozen=True, slots=True)
-class ModelSpec:
-    """Everything required to choose and materialize one model."""
-
-    architecture: str
-    loader: str = "init"
-    model_args: Mapping[str, object] = field(default_factory=dict)
-    weights: Path | None = None
-    device: str | torch.device = "cpu"
-    dtype: torch.dtype = torch.float32
-
-
-@dataclass(frozen=True, slots=True)
-class ForwardBatch:
-    """The stable input boundary between request preparation and a model."""
-
-    input_ids: Tensor
-
-    def __post_init__(self) -> None:
-        if self.input_ids.ndim != 2:
-            raise ValueError("input_ids must have shape [batch, sequence]")
-
-
-@dataclass(frozen=True, slots=True)
-class ModelOutput:
-    """The minimal output needed by the next runtime layer."""
-
-    logits: Tensor
-
 
 FinishReason: TypeAlias = Literal["length", "eos"]
 
 
 class GenerationError(RuntimeError):
-    """Base error exposed by the protocol-neutral generation boundary."""
+    """生成失败时使用的基础异常。"""
 
 
 class GenerationNotReadyError(GenerationError):
-    """Raised when generation is requested before a model is ready."""
+    """模型还没准备好时抛出。"""
 
 
 @dataclass(frozen=True, slots=True)
 class GenerateRequest:
-    """One immutable token generation request."""
+    """一次生成请求，创建后不能修改。"""
 
     input_ids: tuple[int, ...]
     max_new_tokens: int = 16
@@ -75,7 +40,7 @@ class GenerateRequest:
 
 @dataclass(frozen=True, slots=True)
 class TokenGenerated:
-    """One token emitted by an in-progress generation."""
+    """每生成一个 token 就发出一个事件。"""
 
     token_id: int
     position: int
@@ -83,7 +48,7 @@ class TokenGenerated:
 
 @dataclass(frozen=True, slots=True)
 class GenerationFinished:
-    """The terminal event of a successful generation."""
+    """生成结束时发出的事件。"""
 
     finish_reason: FinishReason
 
@@ -93,7 +58,7 @@ GenerationEvent: TypeAlias = TokenGenerated | GenerationFinished
 
 @dataclass(frozen=True, slots=True)
 class GenerateResult:
-    """The collected form of a completed generation stream."""
+    """收集完整生成流后得到的结果。"""
 
     input_ids: tuple[int, ...]
     generated_token_ids: tuple[int, ...]
@@ -104,21 +69,8 @@ class GenerateResult:
         return self.input_ids + self.generated_token_ids
 
 
-class ModelFactory(Protocol):
-    def __call__(self, spec: ModelSpec) -> nn.Module: ...
-
-
-class ModelLoader(Protocol):
-    def load(self, spec: ModelSpec, factory: ModelFactory) -> nn.Module: ...
-
-
 class GenerationService(Protocol):
-    """Synchronous generation contract used by reference implementations.
-
-    Serving protocols consume ``EngineClient`` instead. Keeping this contract
-    synchronous preserves a small offline baseline while the client boundary
-    absorbs async and future IPC concerns.
-    """
+    """同步参考生成接口。"""
 
     @property
     def ready(self) -> bool: ...

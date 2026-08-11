@@ -1,8 +1,7 @@
-"""Executable composition root for the HTTP server.
+"""创建并启动 HTTP 服务。
 
-Unlike ``serving.http``, this module is allowed to choose concrete runtime
-implementations, manage model startup, parse CLI configuration, and invoke
-Uvicorn. No inference or HTTP encoding logic should be implemented here.
+这里负责选择具体实现、加载模型、解析命令行参数并启动 Uvicorn，
+不放推理和 HTTP 编码逻辑。
 """
 
 from __future__ import annotations
@@ -16,9 +15,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from light_vllm.bootstrap import create_runner
-from light_vllm.contracts import ModelSpec
-from light_vllm.engine import InProcessEngineClient
-from light_vllm.generation import GreedyGenerationService
+from light_vllm.engine.in_process import InProcessEngineClient
+from light_vllm.execution.local import GreedyTokenExecutor
+from light_vllm.generation.reference import ReferenceGenerationService
+from light_vllm.models.api import ModelSpec
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -32,25 +32,23 @@ _DTYPES = {
 
 
 def create_serving_app(spec: ModelSpec) -> FastAPI:
-    """Wire the current single-process reference stack into the HTTP adapter.
+    """创建当前的单进程 HTTP 服务。
 
-    Replacing ``InProcessEngineClient`` with a future process client belongs in
-    this composition root; ``serving.http`` should remain unchanged.
+    以后换成独立进程引擎时只改这里，不改 HTTP 路由。
     """
 
-    # FastAPI is an optional serving dependency. Importing it lazily keeps the
-    # model/runtime package usable when only the core dependencies are installed.
+    # FastAPI 是可选依赖。只有启动 HTTP 服务时才导入，
+    # 没有安装它也不影响核心模型功能。
     from light_vllm.serving.http import create_http_app
 
     runner = create_runner()
-    service = GreedyGenerationService(runner, device=spec.device)
+    executor = GreedyTokenExecutor(runner, device=spec.device)
+    service = ReferenceGenerationService(executor)
     engine = InProcessEngineClient(service)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        # The application does not become ready until the candidate model has
-        # loaded successfully. A failed load aborts startup instead of exposing
-        # a partially initialized engine.
+        # 模型加载成功后服务才会就绪；加载失败就停止启动。
         runner.load(spec)
         yield
 

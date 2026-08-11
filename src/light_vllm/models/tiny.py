@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from light_vllm.contracts import ForwardBatch, ModelOutput, ModelSpec
+from light_vllm.models.api import ForwardBatch, ModelOutput, ModelSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,7 +14,7 @@ class TinyCausalLMConfig:
 
 
 class TinyCausalLM(nn.Module):
-    """The smallest useful language-model-shaped reference implementation."""
+    """用于测试整体流程的最小模型。"""
 
     def __init__(self, config: TinyCausalLMConfig) -> None:
         super().__init__()

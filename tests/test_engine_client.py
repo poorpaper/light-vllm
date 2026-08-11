@@ -113,8 +113,7 @@ def test_cancellation_waits_for_the_active_sync_step_before_closing() -> None:
             await asyncio.sleep(0)
             assert not pending.done()
         finally:
-            # Always release the worker, including when an assertion fails, so
-            # asyncio.run() cannot hang while shutting down its executor.
+            # 无论断言是否通过，都要释放工作线程，否则 asyncio.run() 关闭时可能卡住。
             release.set()
             with suppress(asyncio.CancelledError):
                 await asyncio.wait_for(pending, timeout=1.0)

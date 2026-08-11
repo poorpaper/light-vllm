@@ -1,8 +1,7 @@
-"""FastAPI adapter for the transport-neutral ``EngineClient`` port.
+"""把 ``EngineClient`` 包装成 FastAPI 接口。
 
-This module owns HTTP concerns only: validation schemas, status codes, JSON,
-and SSE encoding. Runtime construction and model loading belong to the HTTP
-entrypoint, which makes this adapter easy to test with a stub engine.
+这里只处理参数校验、HTTP 状态码、JSON 和 SSE。模型和运行时在
+``entrypoints/http.py`` 中创建，测试时可以换成假引擎。
 """
 
 from __future__ import annotations
@@ -16,7 +15,8 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.sse import EventSourceResponse, format_sse_event
 from pydantic import BaseModel, ConfigDict, Field
 
-from light_vllm.contracts import (
+from light_vllm.engine.api import EngineClient
+from light_vllm.generation.api import (
     GenerateRequest,
     GenerateResult,
     GenerationError,
@@ -25,7 +25,6 @@ from light_vllm.contracts import (
     GenerationNotReadyError,
     TokenGenerated,
 )
-from light_vllm.engine import EngineClient
 
 TokenId = Annotated[int, Field(strict=True, ge=0)]
 Lifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
@@ -35,9 +34,8 @@ MAX_PROMPT_TOKENS = 4096
 class GenerateHttpRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # This is an adapter-level safety ceiling for the reference server, not a
-    # model context-length contract. Future engines may expose a configured
-    # limit while the transport-neutral GenerateRequest stays reusable.
+    # 这是为了保护参考服务而设置的最大值，不代表模型真正支持的上下文长度。
+    # 以后可以由引擎提供更准确的限制。
     input_ids: list[TokenId] = Field(min_length=1, max_length=MAX_PROMPT_TOKENS)
     max_new_tokens: Annotated[int, Field(strict=True, ge=1, le=4096)] = 16
     eos_token_id: TokenId | None = None
@@ -85,7 +83,7 @@ class ErrorEventData(BaseModel):
 
 
 def _http_error(exc: Exception) -> HTTPException:
-    """Map domain failures before an HTTP response has started."""
+    """在开始返回响应前，把内部异常转换成 HTTP 错误。"""
 
     if isinstance(exc, GenerationNotReadyError):
         return HTTPException(
@@ -99,7 +97,7 @@ def _http_error(exc: Exception) -> HTTPException:
 
 
 def _encode_event(event: GenerationEvent) -> bytes:
-    """Translate one domain event into its HTTP/SSE wire representation."""
+    """把生成事件转换成 SSE 数据。"""
 
     if isinstance(event, TokenGenerated):
         data = TokenEventData(token_id=event.token_id, position=event.position)
@@ -126,7 +124,7 @@ def _stream_error_event(exc: Exception) -> bytes:
 
 
 async def _close_engine_stream(events: AsyncIterator[GenerationEvent]) -> None:
-    """Close an engine stream without racing cancellation against cleanup."""
+    """安全关闭生成流，避免取消和清理同时发生。"""
 
     aclose = getattr(events, "aclose", None)
     if aclose is not None:
@@ -147,11 +145,10 @@ async def _close_engine_stream(events: AsyncIterator[GenerationEvent]) -> None:
 async def _encoded_stream(
     first_event: GenerationEvent, events: AsyncIterator[GenerationEvent]
 ) -> AsyncIterator[bytes]:
-    """Encode an engine stream and always close it when the consumer leaves.
+    """把生成事件依次编码成 SSE，并在客户端离开时关闭生成流。
 
-    HTTP status and headers are already committed after the first body event,
-    so later failures must become an SSE ``error`` event instead of an HTTP
-    error response.
+    第一条数据发出后就不能再修改 HTTP 状态码，因此后续错误只能作为
+    SSE ``error`` 事件返回。
     """
 
     finished = False
@@ -178,11 +175,9 @@ def create_http_app(
     *,
     lifespan: Lifespan | None = None,
 ) -> FastAPI:
-    """Create a reusable HTTP application around a pre-built engine client.
+    """用给定的 ``EngineClient`` 创建 FastAPI 应用。
 
-    Keeping construction outside this factory lets tests inject a stub and lets
-    future entrypoints choose an in-process or IPC client without changing any
-    route.
+    测试可以传入假引擎；以后换成独立进程引擎也不用修改路由。
     """
 
     app = FastAPI(title="light-vllm", lifespan=lifespan)
@@ -227,9 +222,8 @@ def create_http_app(
     async def stream(payload: GenerateHttpRequest) -> EventSourceResponse:
         events = engine.stream(payload.to_contract())
         try:
-            # Pull once before creating the streaming response. Failures at
-            # this point can still be represented by an honest HTTP status;
-            # subsequent failures must be encoded inside the SSE stream.
+            # 先读取第一个事件再开始流式响应。这样首次读取失败时还能返回
+            # 正确的 HTTP 状态码；开始流式响应后，错误只能写进 SSE。
             first_event = await anext(events)
         except StopAsyncIteration as exc:
             with suppress(Exception):

@@ -7,11 +7,11 @@ T = TypeVar("T")
 
 
 class RegistryError(LookupError):
-    """Raised when a component cannot be registered or resolved."""
+    """注册或查找组件失败时抛出。"""
 
 
 class Registry(Generic[T]):
-    """A small explicit map used instead of feature-dispatch condition trees."""
+    """保存名称和组件的对应关系，避免大量 if/elif。"""
 
     def __init__(self, kind: str) -> None:
         self._kind = kind
