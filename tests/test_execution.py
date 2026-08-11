@@ -2,9 +2,13 @@ import pytest
 import torch
 
 from light_vllm.execution import (
+    ExecutionBatch,
     ExecutionError,
     ExecutionNotReadyError,
+    GreedyBatchTokenExecutor,
     GreedyTokenExecutor,
+    SequenceTokens,
+    TokenSelection,
 )
 from light_vllm.models.api import ForwardBatch, ModelNotLoadedError, ModelOutput
 
@@ -56,3 +60,22 @@ def test_local_executor_checks_model_output_shape() -> None:
 
     with pytest.raises(ExecutionError, match="model logits"):
         executor.next_token((1,))
+
+
+def test_batch_executor_right_pads_and_selects_each_last_valid_position() -> None:
+    forwarder = IncrementingForwarder()
+    executor = GreedyBatchTokenExecutor(forwarder, padding_token_id=0)
+
+    selections = executor.next_tokens(
+        ExecutionBatch(
+            sequences=(
+                SequenceTokens(request_id="long", token_ids=(1, 2)),
+                SequenceTokens(request_id="short", token_ids=(3,)),
+            )
+        )
+    )
+
+    assert selections == (
+        TokenSelection(request_id="long", token_id=3),
+        TokenSelection(request_id="short", token_id=4),
+    )

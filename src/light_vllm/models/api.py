@@ -23,13 +23,32 @@ class ModelSpec:
 
 @dataclass(frozen=True, slots=True)
 class ForwardBatch:
-    """传给模型的一批输入 token。"""
+    """传给模型的一批右侧补齐的输入 token。
+
+    ``input_ids`` 的形状固定为 ``[batch, padded_sequence]``；
+    ``sequence_lengths`` 记录每行补齐前的有效长度。单请求或等长批次可以
+    省略长度，此时默认每一行都使用完整宽度。
+    """
 
     input_ids: Tensor
+    sequence_lengths: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
+
+        batch_size, sequence_width = self.input_ids.shape
+        lengths = self.sequence_lengths
+        # 在契约边界统一归一化，后续模型和执行器不需要处理 None。
+        lengths = (sequence_width,) * batch_size if lengths is None else tuple(lengths)
+
+        if len(lengths) != batch_size:
+            raise ValueError("sequence_lengths must contain one value per batch row")
+        if any(
+            type(length) is not int or length <= 0 or length > sequence_width for length in lengths
+        ):
+            raise ValueError("sequence lengths must be within the padded sequence width")
+        object.__setattr__(self, "sequence_lengths", lengths)
 
 
 @dataclass(frozen=True, slots=True)
