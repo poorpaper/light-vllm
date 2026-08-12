@@ -60,7 +60,7 @@ class GreedyTokenExecutor:
         return int(output.logits[0, -1].argmax().item())
 
 
-class GreedyBatchTokenExecutor:
+class GreedyFullSequenceBatchExecutor:
     """右侧补齐不同长度的序列，并批量选择贪心 token。
 
     当前实现每轮重算完整序列，不管理 KV cache。右侧补齐保证 causal 模型

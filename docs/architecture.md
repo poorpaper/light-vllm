@@ -17,7 +17,7 @@
 | `InProcessEngineClient` | 异步准入、sync-to-async 桥接与取消清理 | scheduling、IPC、生成算法 |
 | `Scheduler` | 维护等待/运行集合并选择下一次迭代 | tensor、HTTP、模型实现 |
 | `BatchTokenExecutor` | 把执行批次转换成模型输入并选择 token | 请求排队、事件流、协议 |
-| `IterationBatchEngine` | 请求状态、迭代循环、事件分发与安全取消 | HTTP schema、具体调度策略 |
+| `FullSequenceBatchEngine` | 全序列请求状态、迭代循环、事件分发与安全取消 | HTTP schema、具体调度策略 |
 | HTTP adapter | JSON/SSE 与生成契约之间转换 | generation service、runner、torch |
 | Composition root | 创建并连接 runtime、service、transport | 生成算法和模型计算细节 |
 
@@ -37,7 +37,7 @@ flowchart LR
     RPC["Future RPC adapter"] -.-> Client
     Client --> Local["InProcessEngineClient"]
     Local --> Service["GenerationService contract"]
-    Client --> Batched["IterationBatchEngine"]
+    Client --> Batched["FullSequenceBatchEngine"]
     Batched --> Scheduler["Scheduler contract"]
     Batched --> BatchExecutor["BatchTokenExecutor contract"]
     BatchExecutor --> Runner
@@ -95,7 +95,7 @@ composition root 装配，不能向生成服务或 runner 增加协议判断。
 
 当前参考生成器使用独立执行锁串行化完整请求。它与 runner 生命周期锁职责不同，并必须在 iterator
 关闭、取消或异常时释放。未来同步 pipeline 实现可以继续满足 `GenerationService` 以便直接对比；
-`IterationBatchEngine` 则直接实现 `EngineClient`，不能改变 transport-neutral 数据契约。
+`FullSequenceBatchEngine` 则直接实现 `EngineClient`，不能改变 transport-neutral 数据契约。
 
 HTTP adapter 对输入 prompt 和新增 token 数各设置 4096 的安全上限。这个上限只保护当前
 adapter 的基础资源边界，不代表任意模型的 context length；模型相关限制应在未来配置与 admission
@@ -114,25 +114,29 @@ flowchart LR
     Update --> Schedule
 ```
 
-`RawBatchScheduler` 与 `ContinuousBatchScheduler` 共用这条循环、执行器和生成事件：
+`StaticBatchScheduler` 与 `ContinuousBatchScheduler` 共用这条循环、执行器和生成事件：
 
 | 策略 | 空槽出现后何时接纳等待请求 | 用途 |
 | --- | --- | --- |
-| raw | 当前静态批次全部结束后 | 非 continuous batching 对照组 |
+| static（CLI: `raw`） | 当前静态批次全部结束后 | 非 continuous batching 对照组 |
 | continuous | 下一次模型迭代前 | iteration-level continuous batching |
 
 两种策略只改变批次成员，不改变采样、停止条件和输出事件，因此可以直接比较吞吐、延迟和批次轨迹。
 请求在模型执行期间取消时，Engine 先从 Scheduler 和活动状态中移除；已经开始的同步模型调用执行到本轮
 安全边界，返回结果会被丢弃，不会再进入后续批次。
 
-当前 `ExecutionBatch` 保存每个请求的完整 token 序列。`GreedyBatchTokenExecutor` 对不同长度序列右侧
+当前 `ExecutionBatch` 保存每个请求的完整 token 序列。`GreedyFullSequenceBatchExecutor` 对不同长度序列右侧
 补齐，并用 `ForwardBatch.sequence_lengths` 读取每行最后一个有效位置。它还没有 KV cache，因此每轮都
-重算完整序列；后续 prefill/decode 与 token budget 应在 Scheduler、执行批次和新的执行后端中增长，
-不能塞进 `InProcessEngineClient` 或 reference service。
+重算完整序列。
+
+未来 chunked prefill 使用独立的 token-budget `SchedulePlan`、按请求描述本轮 token 数的调度项，以及拥有
+KV cache 的 Engine Core。不要扩张当前 `FullSequenceBatchEngine`、`ExecutionBatch` 或
+`BatchTokenExecutor` 来同时承载两种执行模型，也不能把这些职责塞进 `InProcessEngineClient` 或 reference
+service。
 
 ## Engine 与进程边界
 
-当前 `InProcessEngineClient` 与 `IterationBatchEngine` 都建立边界但不建立新进程。后续可以新增
+当前 `InProcessEngineClient` 与 `FullSequenceBatchEngine` 都建立边界但不建立新进程。后续可以新增
 `ProcessEngineClient`，通过 request ID 和不可变消息与 Engine Core 通信：
 
 ```mermaid
@@ -176,7 +180,7 @@ metrics；当前只固定方向，不增加空接口。
 
 1. **Model path（已完成）**：model spec、loader、统一 forward、原子替换。
 2. **参考纵切（已完成）**：不可变 generate 契约、greedy event stream、HTTP JSON/SSE adapter。
-3. **Request path（已完成参考版）**：scheduler、执行批次、raw/continuous iteration engine。
+3. **Request path（已完成参考版）**：scheduler、执行批次、static/continuous full-sequence engine。
 4. **Memory path（下一步）**：KV cache 接口、block allocator、显存预算。
 5. **Execution path**：prefill/decode runner、批处理策略、设备后端。
 6. **Production serving path**：进程 client、异步 engine、取消传播、OpenAI-compatible adapter。

@@ -2,8 +2,8 @@ import pytest
 
 from light_vllm.scheduler import (
     ContinuousBatchScheduler,
-    RawBatchScheduler,
     SchedulerError,
+    StaticBatchScheduler,
 )
 
 
@@ -17,8 +17,8 @@ def test_continuous_batching_refills_open_slots_each_iteration() -> None:
     assert scheduler.schedule().request_ids == ("b", "c")
 
 
-def test_raw_batching_waits_until_the_current_wave_is_empty() -> None:
-    scheduler = RawBatchScheduler(max_num_sequences=2)
+def test_static_batching_waits_until_the_current_wave_is_empty() -> None:
+    scheduler = StaticBatchScheduler(max_num_sequences=2)
     for request_id in ("a", "b", "c"):
         scheduler.add(request_id)
 

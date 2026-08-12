@@ -1,10 +1,13 @@
 from light_vllm.scheduler.api import Scheduler, SchedulerBatch, SchedulerError
-from light_vllm.scheduler.iteration import ContinuousBatchScheduler, RawBatchScheduler
+from light_vllm.scheduler.sequence_batching import (
+    ContinuousBatchScheduler,
+    StaticBatchScheduler,
+)
 
 __all__ = [
     "ContinuousBatchScheduler",
-    "RawBatchScheduler",
     "Scheduler",
     "SchedulerBatch",
     "SchedulerError",
+    "StaticBatchScheduler",
 ]

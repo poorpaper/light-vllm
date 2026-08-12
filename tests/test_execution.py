@@ -5,7 +5,7 @@ from light_vllm.execution import (
     ExecutionBatch,
     ExecutionError,
     ExecutionNotReadyError,
-    GreedyBatchTokenExecutor,
+    GreedyFullSequenceBatchExecutor,
     GreedyTokenExecutor,
     SequenceTokens,
     TokenSelection,
@@ -64,7 +64,7 @@ def test_local_executor_checks_model_output_shape() -> None:
 
 def test_batch_executor_right_pads_and_selects_each_last_valid_position() -> None:
     forwarder = IncrementingForwarder()
-    executor = GreedyBatchTokenExecutor(forwarder, padding_token_id=0)
+    executor = GreedyFullSequenceBatchExecutor(forwarder, padding_token_id=0)
 
     selections = executor.next_tokens(
         ExecutionBatch(

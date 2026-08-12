@@ -7,14 +7,14 @@ from light_vllm.execution.api import (
     TokenExecutor,
     TokenSelection,
 )
-from light_vllm.execution.local import GreedyBatchTokenExecutor, GreedyTokenExecutor
+from light_vllm.execution.local import GreedyFullSequenceBatchExecutor, GreedyTokenExecutor
 
 __all__ = [
     "BatchTokenExecutor",
     "ExecutionBatch",
     "ExecutionError",
     "ExecutionNotReadyError",
-    "GreedyBatchTokenExecutor",
+    "GreedyFullSequenceBatchExecutor",
     "GreedyTokenExecutor",
     "SequenceTokens",
     "TokenExecutor",

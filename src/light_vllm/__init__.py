@@ -1,12 +1,12 @@
 from light_vllm.bootstrap import create_catalog, create_runner
 from light_vllm.catalog import Catalog
-from light_vllm.engine import EngineClient, InProcessEngineClient, IterationBatchEngine
+from light_vllm.engine import EngineClient, FullSequenceBatchEngine, InProcessEngineClient
 from light_vllm.execution import (
     BatchTokenExecutor,
     ExecutionBatch,
     ExecutionError,
     ExecutionNotReadyError,
-    GreedyBatchTokenExecutor,
+    GreedyFullSequenceBatchExecutor,
     GreedyTokenExecutor,
     SequenceTokens,
     TokenExecutor,
@@ -27,10 +27,10 @@ from light_vllm.models import ForwardBatch, ModelOutput, ModelSpec
 from light_vllm.runner import ModelRunner
 from light_vllm.scheduler import (
     ContinuousBatchScheduler,
-    RawBatchScheduler,
     Scheduler,
     SchedulerBatch,
     SchedulerError,
+    StaticBatchScheduler,
 )
 
 __all__ = [
@@ -42,6 +42,7 @@ __all__ = [
     "ExecutionError",
     "ExecutionNotReadyError",
     "ForwardBatch",
+    "FullSequenceBatchEngine",
     "GenerateRequest",
     "GenerateResult",
     "GenerationError",
@@ -49,19 +50,18 @@ __all__ = [
     "GenerationFinished",
     "GenerationNotReadyError",
     "GenerationService",
-    "GreedyBatchTokenExecutor",
+    "GreedyFullSequenceBatchExecutor",
     "GreedyTokenExecutor",
     "InProcessEngineClient",
-    "IterationBatchEngine",
     "ModelOutput",
     "ModelRunner",
     "ModelSpec",
-    "RawBatchScheduler",
     "ReferenceGenerationService",
     "Scheduler",
     "SchedulerBatch",
     "SchedulerError",
     "SequenceTokens",
+    "StaticBatchScheduler",
     "TokenExecutor",
     "TokenGenerated",
     "TokenSelection",

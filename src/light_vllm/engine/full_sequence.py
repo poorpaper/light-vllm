@@ -1,4 +1,4 @@
-"""按模型迭代驱动 raw batching 与 continuous batching。
+"""用全序列重算驱动 static batching 与 continuous batching。
 
 这个模块只实现异步 Engine 编排，不知道具体模型、PyTorch 或 HTTP：
 
@@ -117,11 +117,15 @@ async def _await_safe_boundary(task: asyncio.Task[None]) -> None:
         raise
 
 
-class IterationBatchEngine:
-    """在同一进程内按迭代执行调度批次。
+class FullSequenceBatchEngine:
+    """在同一进程内按迭代执行全序列调度批次。
 
     Engine 只维护请求状态、事件流和安全取消。每轮选择哪些请求由
     ``Scheduler`` 决定，如何执行批次由 ``BatchTokenExecutor`` 决定。
+
+    当前 baseline 每轮把每个请求的完整 token 序列交给执行器，不区分
+    prefill/decode，也不管理 KV cache。未来的 token-budget/chunked-prefill
+    Engine 应使用独立执行计划，不能扩张这里的一请求一 token 语义。
 
     同一实例只启动一个 driver，因此不会并发调用执行器。driver 空闲时自动
     退出；后续请求到达时再按需启动，不保留永久忙等的后台循环。
@@ -256,7 +260,7 @@ class IterationBatchEngine:
         if self._driver_task is None:
             self._driver_task = asyncio.create_task(
                 self._drive(),
-                name="light-vllm-iteration-engine",
+                name="light-vllm-full-sequence-engine",
             )
 
     async def _drive(self) -> None:

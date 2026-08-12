@@ -33,11 +33,11 @@ flowchart TB
 
     subgraph Implementations["② 当前实现"]
         InProcess["InProcessEngineClient<br/>同步流转异步流"]
-        BatchedEngine["IterationBatchEngine<br/>schedule · execute · update"]
+        BatchedEngine["FullSequenceBatchEngine<br/>schedule · execute · update"]
         GreedyService["ReferenceGenerationService<br/>token 编排 · 停止条件 · 事件"]
         GreedyExecutor["GreedyTokenExecutor<br/>准备 Tensor · 检查输出 · argmax"]
-        BatchExecutor["GreedyBatchTokenExecutor<br/>右侧补齐 · 批量 argmax"]
-        RawScheduler["RawBatchScheduler"]
+        BatchExecutor["GreedyFullSequenceBatchExecutor<br/>右侧补齐 · 批量 argmax"]
+        StaticScheduler["StaticBatchScheduler"]
         ContinuousScheduler["ContinuousBatchScheduler"]
         Runner["ModelRunner<br/>模型生命周期 + forward"]
         Tiny["TinyCausalLM<br/>模型计算"]
@@ -63,7 +63,7 @@ flowchart TB
     BatchedEngine -.实现.-> EngineAPI
     BatchedEngine --> SchedulerAPI
     BatchedEngine --> ExecutionAPI
-    RawScheduler -.实现.-> SchedulerAPI
+    StaticScheduler -.实现.-> SchedulerAPI
     ContinuousScheduler -.实现.-> SchedulerAPI
     GreedyService -.实现.-> GenerationAPI
     GreedyService --> ExecutionAPI
@@ -95,7 +95,7 @@ flowchart TB
     class ModelAPI,LoaderAPI,ExecutionAPI,SchedulerAPI,GenerationAPI,EngineAPI contract;
     class InProcess,BatchedEngine,GreedyService,GreedyExecutor,BatchExecutor,Runner core;
     class Catalog,ModelRegistry,LoaderRegistry registry;
-    class Tiny,TorchLoaders,RawScheduler,ContinuousScheduler impl;
+    class Tiny,TorchLoaders,StaticScheduler,ContinuousScheduler impl;
     class HTTP,RPC,Composition registry;
 ```
 
@@ -103,9 +103,10 @@ flowchart TB
 和 `engine` 分别在自己的 `api.py` 中维护。实现依赖本域或下游域的 API，不依赖其他具体实现。
 
 当前最关键的执行边界是：`ReferenceGenerationService` 只依赖 `TokenExecutor`；
-`IterationBatchEngine` 只依赖 `Scheduler` 与 `BatchTokenExecutor`。前者保留单请求语义基线，后者维护
-异步请求状态并驱动 iteration-level batching。`GreedyTokenExecutor` 与 `GreedyBatchTokenExecutor` 负责
-本地 PyTorch 输入准备、输出检查和贪心选择；协议 adapter 仍只依赖异步 `EngineClient`。
+`FullSequenceBatchEngine` 只依赖 `Scheduler` 与 `BatchTokenExecutor`。前者保留单请求语义基线，后者维护
+异步请求状态并驱动全序列 iteration-level batching。`GreedyTokenExecutor` 与
+`GreedyFullSequenceBatchExecutor` 负责本地 PyTorch 输入准备、输出检查和贪心选择；协议 adapter 仍只依赖
+异步 `EngineClient`。
 
 ## 3. 模型加载时序
 
@@ -239,10 +240,10 @@ elif spec.loader == "state-dict":
 | 模型生命周期和 forward | `src/light_vllm/runner.py` |
 | 本地 PyTorch 贪心执行 | `src/light_vllm/execution/local.py` |
 | 调度 API | `src/light_vllm/scheduler/api.py` |
-| raw/continuous 调度策略 | `src/light_vllm/scheduler/iteration.py` |
+| static/continuous 序列调度策略 | `src/light_vllm/scheduler/sequence_batching.py` |
 | 协议无关的参考生成 | `src/light_vllm/generation/reference.py` |
 | 进程内 Engine 实现 | `src/light_vllm/engine/in_process.py` |
-| iteration batching Engine | `src/light_vllm/engine/batched.py` |
+| 全序列 batching Engine | `src/light_vllm/engine/full_sequence.py` |
 | FastAPI JSON/SSE adapter | `src/light_vllm/serving/http.py` |
 | runtime/engine/transport 装配与 CLI | `src/light_vllm/entrypoints/http.py` |
 | 基础 loader | `src/light_vllm/loaders/torch.py` |
@@ -253,7 +254,7 @@ elif spec.loader == "state-dict":
 ```mermaid
 flowchart LR
     P0["P0 已完成<br/>Loader + Minimal Forward"] --> Slice["参考纵切已完成<br/>Generate + EngineClient + HTTP"]
-    Slice --> P1["P1 已完成参考版<br/>Raw / Continuous Batching"]
+    Slice --> P1["P1 已完成参考版<br/>Static / Continuous Batching"]
     P1 --> P2["P2 下一步<br/>KV Cache / Block Allocator"]
     P2 --> P3["P3 Execution Path<br/>Prefill / Decode / Batch"]
     P3 --> P4["P4 Production Serving<br/>Async Engine / Compatibility API"]
@@ -267,7 +268,8 @@ flowchart LR
 
 当前 HTTP 能力可以选择 reference、raw 或 continuous 三种单进程 Engine。`TokenExecutor` 仍只描述单请求
 逐 token 的参考路径；批量路径使用独立的 `BatchTokenExecutor`、`ExecutionBatch` 与 `Scheduler`，没有
-扩张 reference 契约。下一步在这些挂载点之后增加 KV cache 与 prefill/decode，不修改 HTTP adapter。
+扩张 reference 契约。下一步增加独立的 KV-cache Engine Core 与 token-budget 调度计划，不修改 HTTP
+adapter，也不扩张当前全序列重算契约。
 
 ## 9. 生成与协议边界
 
@@ -317,7 +319,7 @@ generator 内部跨 `yield` 持有的执行锁，每个等待请求都会占用�
 当前 `ReferenceGenerationService` 每次把完整 token 序列交给 `TokenExecutor`，并用独立执行锁串行化生成。
 它只维护 token、EOS/长度停止条件和事件，不接触 torch、device、runner 或 logits。当前
 `GreedyTokenExecutor` 会重新构造完整 Tensor，调用 runner、检查 logits 并执行 argmax。这是 CPU 可测试的
-清晰参考实现，不承诺 KV cache 或高并发吞吐。`IterationBatchEngine` 已作为新的 Engine 实现接入
+清晰参考实现，不承诺 KV cache 或高并发吞吐。`FullSequenceBatchEngine` 已作为新的 Engine 实现接入
 `EngineClient`，没有把异步调度塞进同步 reference 契约。
 
 ## 10. EngineClient 与进程演进
@@ -332,15 +334,15 @@ flowchart LR
     Reference --> Executor["TokenExecutor"]
     Executor --> LocalExecutor["GreedyTokenExecutor"]
     LocalExecutor --> Runner["ModelRunner"]
-    Client --> Batched["IterationBatchEngine"]
-    Batched --> Scheduler["Raw / Continuous Scheduler"]
+    Client --> Batched["FullSequenceBatchEngine"]
+    Batched --> Scheduler["Static / Continuous Scheduler"]
     Batched --> ExecutionBatch["ExecutionBatch"]
-    ExecutionBatch --> BatchExecutor["GreedyBatchTokenExecutor"]
+    ExecutionBatch --> BatchExecutor["GreedyFullSequenceBatchExecutor"]
     BatchExecutor --> Runner
     Runner --> Model["Active Model"]
 ```
 
-`RawBatchScheduler` 在当前静态批次全部结束后才接纳下一批请求；
+`StaticBatchScheduler` 在当前静态批次全部结束后才接纳下一批请求；
 `ContinuousBatchScheduler` 每轮都把等待请求补入空槽。二者共用 Engine、执行器、停止条件和事件流，
 因此 continuous batching 与 raw batching 的对比只包含调度策略差异。
 
@@ -361,6 +363,11 @@ cache，每轮仍重算完整序列；这是 CPU 可测试的调度参考实现�
 
 这次拆分固定的是调用方向，不是提前实现分布式。`ReferenceGenerationService` 仍可以被离线代码直接调用，
 因此它是语义 baseline；raw batching 是 continuous batching 的批次性能 baseline。
+
+未来 chunked prefill 使用另一条执行计划边界：Scheduler 根据固定 token budget 返回每个请求本轮的
+`num_scheduled_tokens`，新的 KV-cache Engine Core 据此执行 mixed prefill/decode batch。它不扩张
+`FullSequenceBatchEngine`、`ExecutionBatch` 或 `BatchTokenExecutor` 的“一请求每轮一个 token、完整序列
+重算”语义，因此当前 static/continuous 对照可以长期保留。
 
 当前 HTTP 对输入和输出 token 数各设置 4096 的 adapter 安全上限。它不是模型 context-length
 契约；未来 Scheduler/admission 应根据实际模型配置给出更准确的限制。

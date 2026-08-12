@@ -17,13 +17,16 @@ import torch
 
 from light_vllm.bootstrap import create_runner
 from light_vllm.engine.api import EngineClient
-from light_vllm.engine.batched import IterationBatchEngine
+from light_vllm.engine.full_sequence import FullSequenceBatchEngine
 from light_vllm.engine.in_process import InProcessEngineClient
-from light_vllm.execution.local import GreedyBatchTokenExecutor, GreedyTokenExecutor
+from light_vllm.execution.local import GreedyFullSequenceBatchExecutor, GreedyTokenExecutor
 from light_vllm.generation.reference import ReferenceGenerationService
 from light_vllm.models.api import ModelSpec
 from light_vllm.scheduler.api import Scheduler
-from light_vllm.scheduler.iteration import ContinuousBatchScheduler, RawBatchScheduler
+from light_vllm.scheduler.sequence_batching import (
+    ContinuousBatchScheduler,
+    StaticBatchScheduler,
+)
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -38,7 +41,7 @@ BatchingMode = Literal["reference", "raw", "continuous"]
 # 策略选择只留在 composition root。raw 与 continuous 使用同一个 Engine
 # 和执行器，避免调度模式分支扩散到核心热路径。
 _SCHEDULER_FACTORIES: dict[str, Callable[[int], Scheduler]] = {
-    "raw": lambda max_batch_size: RawBatchScheduler(max_num_sequences=max_batch_size),
+    "raw": lambda max_batch_size: StaticBatchScheduler(max_num_sequences=max_batch_size),
     "continuous": lambda max_batch_size: ContinuousBatchScheduler(max_num_sequences=max_batch_size),
 }
 
@@ -74,12 +77,12 @@ def create_serving_app(
             scheduler_factory = _SCHEDULER_FACTORIES[batching]
         except KeyError as exc:
             raise ValueError(f"unsupported batching mode: {batching}") from exc
-        batch_executor = GreedyBatchTokenExecutor(
+        batch_executor = GreedyFullSequenceBatchExecutor(
             runner,
             device=spec.device,
             padding_token_id=padding_token_id,
         )
-        batch_engine = IterationBatchEngine(
+        batch_engine = FullSequenceBatchEngine(
             batch_executor,
             scheduler_factory(max_batch_size),
         )

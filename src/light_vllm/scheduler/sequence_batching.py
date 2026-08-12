@@ -1,4 +1,4 @@
-"""基于等待队列和运行集合的 iteration scheduler。"""
+"""只按并发序列数组织 static/continuous batch 的调度策略。"""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ class ContinuousBatchScheduler(_IterationScheduler):
         return self._current_batch()
 
 
-class RawBatchScheduler(_IterationScheduler):
+class StaticBatchScheduler(_IterationScheduler):
     """当前静态批次清空后，才接纳下一批等待请求。
 
     即使某个请求提前完成并空出槽位，只要同一批还有请求运行，就不补位。

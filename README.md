@@ -26,8 +26,8 @@ ModelSpec
 HTTP / future RPC ──> EngineClient
                           ├── InProcessEngineClient
                           │       └── reference GenerationService ──> ModelRunner.forward
-                          ├── IterationBatchEngine
-                          │       ├── RawBatchScheduler
+                          ├── FullSequenceBatchEngine
+                          │       ├── StaticBatchScheduler
                           │       └── ContinuousBatchScheduler
                           └── future ProcessEngineClient
 
@@ -44,8 +44,8 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `Catalog` / `Registry`：显式扩展点，避免在核心路径增加类型判断。
 - `ReferenceGenerationService`：以 token event stream 为唯一路径的最小生成参考实现。
 - `InProcessEngineClient`：把同步 reference 实现适配为稳定的异步 serving 端口。
-- `IterationBatchEngine`：按 `schedule -> execute -> update` 驱动批量生成。
-- `RawBatchScheduler`：静态批处理基线，当前批次清空后才接纳下一批请求。
+- `FullSequenceBatchEngine`：按 `schedule -> execute -> update` 驱动全序列重算批量生成。
+- `StaticBatchScheduler`：静态批处理基线，当前批次清空后才接纳下一批请求。
 - `ContinuousBatchScheduler`：每轮模型执行后补入等待请求。
 - FastAPI adapter：协议外层的 JSON/SSE 接口，只依赖 `EngineClient`。
 
@@ -98,7 +98,7 @@ light-vllm-serve \
 - `raw`：静态 iteration batching，批次未清空时不补位。
 - `continuous`：iteration-level continuous batching，每轮结束后补位。
 
-raw 与 continuous 共用同一个 `IterationBatchEngine` 和 `GreedyBatchTokenExecutor`，只替换 Scheduler，
+raw 与 continuous 共用同一个 `FullSequenceBatchEngine` 和 `GreedyFullSequenceBatchExecutor`，只替换 Scheduler，
 因此可以用同一模型、请求集和 batch size 公平对比。当前批量执行会右侧补齐不同长度序列，并通过
 `ForwardBatch.sequence_lengths` 标记每行有效长度。
 
@@ -145,3 +145,7 @@ catalog.loaders.register("my-format", my_loader)
 KV Cache、prefill/decode 拆分、定制 attention kernel、分布式执行和 OpenAI-compatible API 仍是后续
 能力。多进程实现将新增 `EngineClient` 实现，而不改 HTTP。性能 Guardian 也只会在指标、token budget
 和安全更新点稳定后，以有界控制面的形式加入。
+
+未来 chunked prefill 不会扩张 `FullSequenceBatchEngine` 的“一请求每轮一个 token”契约。它应使用独立的
+token-budget Scheduler 输出每个请求本轮的计算量，并由新的 KV-cache Engine Core 执行 mixed
+prefill/decode batch；当前 full-sequence 路径继续作为 static/continuous 的可对比基线。

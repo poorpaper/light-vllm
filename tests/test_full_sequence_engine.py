@@ -7,9 +7,9 @@ from threading import Event, Lock
 
 import pytest
 
-from light_vllm import GenerateRequest, GenerationError, IterationBatchEngine
+from light_vllm import FullSequenceBatchEngine, GenerateRequest, GenerationError
 from light_vllm.execution import ExecutionBatch, ExecutionError, TokenSelection
-from light_vllm.scheduler import ContinuousBatchScheduler, RawBatchScheduler, Scheduler
+from light_vllm.scheduler import ContinuousBatchScheduler, Scheduler, StaticBatchScheduler
 
 
 class RecordingBatchExecutor:
@@ -47,7 +47,7 @@ def _run_with_late_request(
         tuple[tuple[int, ...], tuple[int, ...]],
     ]:
         executor = RecordingBatchExecutor(block_first_step=True)
-        engine = IterationBatchEngine(executor, scheduler_factory())
+        engine = FullSequenceBatchEngine(executor, scheduler_factory())
         first = asyncio.create_task(
             engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
         )
@@ -79,21 +79,21 @@ def _run_with_late_request(
     return asyncio.run(run())
 
 
-def test_continuous_and_raw_batching_keep_results_equal_but_refill_differently() -> None:
+def test_continuous_and_static_batching_keep_results_equal_but_refill_differently() -> None:
     continuous_history, continuous_results = _run_with_late_request(
         lambda: ContinuousBatchScheduler(max_num_sequences=2)
     )
-    raw_history, raw_results = _run_with_late_request(
-        lambda: RawBatchScheduler(max_num_sequences=2)
+    static_history, static_results = _run_with_late_request(
+        lambda: StaticBatchScheduler(max_num_sequences=2)
     )
 
-    assert continuous_results == raw_results == ((2, 3, 4), (11,))
+    assert continuous_results == static_results == ((2, 3, 4), (11,))
     assert continuous_history == (
         ((1,),),
         ((1, 2), (10,)),
         ((1, 2, 3),),
     )
-    assert raw_history == (
+    assert static_history == (
         ((1,),),
         ((1, 2),),
         ((1, 2, 3),),
@@ -104,7 +104,7 @@ def test_continuous_and_raw_batching_keep_results_equal_but_refill_differently()
 def test_cancelled_request_is_removed_at_the_next_safe_iteration_boundary() -> None:
     async def run() -> None:
         executor = RecordingBatchExecutor(block_first_step=True)
-        engine = IterationBatchEngine(
+        engine = FullSequenceBatchEngine(
             executor,
             ContinuousBatchScheduler(max_num_sequences=1),
         )
@@ -135,9 +135,9 @@ def test_cancelled_request_is_removed_at_the_next_safe_iteration_boundary() -> N
     asyncio.run(run())
 
 
-def test_iteration_engine_applies_eos_stop_conditions() -> None:
+def test_full_sequence_engine_applies_eos_stop_conditions() -> None:
     async def run() -> None:
-        engine = IterationBatchEngine(
+        engine = FullSequenceBatchEngine(
             RecordingBatchExecutor(),
             ContinuousBatchScheduler(max_num_sequences=2),
         )
@@ -160,7 +160,7 @@ def test_batch_execution_failure_is_delivered_to_the_request() -> None:
             raise ExecutionError("invalid batch output")
 
     async def run() -> None:
-        engine = IterationBatchEngine(
+        engine = FullSequenceBatchEngine(
             FailingBatchExecutor(),
             ContinuousBatchScheduler(max_num_sequences=1),
         )
