@@ -26,9 +26,9 @@ ModelSpec
 HTTP / future RPC ──> EngineClient
                           ├── InProcessEngineClient
                           │       └── reference GenerationService ──> ModelRunner.forward
-                          ├── FullSequenceBatchEngine
-                          │       ├── StaticBatchScheduler
-                          │       └── ContinuousBatchScheduler
+                          ├── EngineCore
+                          │       ├── TokenBudgetScheduler
+                          │       └── LocalModelExecutor
                           └── future ProcessEngineClient
 
 EngineClient.stream ──> GenerationEvent
@@ -44,9 +44,11 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `Catalog` / `Registry`：显式扩展点，避免在核心路径增加类型判断。
 - `ReferenceGenerationService`：以 token event stream 为唯一路径的最小生成参考实现。
 - `InProcessEngineClient`：把同步 reference 实现适配为稳定的异步 serving 端口。
-- `FullSequenceBatchEngine`：按 `schedule -> execute -> update` 驱动全序列重算批量生成。
-- `StaticBatchScheduler`：静态批处理基线，当前批次清空后才接纳下一批请求。
-- `ContinuousBatchScheduler`：每轮模型执行后补入等待请求。
+- `EngineCore`：按 `schedule -> execute -> update` 驱动异步请求与事件流。
+- `TokenBudgetScheduler`：统一规划 prompt、chunked prefill 与 decode 的 token 数。
+- `PagedKVCacheManager`：管理逻辑 block 的预留、提交、回滚和释放。
+- `LocalModelExecutor`：使用连续 K/V tensor 执行本地模型计算。
+- `GreedySampler`：独立于 Executor 的贪心采样策略。
 - FastAPI adapter：协议外层的 JSON/SSE 接口，只依赖 `EngineClient`。
 
 ## 快速开始
@@ -86,21 +88,22 @@ HTTP 是可选 adapter，不会成为核心运行时依赖：
 ```bash
 python -m pip install -e ".[serve]"
 light-vllm-serve \
-  --architecture tiny-causal-lm \
-  --batching continuous \
-  --max-batch-size 8 \
-  --model-args '{"vocab_size": 128, "hidden_size": 32}'
+  --architecture tiny-attention-causal-lm \
+  --runtime engine \
+  --max-num-sequences 8 \
+  --max-num-scheduled-tokens 256 \
+  --kv-num-heads 4 \
+  --kv-head-size 8 \
+  --model-args '{"vocab_size": 128, "hidden_size": 32, "num_heads": 4}'
 ```
 
-`--batching` 支持三种可直接对比的模式：
+`--runtime` 支持两条清晰路径：
 
 - `reference`：一次执行一个完整请求，作为最清楚的语义基线。
-- `raw`：静态 iteration batching，批次未清空时不补位。
-- `continuous`：iteration-level continuous batching，每轮结束后补位。
+- `engine`：token-budget Scheduler、逻辑 KV blocks 和增量模型执行。
 
-raw 与 continuous 共用同一个 `FullSequenceBatchEngine` 和 `GreedyFullSequenceBatchExecutor`，只替换 Scheduler，
-因此可以用同一模型、请求集和 batch size 公平对比。当前批量执行会右侧补齐不同长度序列，并通过
-`ForwardBatch.sequence_lengths` 标记每行有效长度。
+Engine 路径不区分 prefill/decode 模式：Scheduler 只返回每请求本轮 token 数，长 prompt 自然拆成
+chunk；追上全部已知 token 后才采样输出。当前物理 K/V 仍是连续 tensor，尚未实现 Paged Attention。
 
 当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
 
@@ -140,12 +143,7 @@ catalog.loaders.register("my-format", my_loader)
 
 ## 当前非目标
 
-当前 batching 是 P1 的可读参考实现，每轮仍会重新计算每个请求的完整 token 序列；它证明调度、批次、
-取消和事件流边界，不代表已经具备 vLLM 的高性能内存路径。Tokenizer、文本 prompt、sampling、Paged
-KV Cache、prefill/decode 拆分、定制 attention kernel、分布式执行和 OpenAI-compatible API 仍是后续
-能力。多进程实现将新增 `EngineClient` 实现，而不改 HTTP。性能 Guardian 也只会在指标、token budget
-和安全更新点稳定后，以有界控制面的形式加入。
-
-未来 chunked prefill 不会扩张 `FullSequenceBatchEngine` 的“一请求每轮一个 token”契约。它应使用独立的
-token-budget Scheduler 输出每个请求本轮的计算量，并由新的 KV-cache Engine Core 执行 mixed
-prefill/decode batch；当前 full-sequence 路径继续作为 static/continuous 的可对比基线。
+当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback 和独立 Greedy
+Sampler，但物理执行仍使用连续 K/V tensor。Tokenizer、文本 prompt、随机 sampling、Paged Attention、
+prefix caching、preemption、投机解码、分布式执行和 OpenAI-compatible API 仍是后续能力。多进程实现将
+新增 `EngineClient` 实现，而不改 HTTP。

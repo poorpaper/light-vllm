@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from light_vllm.models.api import ForwardBatch, ModelOutput, ModelSpec
+from light_vllm.modeling.models.interfaces import ForwardBatch, ModelOutput, ModelSpec
 
 
 @dataclass(frozen=True, slots=True)

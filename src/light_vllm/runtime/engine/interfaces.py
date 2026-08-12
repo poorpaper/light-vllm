@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol
 
-from light_vllm.generation.api import (
+from light_vllm.runtime.generation.interfaces import (
     GenerateRequest,
     GenerateResult,
     GenerationEvent,

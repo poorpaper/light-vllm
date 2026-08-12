@@ -8,7 +8,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import suppress
 from typing import TypeVar
 
-from light_vllm.generation.api import (
+from light_vllm.runtime.generation.interfaces import (
     GenerateRequest,
     GenerateResult,
     GenerationError,

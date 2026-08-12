@@ -1,417 +1,199 @@
-# light-vllm 架构设计（v0.5）
+# light-vllm 架构设计（v0.7）
 
-这份文档描述 light-vllm 当前已经落地的最小架构，以及后续功能应该沿着哪些边界继续生长。
+这份文档记录当前已经落地的设计。更细的职责说明见 [architecture.md](architecture.md)。
 
-核心思想只有一句话：
-
-> **稳定核心只负责编排契约；变化能力通过注册组件接入。**
+> **稳定核心只编排事实型契约；策略和后端通过组合接入。**
 
 ## 1. 设计目标
 
-| 目标 | 在当前架构中的落实方式 |
+| 目标 | 当前落实方式 |
 | --- | --- |
-| 轻量 | 模型路径与生成路径各自保持单向、短小的依赖链 |
-| 热插拔 | 组件可以运行时注册；新模型完整加载后再原子替换旧引用 |
-| 高扩展 | 模型架构和权重格式各自拥有独立注册表 |
-| 高可读性 | 配置、选择、加载、生成、协议转换和装配各自只有一个职责 |
-| 少边界 case | 功能分发依赖映射，不依赖不断扩大的 `if-elif-else` 树 |
+| 轻量 | `EngineCore → Scheduler → Executor` 单向调用链 |
+| 高可读性 | 请求、调度、执行、采样、模型和协议各有唯一职责 |
+| 高扩展性 | 模型/loader 注册；Sampler 与 Executor 通过组合替换 |
+| 少模式分支 | 不用 prefill/decode/greedy/KV 专用 Executor |
+| 成熟实践 | 采用统一 token budget、Scheduler/KV 协作和 Worker 物理缓存边界 |
 
-完全消灭 `if` 不是目标。输入校验、错误处理和生命周期检查仍然应该显式存在；需要消除的是跨功能、跨后端的条件分发树。
+## 2. 包结构
 
-## 2. 总体组件图
+```text
+src/light_vllm/
+├── modeling/
+│   ├── models/
+│   ├── loaders/
+│   ├── runner.py
+│   ├── catalog.py
+│   └── registry.py
+├── runtime/
+│   ├── generation/
+│   ├── scheduler/
+│   ├── execution/
+│   ├── engine/
+│   ├── sampling.py
+│   └── kv_cache.py
+├── serving/
+├── entrypoints/
+└── bootstrap.py
+```
+
+一级包只表示大的所有权边界。`sampling.py`、`kv_cache.py` 目前职责单一，因此保留为叶子文件；只有真实
+实现增长到多个清晰组件时才拆目录。
+
+## 3. 当前组件图
 
 ```mermaid
 flowchart TB
-    subgraph API["① 各功能域的稳定 API"]
-        ModelAPI["models/api.py<br/>ModelSpec · ForwardBatch · ModelForwarder"]
-        LoaderAPI["loaders/api.py<br/>ModelLoader"]
-        ExecutionAPI["execution/api.py<br/>TokenExecutor · BatchTokenExecutor"]
-        SchedulerAPI["scheduler/api.py<br/>Scheduler · SchedulerBatch"]
-        GenerationAPI["generation/api.py<br/>GenerationService · events"]
-        EngineAPI["engine/api.py<br/>EngineClient"]
-    end
-
-    subgraph Implementations["② 当前实现"]
-        InProcess["InProcessEngineClient<br/>同步流转异步流"]
-        BatchedEngine["FullSequenceBatchEngine<br/>schedule · execute · update"]
-        GreedyService["ReferenceGenerationService<br/>token 编排 · 停止条件 · 事件"]
-        GreedyExecutor["GreedyTokenExecutor<br/>准备 Tensor · 检查输出 · argmax"]
-        BatchExecutor["GreedyFullSequenceBatchExecutor<br/>右侧补齐 · 批量 argmax"]
-        StaticScheduler["StaticBatchScheduler"]
-        ContinuousScheduler["ContinuousBatchScheduler"]
-        Runner["ModelRunner<br/>模型生命周期 + forward"]
-        Tiny["TinyCausalLM<br/>模型计算"]
-    end
-
-    subgraph Extension["③ 注册与加载"]
-        Catalog["Catalog"]
-        ModelRegistry["Registry&lt;ModelFactory&gt;"]
-        LoaderRegistry["Registry&lt;ModelLoader&gt;"]
-        TorchLoaders["Init / StateDict loaders"]
-    end
-
-    subgraph Serving["④ 协议与装配"]
-        HTTP["FastAPI adapter"]
-        Composition["HTTP composition root"]
-        RPC["Future RPC adapter"]
-    end
-
-    HTTP --> EngineAPI
-    RPC -.同级扩展.-> EngineAPI
-    InProcess -.实现.-> EngineAPI
-    InProcess --> GenerationAPI
-    BatchedEngine -.实现.-> EngineAPI
-    BatchedEngine --> SchedulerAPI
-    BatchedEngine --> ExecutionAPI
-    StaticScheduler -.实现.-> SchedulerAPI
-    ContinuousScheduler -.实现.-> SchedulerAPI
-    GreedyService -.实现.-> GenerationAPI
-    GreedyService --> ExecutionAPI
-    GreedyExecutor -.实现.-> ExecutionAPI
-    GreedyExecutor --> ModelAPI
-    Runner -.实现 ModelForwarder.-> ModelAPI
-    GreedyExecutor --> Runner
-    BatchExecutor -.实现.-> ExecutionAPI
-    BatchExecutor --> Runner
-    Runner --> Tiny
-
-    Composition --> InProcess
-    Composition --> BatchedEngine
-    Composition --> GreedyService
-    Composition --> GreedyExecutor
-    Composition --> Runner
-
-    Runner --> Catalog
-    Catalog --> ModelRegistry
-    Catalog --> LoaderRegistry
-    ModelRegistry --> Tiny
-    LoaderRegistry --> TorchLoaders
-    TorchLoaders -.实现.-> LoaderAPI
-
-    classDef contract fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e;
-    classDef core fill:#ede9fe,stroke:#7c3aed,color:#4c1d95;
-    classDef registry fill:#dcfce7,stroke:#16a34a,color:#14532d;
-    classDef impl fill:#fef3c7,stroke:#d97706,color:#78350f;
-    class ModelAPI,LoaderAPI,ExecutionAPI,SchedulerAPI,GenerationAPI,EngineAPI contract;
-    class InProcess,BatchedEngine,GreedyService,GreedyExecutor,BatchExecutor,Runner core;
-    class Catalog,ModelRegistry,LoaderRegistry registry;
-    class Tiny,TorchLoaders,StaticScheduler,ContinuousScheduler impl;
-    class HTTP,RPC,Composition registry;
-```
-
-稳定接口不再集中在一个全局文件，而是由 `models`、`loaders`、`execution`、`scheduler`、`generation`
-和 `engine` 分别在自己的 `api.py` 中维护。实现依赖本域或下游域的 API，不依赖其他具体实现。
-
-当前最关键的执行边界是：`ReferenceGenerationService` 只依赖 `TokenExecutor`；
-`FullSequenceBatchEngine` 只依赖 `Scheduler` 与 `BatchTokenExecutor`。前者保留单请求语义基线，后者维护
-异步请求状态并驱动全序列 iteration-level batching。`GreedyTokenExecutor` 与
-`GreedyFullSequenceBatchExecutor` 负责本地 PyTorch 输入准备、输出检查和贪心选择；协议 adapter 仍只依赖
-异步 `EngineClient`。
-
-## 3. 模型加载时序
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor App as 调用方
-    participant Runner as ModelRunner
-    participant Models as Model Registry
-    participant Loaders as Loader Registry
-    participant Loader as ModelLoader
-    participant Factory as ModelFactory
-    participant Candidate as Candidate Model
-
-    App->>Runner: load(ModelSpec)
-    Runner->>Models: get(spec.architecture)
-    Models-->>Runner: factory
-    Runner->>Loaders: get(spec.loader)
-    Loaders-->>Runner: loader
-    Runner->>Loader: load(spec, factory)
-    Loader->>Factory: factory(spec)
-    Factory-->>Loader: torch.nn.Module
-    Loader->>Candidate: load weights / to(device, dtype) / eval()
-
-    alt 候选模型加载失败
-        Loader--xRunner: exception
-        Note over Runner: 当前模型和 generation 保持不变
-        Runner--xApp: exception
-    else 候选模型加载成功
-        Loader-->>Runner: candidate
-        Note over Runner: 只在候选模型完整可用后进入锁
-        Runner->>Runner: atomic swap + generation += 1
-        Runner-->>App: success
-    end
-```
-
-这个顺序刻意避免“先卸载旧模型，再尝试加载新模型”。首版保证进程内模型引用的原子替换；它还没有承诺跨模型迁移 KV cache 或请求状态。
-
-## 4. 最简单的 forward
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor App as 调用方
-    participant Runner as ModelRunner
-    participant Model as Active Model
-
-    App->>Runner: forward(ForwardBatch)
-    Runner->>Runner: 在锁内读取当前模型引用
-    Note over Runner: 随即释放锁，forward 不长期占锁
-    Runner->>Model: model(batch)
-    Model->>Model: Embedding(input_ids)
-    Model->>Model: Linear(hidden_states)
-    Model-->>Runner: ModelOutput(logits)
-    Runner-->>App: ModelOutput
-```
-
-当前 `TinyCausalLM` 只实现 `Embedding → Linear`。它不是为了模拟完整 Transformer，而是为了先固定输入输出、加载和运行生命周期这三条契约。
-
-## 5. 热替换状态机
-
-```mermaid
-stateDiagram-v2
-    state "未加载" as Empty
-    state "加载首个候选模型" as InitialLoading
-    state "服务中" as Ready
-    state "后台构造新候选模型" as Reloading
-    state "原子替换引用" as Swapping
-
-    [*] --> Empty
-    Empty --> InitialLoading: load(spec)
-    InitialLoading --> Empty: 加载失败
-    InitialLoading --> Ready: 加载成功 / generation = 1
-    Ready --> Reloading: load(new_spec)
-    Reloading --> Ready: 加载失败 / 旧模型不变
-    Reloading --> Swapping: 候选模型可用
-    Swapping --> Ready: generation += 1
-```
-
-## 6. 为什么新增能力不改核心
-
-```mermaid
-flowchart LR
-    Plugin["新插件"] --> NewModel["实现 ModelFactory"]
-    Plugin --> NewLoader["实现 ModelLoader"]
-    NewModel -->|register| ModelRegistry["Model Registry"]
-    NewLoader -->|register| LoaderRegistry["Loader Registry"]
-    ModelRegistry --> Runner["既有 ModelRunner"]
-    LoaderRegistry --> Runner
-    Runner --> Result["自动获得新组合"]
-
-    NoChange["无需修改<br/>ModelRunner / 既有实现"]
-    NoChange -.约束.-> Runner
-
-    classDef plugin fill:#fef3c7,stroke:#d97706,color:#78350f;
-    classDef registry fill:#dcfce7,stroke:#16a34a,color:#14532d;
-    classDef core fill:#ede9fe,stroke:#7c3aed,color:#4c1d95;
-    class Plugin,NewModel,NewLoader plugin;
-    class ModelRegistry,LoaderRegistry registry;
-    class Runner,Result,NoChange core;
-```
-
-例如新增 `SafetensorsLoader` 时，应该新增 loader 实现并注册：
-
-```python
-catalog.loaders.register("safetensors", SafetensorsLoader())
-```
-
-不应该在 `ModelRunner.load` 中加入：
-
-```python
-# 不推荐：功能矩阵最终会变成难以维护的条件树
-if spec.loader == "safetensors":
-    ...
-elif spec.loader == "state-dict":
-    ...
-```
-
-## 7. 代码映射
-
-| 架构角色 | 当前文件 |
-| --- | --- |
-| 模型 API | `src/light_vllm/models/api.py` |
-| loader API | `src/light_vllm/loaders/api.py` |
-| 执行 API | `src/light_vllm/execution/api.py` |
-| 生成 API | `src/light_vllm/generation/api.py` |
-| Engine API | `src/light_vllm/engine/api.py` |
-| 通用注册表 | `src/light_vllm/registry.py` |
-| 模型与 loader 目录 | `src/light_vllm/catalog.py` |
-| 内置组件装配 | `src/light_vllm/bootstrap.py` |
-| 模型生命周期和 forward | `src/light_vllm/runner.py` |
-| 本地 PyTorch 贪心执行 | `src/light_vllm/execution/local.py` |
-| 调度 API | `src/light_vllm/scheduler/api.py` |
-| static/continuous 序列调度策略 | `src/light_vllm/scheduler/sequence_batching.py` |
-| 协议无关的参考生成 | `src/light_vllm/generation/reference.py` |
-| 进程内 Engine 实现 | `src/light_vllm/engine/in_process.py` |
-| 全序列 batching Engine | `src/light_vllm/engine/full_sequence.py` |
-| FastAPI JSON/SSE adapter | `src/light_vllm/serving/http.py` |
-| runtime/engine/transport 装配与 CLI | `src/light_vllm/entrypoints/http.py` |
-| 基础 loader | `src/light_vllm/loaders/torch.py` |
-| 最小参考模型 | `src/light_vllm/models/tiny.py` |
-
-## 8. 当前边界与下一步
-
-```mermaid
-flowchart LR
-    P0["P0 已完成<br/>Loader + Minimal Forward"] --> Slice["参考纵切已完成<br/>Generate + EngineClient + HTTP"]
-    Slice --> P1["P1 已完成参考版<br/>Static / Continuous Batching"]
-    P1 --> P2["P2 下一步<br/>KV Cache / Block Allocator"]
-    P2 --> P3["P3 Execution Path<br/>Prefill / Decode / Batch"]
-    P3 --> P4["P4 Production Serving<br/>Async Engine / Compatibility API"]
-    P4 --> P5["P5 Adaptive Control<br/>Metrics / Guardian"]
-
-    classDef done fill:#dcfce7,stroke:#16a34a,color:#14532d;
-    classDef next fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e;
-    class P0,Slice,P1 done;
-    class P2,P3,P4,P5 next;
-```
-
-当前 HTTP 能力可以选择 reference、raw 或 continuous 三种单进程 Engine。`TokenExecutor` 仍只描述单请求
-逐 token 的参考路径；批量路径使用独立的 `BatchTokenExecutor`、`ExecutionBatch` 与 `Scheduler`，没有
-扩张 reference 契约。下一步增加独立的 KV-cache Engine Core 与 token-budget 调度计划，不修改 HTTP
-adapter，也不扩张当前全序列重算契约。
-
-## 9. 生成与协议边界
-
-![light-vllm reference HTTP serving 架构](assets/http-serving-architecture.svg)
-
-静态文件：[SVG 矢量图](assets/http-serving-architecture.svg) ·
-[PNG 预览图](assets/http-serving-architecture.png)
-
-```mermaid
-flowchart LR
-    Request["GenerateRequest"] --> Local["InProcessEngineClient<br/>async bridge"]
-    Local --> SyncStream["ReferenceGenerationService<br/>token 与停止条件"]
-    SyncStream --> Executor["TokenExecutor<br/>next_token"]
-    Executor --> Runner["ModelRunner<br/>forward"]
-    Runner --> Model["Active Model"]
-    Model -.logits.-> Executor
-    Executor -.token_id.-> SyncStream
-    SyncStream --> Token["TokenGenerated × N"]
-    SyncStream --> Done["GenerationFinished"]
-    Token --> Collect["collect"]
-    Done --> Collect
-    Collect --> Result["GenerateResult"]
-    Result --> JSON["HTTP JSON / RPC unary"]
-    Token --> WireStream["HTTP SSE / RPC server stream"]
-    Done --> WireStream
-```
-
-增量事件流是每个边界的唯一生成执行路径。同步 reference 与异步 EngineClient 各自的 `generate` 都
-收集其 `stream`，因此两种响应模式不会产生两套采样或停止逻辑。HTTP 的 `/generate` 返回 JSON，
-`/generate/stream` 把事件编码成 SSE；未来 RPC adapter 可以把同一事件映射为 unary response 或
-server stream。
-
-`stream` 是否启用、Pydantic/Protobuf schema、HTTP status 和 SSE event name 都属于 adapter，不能进入
-`GenerateRequest`。流在发出首事件前失败时，HTTP adapter 可以返回正常错误状态；发出首事件后状态码
-已经确定，错误会被编码为 `error` event 并结束流。
-
-`InProcessEngineClient` 用一个很薄的 async bridge 每次拉取一个同步领域事件。客户端断开时，bridge
-会关闭底层 iterator，让生成服务的 `finally`/上下文管理及时释放执行锁。HTTP adapter 本身只处理
-async event stream，不知道当前 engine 与它是否处于同一进程。
-
-bridge 在进入 worker thread 前持有一个异步准入锁，因此并发等待者停留在 event loop。若只依赖同步
-generator 内部跨 `yield` 持有的执行锁，每个等待请求都会占用一个 worker thread；线程池耗尽后，当前
-持锁请求将无法调度下一次 `next()` 或 `close()`，造成线程池饥饿死锁。被接纳的 stream 使用专属
-单线程执行器，同步 stream 的创建、`next()` 和 `close()` 固定在同一线程。取消先等待当前同步步骤
-结束，再关闭 iterator，因此不会让后台 `next()` 与清理并发执行。
-
-当前 `ReferenceGenerationService` 每次把完整 token 序列交给 `TokenExecutor`，并用独立执行锁串行化生成。
-它只维护 token、EOS/长度停止条件和事件，不接触 torch、device、runner 或 logits。当前
-`GreedyTokenExecutor` 会重新构造完整 Tensor，调用 runner、检查 logits 并执行 argmax。这是 CPU 可测试的
-清晰参考实现，不承诺 KV cache 或高并发吞吐。`FullSequenceBatchEngine` 已作为新的 Engine 实现接入
-`EngineClient`，没有把异步调度塞进同步 reference 契约。
-
-## 10. EngineClient 与进程演进
-
-当前装配仍然是单进程，但有两条并列路径：
-
-```mermaid
-flowchart LR
     HTTP["FastAPI adapter"] --> Client["EngineClient"]
-    Client --> Local["reference<br/>InProcessEngineClient"]
-    Local --> Reference["ReferenceGenerationService"]
-    Reference --> Executor["TokenExecutor"]
-    Executor --> LocalExecutor["GreedyTokenExecutor"]
-    LocalExecutor --> Runner["ModelRunner"]
-    Client --> Batched["FullSequenceBatchEngine"]
-    Batched --> Scheduler["Static / Continuous Scheduler"]
-    Batched --> ExecutionBatch["ExecutionBatch"]
-    ExecutionBatch --> BatchExecutor["GreedyFullSequenceBatchExecutor"]
-    BatchExecutor --> Runner
-    Runner --> Model["Active Model"]
+
+    Client --> Core["EngineCore"]
+    Client --> Bridge["InProcessEngineClient"]
+    Bridge --> Reference["ReferenceGenerationService"]
+
+    Core --> Scheduler["TokenBudgetScheduler"]
+    Scheduler --> LogicalKV["PagedKVCacheManager<br/>逻辑 block"]
+    Core --> Executor["LocalModelExecutor"]
+    Executor --> TensorKV["ContiguousKVCache<br/>物理 tensor"]
+    Executor --> Sampler["GreedySampler"]
+    Reference --> TokenExecutor["LocalTokenExecutor"]
+    TokenExecutor --> Sampler
+
+    Executor --> Runner["ModelRunner"]
+    TokenExecutor --> Runner
+    Runner --> Catalog["Catalog"]
+    Catalog --> Models["Model Registry"]
+    Catalog --> Loaders["Loader Registry"]
 ```
 
-`StaticBatchScheduler` 在当前静态批次全部结束后才接纳下一批请求；
-`ContinuousBatchScheduler` 每轮都把等待请求补入空槽。二者共用 Engine、执行器、停止条件和事件流，
-因此 continuous batching 与 raw batching 的对比只包含调度策略差异。
+逻辑 manager 名为 `PagedKVCacheManager`，因为它确实分配固定大小逻辑 block；执行侧仍是连续 tensor，
+所以当前阶段明确没有 Paged Attention。
 
-每轮循环按以下顺序执行：
+## 4. 稳定契约
+
+| 契约 | 含义 |
+| --- | --- |
+| `GenerateRequest` / events | 协议无关的用户生成语义 |
+| `SchedulerOutput` | 本轮每请求 token 数、computed 位置和逻辑 block table |
+| `ExecutionBatch` | Engine 从请求状态切出的本轮真实 token |
+| `ExecutionOutput` | 每请求完成的计算量与零到多个确认 token |
+| `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
+| `Sampler` | 从二维 `[batch, vocabulary]` logits 选择 token |
+| `ForwardBatch` / `ModelOutput` | 统一模型张量边界 |
+| `EngineClient` | serving 使用的异步生成端口 |
+
+`SchedulerOutput` 和 `ExecutionOutput` 是未来扩展的关键：前者不包含模式名，后者不限制一次只能输出一个
+token。chunked prefill、普通 decode 和未来投机验证因此能共用同一循环。
+
+## 5. 一次迭代
+
+```mermaid
+sequenceDiagram
+    participant E as EngineCore
+    participant S as Scheduler
+    participant K as Logical KV Manager
+    participant X as ModelExecutor
+    participant M as ModelRunner
+    participant P as Sampler
+
+    E->>S: schedule()
+    S->>K: reserve(request, K)
+    K-->>S: block_ids
+    S-->>E: SchedulerOutput
+    E->>E: 切出 input_token_ids
+    E->>X: execute(ExecutionBatch)
+    X->>M: forward(ForwardBatch)
+    M-->>X: logits + KV updates
+    X->>P: sample(last logits)
+    P-->>X: token IDs
+    X-->>E: ExecutionOutput
+    E->>S: complete(computed, new tokens)
+    S->>K: commit(computed)
+    E->>E: 更新状态并发送事件
+```
+
+执行失败时 Engine 移除本轮请求；Scheduler 释放 reservation 与全部逻辑 block，Executor 的物理缓存经
+lease 在安全边界释放。不会出现逻辑状态已经前进但模型 K/V 没有成功写入的半提交状态。
+
+## 6. KV reserve / commit / rollback
+
+逻辑 KV 使用固定 `block_size`：
+
+```text
+committed=1, reserve=4, block_size=2
+需要覆盖 5 token → 临时持有 3 blocks
+
+若只 commit=2：
+committed 变为 3 → 只需 2 blocks → 自动释放尾部 1 block
+```
+
+当前普通执行总是完整提交本轮输入；部分提交语义为未来投机验证准备。取消或失败使用 `remove()` 释放
+整个请求，无需另外维护 rollback API。
+
+## 7. Sampler
+
+`GreedySampler` 已从本地 Executor 中抽离。两个执行路径显式接收 `Sampler`：
+
+```python
+sampler = GreedySampler()
+reference_executor = LocalTokenExecutor(runner, sampler)
+model_executor = LocalModelExecutor(runner, kv_cache, sampler)
+```
+
+新增 top-k/top-p 时实现新的 Sampler 并装配。投机解码的 acceptance sampler 不等同于普通 Sampler，
+未来会作为 speculative decoder 的内部组件与 proposer、target verify 组合。
+
+## 8. Reference 与 Engine Core
+
+Reference 是同步、无调度、每轮全序列重算的语义基线；`InProcessEngineClient` 仅把它适配到异步端口。
+
+Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSequenceBatchEngine`、`KVCacheBatchEngine`、
+`GreedyFullSequenceBatchExecutor`、`GreedyContiguousKVCacheExecutor` 和 `KVCacheBatchTokenExecutor` 已删除，
+不保留兼容 alias。
+
+## 9. 代码映射
+
+| 角色 | 文件 |
+| --- | --- |
+| 模型契约 | `src/light_vllm/modeling/models/interfaces.py` |
+| loader 契约 | `src/light_vllm/modeling/loaders/interfaces.py` |
+| 模型生命周期 | `src/light_vllm/modeling/runner.py` |
+| 生成契约 | `src/light_vllm/runtime/generation/interfaces.py` |
+| reference 生成 | `src/light_vllm/runtime/generation/reference.py` |
+| 采样 | `src/light_vllm/runtime/sampling.py` |
+| 逻辑/物理 KV 基线 | `src/light_vllm/runtime/kv_cache.py` |
+| 调度契约 | `src/light_vllm/runtime/scheduler/interfaces.py` |
+| token-budget 调度 | `src/light_vllm/runtime/scheduler/token_budget.py` |
+| 执行契约 | `src/light_vllm/runtime/execution/interfaces.py` |
+| 本地执行 | `src/light_vllm/runtime/execution/local.py` |
+| Engine Core | `src/light_vllm/runtime/engine/core.py` |
+| EngineClient | `src/light_vllm/runtime/engine/interfaces.py` |
+| HTTP adapter | `src/light_vllm/serving/http.py` |
+| 装配入口 | `src/light_vllm/entrypoints/http.py` |
+
+## 10. 当前完成度
 
 ```mermaid
 flowchart LR
-    Commands["submit / cancel"] --> Schedule["schedule"]
-    Schedule --> Execute["execute batch"]
-    Execute --> Update["update request state"]
-    Update --> Events["token / finished / error"]
-    Update --> Schedule
+    Model["Model path<br/>完成"] --> Serving["Reference serving<br/>完成"]
+    Serving --> Core["Token-budget Engine Core<br/>完成"]
+    Core --> Logical["逻辑 block reserve/commit/rollback<br/>完成"]
+    Logical --> Sampling["独立 Greedy Sampler<br/>完成"]
+    Sampling --> Paged["物理 Paged Attention<br/>下一步"]
+    Paged --> Prefix["Prefix cache / preemption"]
+    Prefix --> Spec["Speculative decoding"]
 ```
 
-不同长度序列由批量执行器右侧补齐，`ForwardBatch.sequence_lengths` 保存每行有效长度。当前没有 KV
-cache，每轮仍重算完整序列；这是 CPU 可测试的调度参考实现，不是最终性能路径。模型执行期间取消请求
-时，不强停工作线程；Engine 立即移除其调度状态，并在当前迭代完成后丢弃该请求结果。
+当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。
 
-这次拆分固定的是调用方向，不是提前实现分布式。`ReferenceGenerationService` 仍可以被离线代码直接调用，
-因此它是语义 baseline；raw batching 是 continuous batching 的批次性能 baseline。
+## 11. 验证要求
 
-未来 chunked prefill 使用另一条执行计划边界：Scheduler 根据固定 token budget 返回每个请求本轮的
-`num_scheduled_tokens`，新的 KV-cache Engine Core 据此执行 mixed prefill/decode batch。它不扩张
-`FullSequenceBatchEngine`、`ExecutionBatch` 或 `BatchTokenExecutor` 的“一请求每轮一个 token、完整序列
-重算”语义，因此当前 static/continuous 对照可以长期保留。
+提交前至少运行：
 
-当前 HTTP 对输入和输出 token 数各设置 4096 的 adapter 安全上限。它不是模型 context-length
-契约；未来 Scheduler/admission 应根据实际模型配置给出更准确的限制。
-
-后续可以增加进程 Engine 而不改 HTTP/RPC adapter：
-
-```mermaid
-flowchart LR
-    Adapter["HTTP / RPC adapter"] --> Client["ProcessEngineClient"]
-    Client -->|Submit / Cancel| Commands["bounded command channel"]
-    Commands --> Core["Engine Core<br/>Scheduler + request state"]
-    Core --> Worker["Model workers"]
-    Core -->|Token / Finished / Error| Events["event channel"]
-    Events --> Client
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\ruff.exe check .
+.\.venv\Scripts\ruff.exe format --check .
+git diff --check
 ```
 
-`ProcessEngineClient` 负责 request ID、输出分发、背压、取消和 engine 存活状态；Engine Core 独占
-Scheduler、KV cache 和执行状态。IPC 可以先用 `multiprocessing`，有实际扩展需求后再换 ZMQ。传输实现
-不得改变 `EngineClient` 或 generation 数据契约。
-
-## 11. Performance Guardian
-
-Guardian 是可行的，但应位于控制面，不得进入 token 数据热路径：
-
-```mermaid
-flowchart LR
-    Metrics["immutable RuntimeSnapshot"] --> Guardian["Guardian policy"]
-    Guardian --> Decision["bounded TuningDecision"]
-    Decision --> Control["EngineControl port"]
-    Control --> SafePoint["Scheduler safe point"]
-    SafePoint --> Metrics
-```
-
-它应拆成三个独立职责：
-
-1. **Observer**：聚合吞吐、TTFT、TPOT、队列长度、batch 利用率、KV 使用率和 OOM 等指标，输出不可变
-   snapshot。
-2. **Policy**：从 snapshot 产生带原因的 `TuningDecision`；第一版只 dry-run 并记录建议。
-3. **Actuator**：通过 `EngineControl` 请求 Engine 在调度安全点校验并应用决策，Guardian 不直接修改
-   Scheduler 或 KV cache 字段。
-
-适合在线调整的是有明确范围、可回滚且不改变请求语义的参数，例如 batch token budget、并发序列上限
-和调度等待窗口。dtype、模型结构、KV block size 等需要重建或迁移状态的配置不应成为普通在线旋钮。
-自动模式必须包含上下界、冷却时间、迟滞、单次变化幅度、审计日志和回滚条件，避免指标噪声引起振荡。
-
-因此实现顺序是：Scheduler → metrics/snapshot → EngineControl safe point → Guardian dry-run → 有界自动模式。
-当前只记录边界，不增加尚无消费者的空接口。
+测试必须覆盖 token budget、chunked prefill、多 token 输出、逻辑 block 回滚、Sampler 替换、执行失败和
+取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。

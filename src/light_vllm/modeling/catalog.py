@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from light_vllm.loaders.api import ModelLoader
-from light_vllm.models.api import ModelFactory
-from light_vllm.registry import Registry
+from light_vllm.modeling.loaders.interfaces import ModelLoader
+from light_vllm.modeling.models.interfaces import ModelFactory
+from light_vllm.modeling.registry import Registry
 
 
 class Plugin(Protocol):

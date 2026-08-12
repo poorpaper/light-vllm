@@ -11,10 +11,10 @@
         <mxCell id="title" value="&lt;div style=&quot;font-size:30px;font-weight:700;color:#17233C;&quot;&gt;light-vllm 整体架构&lt;/div&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="55" y="28" width="900" height="48" as="geometry" />
         </mxCell>
-        <mxCell id="subtitle" value="&lt;span style=&quot;font-size:13px;color:#667085;&quot;&gt;当前参考纵切 · 稳定 API 按域就近定义 · 变化能力通过注册组件接入&lt;/span&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="subtitle" value="&lt;span style=&quot;font-size:13px;color:#667085;&quot;&gt;当前参考纵切 · 稳定接口按域就近定义 · 变化能力通过注册组件接入&lt;/span&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="57" y="75" width="950" height="28" as="geometry" />
         </mxCell>
-        <mxCell id="legend-api" value="稳定 API" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#4C78FF;fontColor=#2446A8;fontSize=12;fontStyle=1;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="legend-api" value="稳定接口" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#4C78FF;fontColor=#2446A8;fontSize=12;fontStyle=1;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="1370" y="50" width="105" height="30" as="geometry" />
         </mxCell>
         <mxCell id="legend-current" value="当前实现" style="rounded=1;arcSize=18;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#98A2B3;fontColor=#344054;fontSize=12;fontStyle=1;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
@@ -59,16 +59,16 @@
         <mxCell id="transport-api" value="HTTP / RPC schema" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#EEF2F6;strokeColor=#CBD5E1;fontColor=#475467;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="75" y="195" width="210" height="42" as="geometry" />
         </mxCell>
-        <mxCell id="engine-api" value="&lt;b&gt;engine/api.py&lt;/b&gt; · EngineClient" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#4C78FF;fontColor=#2446A8;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="engine-api" value="&lt;b&gt;engine/interfaces.py&lt;/b&gt; · EngineClient" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#DBEAFE;strokeColor=#4C78FF;fontColor=#2446A8;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="355" y="195" width="260" height="42" as="geometry" />
         </mxCell>
-        <mxCell id="generation-api" value="&lt;b&gt;generation/api.py&lt;/b&gt; · events" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7656D6;fontColor=#5535B0;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="generation-api" value="&lt;b&gt;generation/interfaces.py&lt;/b&gt; · events" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7656D6;fontColor=#5535B0;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="685" y="195" width="260" height="42" as="geometry" />
         </mxCell>
-        <mxCell id="execution-api" value="&lt;b&gt;execution/api.py&lt;/b&gt; · TokenExecutor" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D6A229;fontColor=#8A5B00;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="execution-api" value="&lt;b&gt;execution/interfaces.py&lt;/b&gt; · ModelExecutor" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D6A229;fontColor=#8A5B00;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="1015" y="195" width="260" height="42" as="geometry" />
         </mxCell>
-        <mxCell id="model-api" value="&lt;b&gt;models/api.py&lt;/b&gt; · ModelSpec · ForwardBatch · ModelOutput" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#D96B5F;fontColor=#A63B31;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="model-api" value="&lt;b&gt;models/interfaces.py&lt;/b&gt; · ModelSpec · ForwardBatch · ModelOutput" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#D96B5F;fontColor=#A63B31;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="1345" y="195" width="380" height="42" as="geometry" />
         </mxCell>
 
@@ -81,7 +81,7 @@
         <mxCell id="reference" value="&lt;div style=&quot;font-size:17px;font-weight:700;color:#5535B0;&quot;&gt;ReferenceGenerationService&lt;/div&gt;&lt;div style=&quot;font-size:12px;color:#667085;margin-top:8px;&quot;&gt;token 编排 · EOS / length · stream&lt;/div&gt;" style="rounded=1;arcSize=14;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#7656D6;strokeWidth=2;shadow=1;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="685" y="300" width="260" height="116" as="geometry" />
         </mxCell>
-        <mxCell id="greedy" value="&lt;div style=&quot;font-size:17px;font-weight:700;color:#8A5B00;&quot;&gt;GreedyTokenExecutor&lt;/div&gt;&lt;div style=&quot;font-size:12px;color:#667085;margin-top:8px;&quot;&gt;Tensor · output check · argmax&lt;/div&gt;" style="rounded=1;arcSize=14;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#D6A229;strokeWidth=2;shadow=1;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="greedy" value="&lt;div style=&quot;font-size:17px;font-weight:700;color:#8A5B00;&quot;&gt;LocalTokenExecutor&lt;/div&gt;&lt;div style=&quot;font-size:12px;color:#667085;margin-top:8px;&quot;&gt;Tensor · output check · Sampler&lt;/div&gt;" style="rounded=1;arcSize=14;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#D6A229;strokeWidth=2;shadow=1;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="1015" y="300" width="260" height="116" as="geometry" />
         </mxCell>
         <mxCell id="runner" value="&lt;div style=&quot;font-size:17px;font-weight:700;color:#A63B31;&quot;&gt;ModelRunner&lt;/div&gt;&lt;div style=&quot;font-size:12px;color:#667085;margin-top:8px;&quot;&gt;lifecycle · forward&lt;/div&gt;" style="rounded=1;arcSize=14;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#D96B5F;strokeWidth=2;shadow=1;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
@@ -94,7 +94,7 @@
         <mxCell id="future-rpc" value="&lt;b&gt;Future RPC Adapter&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:11px;color:#667085;&quot;&gt;同一 EngineClient&lt;/span&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#98A2B3;dashed=1;dashPattern=5 5;fontColor=#475467;fontSize=13;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="75" y="480" width="210" height="78" as="geometry" />
         </mxCell>
-        <mxCell id="future-engine" value="&lt;b&gt;Scheduled Engine · future&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:11px;color:#667085;&quot;&gt;Scheduler · batches · KV cache&lt;/span&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F8FBFF;strokeColor=#4C78FF;dashed=1;dashPattern=5 5;fontColor=#2446A8;fontSize=13;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="future-engine" value="&lt;b&gt;EngineCore&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:11px;color:#667085;&quot;&gt;Token budget · Logical KV blocks&lt;/span&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F8FBFF;strokeColor=#4C78FF;fontColor=#2446A8;fontSize=13;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="355" y="480" width="260" height="78" as="geometry" />
         </mxCell>
         <mxCell id="model-plugin" value="&lt;b&gt;Future Model Plugin&lt;/b&gt;&lt;br&gt;&lt;span style=&quot;font-size:11px;color:#667085;&quot;&gt;Llama · Qwen · …&lt;/span&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#FFF9F8;strokeColor=#D96B5F;dashed=1;dashPattern=5 5;fontColor=#A63B31;fontSize=13;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
@@ -122,7 +122,7 @@
         <mxCell id="future-rpc-edge" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=1.5;strokeColor=#98A2B3;dashed=1;dashPattern=5 5;endArrow=block;endFill=1;" edge="1" parent="1" source="future-rpc" target="engine-api">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="future-engine-edge" value="implements" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=1.5;strokeColor=#4C78FF;dashed=1;dashPattern=5 5;endArrow=open;endFill=0;fontSize=10;fontColor=#667085;fontFamily=Segoe UI;" edge="1" parent="1" source="future-engine" target="engine-api">
+        <mxCell id="future-engine-edge" value="implements" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=1.5;strokeColor=#4C78FF;endArrow=open;endFill=0;fontSize=10;fontColor=#667085;fontFamily=Segoe UI;" edge="1" parent="1" source="future-engine" target="engine-api">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
 
@@ -135,7 +135,7 @@
         <mxCell id="loading-subtitle" value="候选模型在锁外完整构造；成功后才原子替换当前引用" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=12;fontColor=#667085;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="75" y="707" width="600" height="24" as="geometry" />
         </mxCell>
-        <mxCell id="loader-api-pill" value="&lt;b&gt;loaders/api.py&lt;/b&gt; · ModelLoader" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#35A873;fontColor=#176B4B;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
+        <mxCell id="loader-api-pill" value="&lt;b&gt;loaders/interfaces.py&lt;/b&gt; · ModelLoader" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#35A873;fontColor=#176B4B;fontSize=12;fontFamily=Microsoft YaHei;" vertex="1" parent="1">
           <mxGeometry x="1425" y="682" width="280" height="38" as="geometry" />
         </mxCell>
 
