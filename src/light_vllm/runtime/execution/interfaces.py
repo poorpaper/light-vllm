@@ -19,6 +19,7 @@ class ExecutionRequest:
     request_id: str
     input_token_ids: tuple[int, ...]
     num_computed_tokens: int
+    # 只把分页后端需要的 block table 传给 Executor。
     block_ids: tuple[int, ...] | None
     sampling_required: bool
 

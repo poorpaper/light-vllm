@@ -40,15 +40,27 @@ class KVCacheReservation:
 
 
 class KVCacheManager(Protocol):
-    """Scheduler 管理逻辑 KV reservation 所需的接口。"""
+    """Scheduler 管理 KV 预留状态的接口。
+
+    实现可以返回 block table，也可以只记录 token 数；两者都必须支持提交和释放。
+    """
 
     def add_request(self, request_id: str) -> None: ...
 
-    def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation: ...
+    def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation:
+        """预留本轮 token 的空间；空间不足时抛错。"""
 
-    def commit(self, request_id: str, num_tokens: int) -> None: ...
+        ...
 
-    def free(self, request_id: str) -> bool: ...
+    def commit(self, request_id: str, num_tokens: int) -> None:
+        """提交实际算完的 token，并清掉未使用的预留。"""
+
+        ...
+
+    def free(self, request_id: str) -> bool:
+        """释放请求状态；重复释放返回 False。"""
+
+        ...
 
 
 @dataclass(slots=True)
@@ -65,7 +77,10 @@ class _UnboundedAllocation:
 
 
 class UnboundedKVCacheManager:
-    """为非分页缓存维护 reservation 生命周期，不分配 block 或限制容量。"""
+    """为非分页缓存维护预留生命周期，不分配 block，也不限制容量。
+
+    它只做状态记录，方便和分页 manager 做公平的生成流程对比。
+    """
 
     def __init__(self) -> None:
         self._allocations: dict[str, _UnboundedAllocation] = {}
@@ -78,6 +93,7 @@ class UnboundedKVCacheManager:
         self._allocations[request_id] = _UnboundedAllocation()
 
     def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation:
+        # 即使不分 block，也要记录预留，防止同一请求被重复调度。
         if type(num_tokens) is not int or num_tokens <= 0:
             raise ValueError("num_tokens must be a positive integer")
         allocation = self._get(request_id)
@@ -92,6 +108,7 @@ class UnboundedKVCacheManager:
         )
 
     def commit(self, request_id: str, num_tokens: int) -> None:
+        # 只提交实际完成的前缀；剩余预留在这里一并取消。
         allocation = self._get(request_id)
         if type(num_tokens) is not int or not 0 <= num_tokens <= allocation.num_reserved_tokens:
             raise ValueError("committed token count must be within the active reservation")
@@ -100,6 +117,7 @@ class UnboundedKVCacheManager:
         allocation.num_reserved_tokens = 0
 
     def free(self, request_id: str) -> bool:
+        # Engine 在完成、失败和取消时都会调用，重复释放应保持安全。
         return self._allocations.pop(request_id, None) is not None
 
     def _get(self, request_id: str) -> _UnboundedAllocation:

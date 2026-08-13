@@ -15,6 +15,7 @@ class ScheduledRequest:
     request_id: str
     num_computed_tokens: int
     num_scheduled_tokens: int
+    # 分页后端返回 block table；连续缓存返回 None。
     block_ids: tuple[int, ...] | None
     sampling_required: bool
 

@@ -51,9 +51,11 @@ def _create_kv_manager(
     num_blocks: int,
     block_size: int,
 ) -> KVCacheManager:
+    # 选择只在装配层发生，Scheduler 和 Engine 不感知具体缓存策略。
     if mode == "blocks":
         return PagedKVCacheManager(num_blocks=num_blocks, block_size=block_size)
     if mode == "unbounded":
+        # 无 block 模式忽略分页参数，仅用于对比实验。
         return UnboundedKVCacheManager()
     raise ValueError(f"unsupported KV reservation mode: {mode}")
 
