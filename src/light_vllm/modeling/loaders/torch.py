@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from light_vllm.models.api import ModelFactory, ModelSpec
+from light_vllm.modeling.models.interfaces import ModelFactory, ModelSpec
 
 
 class ModelLoadError(RuntimeError):

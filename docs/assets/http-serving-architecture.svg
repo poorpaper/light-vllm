@@ -74,7 +74,7 @@
 
     <rect x="665" y="222" width="225" height="105" rx="18" fill="url(#port)"/>
     <text x="777" y="263" class="box-title">EngineClient</text>
-    <text x="777" y="291" class="box-note">api.py · async stream + collect</text>
+    <text x="777" y="291" class="box-note">interfaces.py · async stream + collect</text>
 
     <rect x="1010" y="200" width="290" height="150" rx="18" fill="url(#entry)"/>
     <text x="1155" y="240" class="box-title">HTTP Composition Root</text>
@@ -113,7 +113,7 @@
     <text x="490" y="621" class="box-note">reference request lock</text>
 
     <rect x="650" y="500" width="260" height="145" rx="18" fill="#0f766e"/>
-    <text x="780" y="542" class="box-title">GreedyTokenExecutor</text>
+    <text x="780" y="542" class="box-title">LocalTokenExecutor</text>
     <text x="780" y="573" class="box-note">tensor input · output check</text>
     <text x="780" y="597" class="box-note">argmax</text>
     <text x="780" y="621" class="box-note">implements TokenExecutor</text>
@@ -171,11 +171,11 @@
     <rect x="440" y="868" width="250" height="120" rx="18" fill="#1e293b" stroke="#64748b" stroke-width="2" stroke-dasharray="9 8"/>
     <text x="565" y="909" class="box-title">Engine Core</text>
     <text x="565" y="938" class="box-note">Scheduler · request state</text>
-    <text x="565" y="962" class="box-note">continuous batching</text>
+    <text x="565" y="962" class="box-note">token-budget scheduling</text>
 
     <rect x="765" y="868" width="250" height="120" rx="18" fill="#1e293b" stroke="#64748b" stroke-width="2" stroke-dasharray="9 8"/>
     <text x="890" y="909" class="box-title">Model Workers</text>
-    <text x="890" y="938" class="box-note">KV cache · prefill/decode</text>
+    <text x="890" y="938" class="box-note">block table · KV tensors</text>
     <text x="890" y="962" class="box-note">distributed execution</text>
   </g>
 

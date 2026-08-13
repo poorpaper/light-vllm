@@ -9,8 +9,12 @@ from __future__ import annotations
 from collections.abc import Iterator
 from threading import Lock
 
-from light_vllm.execution.api import ExecutionError, ExecutionNotReadyError, TokenExecutor
-from light_vllm.generation.api import (
+from light_vllm.runtime.execution.interfaces import (
+    ExecutionError,
+    ExecutionNotReadyError,
+    TokenExecutor,
+)
+from light_vllm.runtime.generation.interfaces import (
     GenerateRequest,
     GenerateResult,
     GenerationError,

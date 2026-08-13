@@ -266,14 +266,43 @@ def test_tiny_model_serves_an_end_to_end_http_request() -> None:
     assert len(response.json()["token_ids"]) == 4
 
 
-def test_tiny_model_serves_through_the_continuous_batching_engine() -> None:
+def test_tiny_attention_model_serves_through_engine_core() -> None:
     app = create_serving_app(
         ModelSpec(
-            architecture="tiny-causal-lm",
-            model_args={"vocab_size": 16, "hidden_size": 4},
+            architecture="tiny-attention-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
         ),
-        batching="continuous",
-        max_batch_size=2,
+        runtime="engine",
+        max_num_sequences=2,
+        max_num_scheduled_tokens=2,
+        kv_num_layers=1,
+        kv_num_heads=1,
+        kv_head_size=4,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/generate",
+            json={"input_ids": [1, 2], "max_new_tokens": 2},
+        )
+
+    assert response.status_code == 200
+    assert len(response.json()["generated_token_ids"]) == 2
+
+
+def test_engine_core_serves_with_unbounded_kv_reservations() -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture="tiny-attention-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+        ),
+        runtime="engine",
+        kv_reservation="unbounded",
+        max_num_sequences=2,
+        max_num_scheduled_tokens=2,
+        kv_num_layers=1,
+        kv_num_heads=1,
+        kv_head_size=4,
     )
 
     with TestClient(app) as client:

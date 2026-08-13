@@ -5,8 +5,13 @@ from threading import RLock
 import torch
 from torch import nn
 
-from light_vllm.catalog import Catalog
-from light_vllm.models.api import ForwardBatch, ModelNotLoadedError, ModelOutput, ModelSpec
+from light_vllm.modeling.catalog import Catalog
+from light_vllm.modeling.models.interfaces import (
+    ForwardBatch,
+    ModelNotLoadedError,
+    ModelOutput,
+    ModelSpec,
+)
 
 
 class ModelRunner:

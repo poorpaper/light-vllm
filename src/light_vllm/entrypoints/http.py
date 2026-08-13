@@ -16,17 +16,21 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from light_vllm.bootstrap import create_runner
-from light_vllm.engine.api import EngineClient
-from light_vllm.engine.full_sequence import FullSequenceBatchEngine
-from light_vllm.engine.in_process import InProcessEngineClient
-from light_vllm.execution.local import GreedyFullSequenceBatchExecutor, GreedyTokenExecutor
-from light_vllm.generation.reference import ReferenceGenerationService
-from light_vllm.models.api import ModelSpec
-from light_vllm.scheduler.api import Scheduler
-from light_vllm.scheduler.sequence_batching import (
-    ContinuousBatchScheduler,
-    StaticBatchScheduler,
+from light_vllm.modeling.models.interfaces import ModelSpec
+from light_vllm.runtime.engine.core import EngineCore
+from light_vllm.runtime.engine.in_process import InProcessEngineClient
+from light_vllm.runtime.engine.interfaces import EngineClient
+from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
+from light_vllm.runtime.generation.reference import ReferenceGenerationService
+from light_vllm.runtime.kv_cache import (
+    ContiguousKVCache,
+    KVCacheManager,
+    KVCacheSpec,
+    PagedKVCacheManager,
+    UnboundedKVCacheManager,
 )
+from light_vllm.runtime.sampling import GreedySampler
+from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -37,23 +41,39 @@ _DTYPES = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
-BatchingMode = Literal["reference", "raw", "continuous"]
-# 策略选择只留在 composition root。raw 与 continuous 使用同一个 Engine
-# 和执行器，避免调度模式分支扩散到核心热路径。
-_SCHEDULER_FACTORIES: dict[str, Callable[[int], Scheduler]] = {
-    "raw": lambda max_batch_size: StaticBatchScheduler(max_num_sequences=max_batch_size),
-    "continuous": lambda max_batch_size: ContinuousBatchScheduler(max_num_sequences=max_batch_size),
-}
+RuntimeMode = Literal["reference", "engine"]
+KVReservationMode = Literal["blocks", "unbounded"]
+
+
+def _create_kv_manager(
+    mode: KVReservationMode,
+    *,
+    num_blocks: int,
+    block_size: int,
+) -> KVCacheManager:
+    # 选择只在装配层发生，Scheduler 和 Engine 不感知具体缓存策略。
+    if mode == "blocks":
+        return PagedKVCacheManager(num_blocks=num_blocks, block_size=block_size)
+    if mode == "unbounded":
+        # 无 block 模式忽略分页参数，仅用于对比实验。
+        return UnboundedKVCacheManager()
+    raise ValueError(f"unsupported KV reservation mode: {mode}")
 
 
 def create_serving_app(
     spec: ModelSpec,
     *,
-    batching: BatchingMode = "reference",
-    max_batch_size: int = 8,
-    padding_token_id: int = 0,
+    runtime: RuntimeMode = "reference",
+    kv_reservation: KVReservationMode = "blocks",
+    max_num_sequences: int = 8,
+    max_num_scheduled_tokens: int = 256,
+    num_kv_blocks: int = 256,
+    kv_block_size: int = 16,
+    kv_num_layers: int = 1,
+    kv_num_heads: int = 1,
+    kv_head_size: int = 64,
 ) -> FastAPI:
-    """创建单进程 HTTP 服务，并选择 reference 或批处理引擎。
+    """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
     以后换成独立进程引擎时只改这里，不改 HTTP 路由。
     """
@@ -66,28 +86,43 @@ def create_serving_app(
     # reference client 没有常驻 driver；只有批量 Engine 需要在 lifespan
     # 结束时显式等待当前模型迭代完成。
     close_engine: Callable[[], Awaitable[None]] | None = None
-    if batching == "reference":
+    sampler = GreedySampler()
+    if runtime == "reference":
         # 保留原始单请求基线，继续通过轻量 sync-to-async bridge 对外服务。
-        executor = GreedyTokenExecutor(runner, device=spec.device)
+        executor = LocalTokenExecutor(runner, sampler, device=spec.device)
         service = ReferenceGenerationService(executor)
         engine: EngineClient = InProcessEngineClient(service)
     else:
-        # 批量模式只替换 Scheduler，Engine、执行器和 HTTP adapter 完全共用。
-        try:
-            scheduler_factory = _SCHEDULER_FACTORIES[batching]
-        except KeyError as exc:
-            raise ValueError(f"unsupported batching mode: {batching}") from exc
-        batch_executor = GreedyFullSequenceBatchExecutor(
+        if runtime != "engine":
+            raise ValueError(f"unsupported runtime mode: {runtime}")
+        tensor_cache = ContiguousKVCache(
+            KVCacheSpec(
+                num_layers=kv_num_layers,
+                num_kv_heads=kv_num_heads,
+                head_size=kv_head_size,
+                dtype=spec.dtype,
+                device=spec.device,
+            )
+        )
+        logical_cache = _create_kv_manager(
+            kv_reservation,
+            num_blocks=num_kv_blocks,
+            block_size=kv_block_size,
+        )
+        model_executor = LocalModelExecutor(
             runner,
+            tensor_cache,
+            sampler,
             device=spec.device,
-            padding_token_id=padding_token_id,
         )
-        batch_engine = FullSequenceBatchEngine(
-            batch_executor,
-            scheduler_factory(max_batch_size),
+        scheduler = TokenBudgetScheduler(
+            logical_cache,
+            max_num_sequences=max_num_sequences,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
         )
-        engine = batch_engine
-        close_engine = batch_engine.close
+        engine_core = EngineCore(model_executor, scheduler)
+        engine = engine_core
+        close_engine = engine_core.close
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -123,11 +158,20 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=tuple(_DTYPES), default="float32")
     parser.add_argument("--model-args", type=_json_object, default={})
+    parser.add_argument("--runtime", choices=("reference", "engine"), default="reference")
     parser.add_argument(
-        "--batching", choices=("reference", "raw", "continuous"), default="reference"
+        "--kv-reservation",
+        choices=("blocks", "unbounded"),
+        default="blocks",
+        help="use logical KV blocks or an unbounded no-block experiment baseline",
     )
-    parser.add_argument("--max-batch-size", type=int, default=8)
-    parser.add_argument("--padding-token-id", type=int, default=0)
+    parser.add_argument("--max-num-sequences", type=int, default=8)
+    parser.add_argument("--max-num-scheduled-tokens", type=int, default=256)
+    parser.add_argument("--num-kv-blocks", type=int, default=256)
+    parser.add_argument("--kv-block-size", type=int, default=16)
+    parser.add_argument("--kv-num-layers", type=int, default=1)
+    parser.add_argument("--kv-num-heads", type=int, default=1)
+    parser.add_argument("--kv-head-size", type=int, default=64)
     return parser
 
 
@@ -146,9 +190,15 @@ def main() -> None:
     uvicorn.run(
         create_serving_app(
             spec,
-            batching=args.batching,
-            max_batch_size=args.max_batch_size,
-            padding_token_id=args.padding_token_id,
+            runtime=args.runtime,
+            kv_reservation=args.kv_reservation,
+            max_num_sequences=args.max_num_sequences,
+            max_num_scheduled_tokens=args.max_num_scheduled_tokens,
+            num_kv_blocks=args.num_kv_blocks,
+            kv_block_size=args.kv_block_size,
+            kv_num_layers=args.kv_num_layers,
+            kv_num_heads=args.kv_num_heads,
+            kv_head_size=args.kv_head_size,
         ),
         host=args.host,
         port=args.port,

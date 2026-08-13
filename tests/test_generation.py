@@ -8,7 +8,7 @@ from light_vllm import (
     ReferenceGenerationService,
     TokenGenerated,
 )
-from light_vllm.execution import ExecutionError, ExecutionNotReadyError
+from light_vllm.runtime.execution import ExecutionError, ExecutionNotReadyError
 
 
 class IncrementingExecutor:

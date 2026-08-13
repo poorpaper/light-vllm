@@ -15,8 +15,8 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.sse import EventSourceResponse, format_sse_event
 from pydantic import BaseModel, ConfigDict, Field
 
-from light_vllm.engine.api import EngineClient
-from light_vllm.generation.api import (
+from light_vllm.runtime.engine.interfaces import EngineClient
+from light_vllm.runtime.generation.interfaces import (
     GenerateRequest,
     GenerateResult,
     GenerationError,

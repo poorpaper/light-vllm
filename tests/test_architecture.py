@@ -19,17 +19,25 @@ def _imported_modules(path: Path) -> set[str]:
     return modules
 
 
-def test_api_modules_do_not_import_their_implementations() -> None:
+def test_interface_modules_do_not_import_their_implementations() -> None:
     boundaries = {
-        SOURCE_ROOT / "engine" / "api.py": (
-            "light_vllm.engine.full_sequence",
-            "light_vllm.engine.in_process",
+        SOURCE_ROOT / "runtime" / "engine" / "interfaces.py": (
+            "light_vllm.runtime.engine.core",
+            "light_vllm.runtime.engine.in_process",
         ),
-        SOURCE_ROOT / "execution" / "api.py": ("light_vllm.execution.local",),
-        SOURCE_ROOT / "generation" / "api.py": ("light_vllm.generation.reference",),
-        SOURCE_ROOT / "loaders" / "api.py": ("light_vllm.loaders.torch",),
-        SOURCE_ROOT / "models" / "api.py": ("light_vllm.models.tiny",),
-        SOURCE_ROOT / "scheduler" / "api.py": ("light_vllm.scheduler.sequence_batching",),
+        SOURCE_ROOT / "runtime" / "execution" / "interfaces.py": (
+            "light_vllm.runtime.execution.local",
+        ),
+        SOURCE_ROOT / "runtime" / "generation" / "interfaces.py": (
+            "light_vllm.runtime.generation.reference",
+        ),
+        SOURCE_ROOT / "modeling" / "loaders" / "interfaces.py": (
+            "light_vllm.modeling.loaders.torch",
+        ),
+        SOURCE_ROOT / "modeling" / "models" / "interfaces.py": ("light_vllm.modeling.models.tiny",),
+        SOURCE_ROOT / "runtime" / "scheduler" / "interfaces.py": (
+            "light_vllm.runtime.scheduler.token_budget",
+        ),
     }
 
     for path, implementations in boundaries.items():
@@ -37,8 +45,12 @@ def test_api_modules_do_not_import_their_implementations() -> None:
 
 
 def test_generation_reference_does_not_import_model_backend_details() -> None:
-    modules = _imported_modules(SOURCE_ROOT / "generation" / "reference.py")
-    forbidden_prefixes = ("torch", "light_vllm.models", "light_vllm.runner")
+    modules = _imported_modules(SOURCE_ROOT / "runtime" / "generation" / "reference.py")
+    forbidden_prefixes = (
+        "torch",
+        "light_vllm.modeling.models",
+        "light_vllm.modeling.runner",
+    )
 
     assert not any(
         module == prefix or module.startswith(f"{prefix}.")
@@ -47,12 +59,12 @@ def test_generation_reference_does_not_import_model_backend_details() -> None:
     )
 
 
-def test_full_sequence_engine_does_not_import_model_or_transport_details() -> None:
-    modules = _imported_modules(SOURCE_ROOT / "engine" / "full_sequence.py")
+def test_engine_core_does_not_import_model_or_transport_details() -> None:
+    modules = _imported_modules(SOURCE_ROOT / "runtime" / "engine" / "core.py")
     forbidden_prefixes = (
         "torch",
-        "light_vllm.models",
-        "light_vllm.runner",
+        "light_vllm.modeling.models",
+        "light_vllm.modeling.runner",
         "light_vllm.serving",
     )
 
