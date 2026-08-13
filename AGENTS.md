@@ -23,6 +23,7 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
   `PagedKVCacheManager` 额外按容量分配 block table。
+- composition root 通过 `kv_reservation=blocks|unbounded` 选择逻辑 manager；该选择不得进入 Engine 热路径。
 - `LocalModelExecutor` 拥有本地模型计算与连续 K/V tensor；它不决定谁运行或分配多少资源。
 - `ExecutionOutput` 允许一个请求返回零到多个确认 token，为 chunked prefill 和投机解码保留正确语义。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。

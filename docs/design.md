@@ -66,7 +66,8 @@ flowchart TB
 
 `UnboundedKVCacheManager` 只维护 reservation/commit 生命周期，不限制容量或产生位置；
 `PagedKVCacheManager` 分配固定大小逻辑 block。执行侧仍是连续 tensor，所以当前阶段明确没有
-Paged Attention。
+Paged Attention。composition root 使用 `kv_reservation=blocks|unbounded` 选择二者，Scheduler 和 Engine
+不包含模式判断。
 
 ## 4. 稳定契约
 

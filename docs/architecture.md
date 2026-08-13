@@ -130,6 +130,9 @@ flowchart TB
 当前有两种逻辑 manager：`UnboundedKVCacheManager` 为连续缓存提供无 block、无容量限制的实验基线；
 `PagedKVCacheManager` 实现以下逻辑分页管理：
 
+二者只在 composition root 通过 `kv_reservation=unbounded|blocks` 选择；Scheduler、Engine 和 Executor
+不按该模式分支。`unbounded` 仅用于实验，不提供生产容量保护。
+
 1. `reserve(K)` 为本轮最坏情况预留 block；容量不足时该请求不能执行。
 2. 模型成功后 `commit(M)`，其中 `M <= K`。
 3. 未提交的尾部自动回滚并归还多余 block。

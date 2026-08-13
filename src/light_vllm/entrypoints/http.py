@@ -22,7 +22,13 @@ from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
 from light_vllm.runtime.generation.reference import ReferenceGenerationService
-from light_vllm.runtime.kv_cache import ContiguousKVCache, KVCacheSpec, PagedKVCacheManager
+from light_vllm.runtime.kv_cache import (
+    ContiguousKVCache,
+    KVCacheManager,
+    KVCacheSpec,
+    PagedKVCacheManager,
+    UnboundedKVCacheManager,
+)
 from light_vllm.runtime.sampling import GreedySampler
 from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 
@@ -36,12 +42,27 @@ _DTYPES = {
     "bfloat16": torch.bfloat16,
 }
 RuntimeMode = Literal["reference", "engine"]
+KVReservationMode = Literal["blocks", "unbounded"]
+
+
+def _create_kv_manager(
+    mode: KVReservationMode,
+    *,
+    num_blocks: int,
+    block_size: int,
+) -> KVCacheManager:
+    if mode == "blocks":
+        return PagedKVCacheManager(num_blocks=num_blocks, block_size=block_size)
+    if mode == "unbounded":
+        return UnboundedKVCacheManager()
+    raise ValueError(f"unsupported KV reservation mode: {mode}")
 
 
 def create_serving_app(
     spec: ModelSpec,
     *,
     runtime: RuntimeMode = "reference",
+    kv_reservation: KVReservationMode = "blocks",
     max_num_sequences: int = 8,
     max_num_scheduled_tokens: int = 256,
     num_kv_blocks: int = 256,
@@ -81,7 +102,8 @@ def create_serving_app(
                 device=spec.device,
             )
         )
-        logical_cache = PagedKVCacheManager(
+        logical_cache = _create_kv_manager(
+            kv_reservation,
             num_blocks=num_kv_blocks,
             block_size=kv_block_size,
         )
@@ -135,6 +157,12 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=tuple(_DTYPES), default="float32")
     parser.add_argument("--model-args", type=_json_object, default={})
     parser.add_argument("--runtime", choices=("reference", "engine"), default="reference")
+    parser.add_argument(
+        "--kv-reservation",
+        choices=("blocks", "unbounded"),
+        default="blocks",
+        help="use logical KV blocks or an unbounded no-block experiment baseline",
+    )
     parser.add_argument("--max-num-sequences", type=int, default=8)
     parser.add_argument("--max-num-scheduled-tokens", type=int, default=256)
     parser.add_argument("--num-kv-blocks", type=int, default=256)
@@ -161,6 +189,7 @@ def main() -> None:
         create_serving_app(
             spec,
             runtime=args.runtime,
+            kv_reservation=args.kv_reservation,
             max_num_sequences=args.max_num_sequences,
             max_num_scheduled_tokens=args.max_num_scheduled_tokens,
             num_kv_blocks=args.num_kv_blocks,

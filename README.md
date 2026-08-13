@@ -90,6 +90,7 @@ python -m pip install -e ".[serve]"
 light-vllm-serve \
   --architecture tiny-attention-causal-lm \
   --runtime engine \
+  --kv-reservation blocks \
   --max-num-sequences 8 \
   --max-num-scheduled-tokens 256 \
   --kv-num-heads 4 \
@@ -104,6 +105,9 @@ light-vllm-serve \
 
 Engine 路径不区分 prefill/decode 模式：Scheduler 只返回每请求本轮 token 数，长 prompt 自然拆成
 chunk；追上全部已知 token 后才采样输出。当前物理 K/V 仍是连续 tensor，尚未实现 Paged Attention。
+
+`--kv-reservation blocks` 使用逻辑 block 容量管理；`--kv-reservation unbounded` 不分配 block，也不限制
+逻辑 KV 容量，用于在相同连续物理缓存上隔离 block 管理的实验影响。后者不是生产容量保护机制。
 
 当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
 
