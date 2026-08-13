@@ -21,20 +21,40 @@ def _imported_modules(path: Path) -> set[str]:
 
 def test_api_modules_do_not_import_their_implementations() -> None:
     boundaries = {
-        SOURCE_ROOT / "engine" / "api.py": "light_vllm.engine.in_process",
-        SOURCE_ROOT / "execution" / "api.py": "light_vllm.execution.local",
-        SOURCE_ROOT / "generation" / "api.py": "light_vllm.generation.reference",
-        SOURCE_ROOT / "loaders" / "api.py": "light_vllm.loaders.torch",
-        SOURCE_ROOT / "models" / "api.py": "light_vllm.models.tiny",
+        SOURCE_ROOT / "engine" / "api.py": (
+            "light_vllm.engine.full_sequence",
+            "light_vllm.engine.in_process",
+        ),
+        SOURCE_ROOT / "execution" / "api.py": ("light_vllm.execution.local",),
+        SOURCE_ROOT / "generation" / "api.py": ("light_vllm.generation.reference",),
+        SOURCE_ROOT / "loaders" / "api.py": ("light_vllm.loaders.torch",),
+        SOURCE_ROOT / "models" / "api.py": ("light_vllm.models.tiny",),
+        SOURCE_ROOT / "scheduler" / "api.py": ("light_vllm.scheduler.sequence_batching",),
     }
 
-    for path, implementation in boundaries.items():
-        assert implementation not in _imported_modules(path), path
+    for path, implementations in boundaries.items():
+        assert not set(implementations) & _imported_modules(path), path
 
 
 def test_generation_reference_does_not_import_model_backend_details() -> None:
     modules = _imported_modules(SOURCE_ROOT / "generation" / "reference.py")
     forbidden_prefixes = ("torch", "light_vllm.models", "light_vllm.runner")
+
+    assert not any(
+        module == prefix or module.startswith(f"{prefix}.")
+        for module in modules
+        for prefix in forbidden_prefixes
+    )
+
+
+def test_full_sequence_engine_does_not_import_model_or_transport_details() -> None:
+    modules = _imported_modules(SOURCE_ROOT / "engine" / "full_sequence.py")
+    forbidden_prefixes = (
+        "torch",
+        "light_vllm.models",
+        "light_vllm.runner",
+        "light_vllm.serving",
+    )
 
     assert not any(
         module == prefix or module.startswith(f"{prefix}.")

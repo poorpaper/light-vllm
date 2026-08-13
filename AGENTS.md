@@ -29,11 +29,14 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `GreedyTokenExecutor` 负责准备 PyTorch 输入、检查模型输出并选择最高分 token。
 - `ReferenceGenerationService` 只编排 token、停止条件和同步事件流。
 - `InProcessEngineClient` 把同步参考实现适配到异步 serving 端口。
+- `ExecutionBatch` / `BatchTokenExecutor` 定义与单请求执行器分离的批量执行边界。
+- `FullSequenceBatchEngine` 按 `schedule → execute → update` 驱动全序列重算基线。
+- `StaticBatchScheduler` 保留静态批处理基线；`ContinuousBatchScheduler` 每轮补入等待请求。
 - FastAPI adapter 提供 JSON 与 SSE 两种 HTTP 表达，但只依赖 `EngineClient`。
 - 稳定接口按功能域放在各自的 `api.py`；具体实现放在同域的其他模块。
 
-这条纵切用于验证分层，不代表完整 P1-P5 已完成。Scheduler、KV cache、Paged Attention、
-prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine 和生产级 serving 尚未实现。
+这条纵切与 iteration batching 用于验证分层，不代表完整 P2-P5 已完成。KV cache、Paged Attention、
+prefill/decode 拆分、分布式执行、tokenizer、sampling 和生产级 serving 尚未实现。
 不要让这些未来能力提前污染当前契约。
 
 ## 代码地图
@@ -44,6 +47,8 @@ prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine �
 | `src/light_vllm/loaders/api.py` | 权重加载器接口 |
 | `src/light_vllm/generation/api.py` | 生成数据契约与同步生成接口 |
 | `src/light_vllm/execution/api.py` | token 执行接口与执行异常 |
+| `src/light_vllm/scheduler/api.py` | iteration scheduler 稳定接口与批次选择结果 |
+| `src/light_vllm/scheduler/sequence_batching.py` | static 与 continuous 序列批处理策略 |
 | `src/light_vllm/engine/api.py` | serving 使用的异步 Engine 接口 |
 | `src/light_vllm/registry.py` | 通用的名字到组件映射 |
 | `src/light_vllm/catalog.py` | 持有 model/loader 两类扩展点 |
@@ -54,11 +59,14 @@ prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine �
 | `src/light_vllm/execution/local.py` | 本地 PyTorch 输入准备、输出检查与贪心选 token |
 | `src/light_vllm/generation/reference.py` | 协议无关、可直接对比的参考生成服务 |
 | `src/light_vllm/engine/in_process.py` | 同步生成到异步 Engine 的进程内适配器 |
+| `src/light_vllm/engine/full_sequence.py` | 全序列重算 batch Engine、请求状态与事件分发 |
 | `src/light_vllm/serving/http.py` | FastAPI JSON/SSE adapter |
 | `src/light_vllm/entrypoints/http.py` | runtime、engine client 与 HTTP 的装配入口 |
 | `tests/test_minimal_forward.py` | 当前核心契约的行为测试 |
 | `tests/test_generation.py` | 生成事件流与收集语义测试 |
 | `tests/test_engine_client.py` | sync-to-async、收集与取消清理测试 |
+| `tests/test_scheduler.py` | raw/continuous 调度策略测试 |
+| `tests/test_full_sequence_engine.py` | 全序列 iteration loop、补位、取消与语义对比测试 |
 | `tests/test_http_serving.py` | HTTP adapter 与端到端测试 |
 
 ## 必须保持的架构不变量
@@ -84,6 +92,10 @@ prefill/decode 拆分、分布式执行、tokenizer、sampling、异步 engine �
 16. `InProcessEngineClient` 必须在进入 worker thread 前异步串行化请求；等待者不得在线程池中阻塞于
     reference service 的同步执行锁。
 17. 内部代码必须从所属功能域的 `api.py` 导入稳定接口；需要具体实现时直接导入对应实现模块。
+18. `FullSequenceBatchEngine` 只编排请求状态、Scheduler、批量执行与事件；不得包含具体模型或 transport 逻辑。
+19. static 与 continuous batching 必须共用同一个 Engine 和 `BatchTokenExecutor`，只替换 Scheduler 策略。
+20. 请求在模型迭代中取消时必须立即退出后续调度；已开始的同步执行到达安全边界后，其结果必须丢弃。
+21. `ForwardBatch.sequence_lengths` 表示右侧补齐前的有效长度；批量执行器只能从有效位置选择 token。
 
 ## Runner 中锁的准确含义
 
@@ -123,13 +135,14 @@ Registry 不是完整依赖注入容器，也不负责自动发现 Python packag
 
 - `models/api.py`：`ModelSpec`、`ForwardBatch`、`ModelOutput`、`ModelFactory`、`ModelForwarder`；
 - `loaders/api.py`：`ModelLoader`；
-- `execution/api.py`：`TokenExecutor` 以及执行异常；
+- `execution/api.py`：`TokenExecutor`、`BatchTokenExecutor`、`ExecutionBatch` 以及执行异常；
+- `scheduler/api.py`：iteration scheduler 与批次选择结果；
 - `generation/api.py`：生成请求、结果、事件和 `GenerationService`；
 - `engine/api.py`：serving 到 engine 的异步 `EngineClient`。
 
 `api.py` 描述该功能域对外承诺的数据和行为，具体实现放在同域的其他模块。当前
-`InProcessEngineClient` 包装同步 `GenerationService`；未来 IPC client 应实现同一端口，不能要求
-HTTP/RPC adapter 理解进程拓扑。
+`InProcessEngineClient` 包装同步 `GenerationService`；`FullSequenceBatchEngine` 直接实现同一异步端口。
+未来 IPC client 也应保持该端口，不能要求 HTTP/RPC adapter 理解进程拓扑。
 
 `Protocol` 是 Python 中表达行为接口的方式，主要服务于静态类型和可读性，并不会自动做完整运行时校验。必要的边界校验应放在数据
 契约或真正消费该契约的位置，避免散落在具体实现中。
@@ -174,9 +187,8 @@ python -m venv .venv
 
 ## 下一步建议
 
-优先继续 P1 request path：在现有不可变生成契约之后增加 Scheduler 接口和执行批次契约。当前
-`TokenExecutor` 只服务于无 scheduler 的单请求参考路径，不应直接扩张成未来批处理接口。
-Scheduler 应作为新的 Engine 实现接入，而不改变 reference baseline 或 HTTP/RPC adapter。先让请求如何
-进入批次、批次如何交给 runner 变得清楚，再引入 KV cache 与 prefill/decode 优化。性能 Guardian 只能
-在指标、Scheduler 参数所有权和安全更新点明确后加入；它通过控制端口提交有界决策，不得直接修改
-运行时内部状态或进入 token 热路径。
+优先继续 P2 memory path：在现有 iteration scheduler 与执行批次之后增加 KV cache 接口、block allocator
+和显存预算，再拆分 prefill/decode。当前 `TokenExecutor` 继续服务无 scheduler 的单请求参考路径；
+`BatchTokenExecutor` 服务 static/continuous 的全序列重算基线，不应直接塞入 KV block 管理。token budget、
+KV 分配和 preemption 应由 Scheduler/Engine 在安全点拥有，不能进入 `InProcessEngineClient`、reference
+service 或 HTTP/RPC adapter。性能 Guardian 只能在指标、Scheduler 参数所有权和安全更新点明确后加入。

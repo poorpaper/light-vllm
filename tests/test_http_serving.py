@@ -264,3 +264,23 @@ def test_tiny_model_serves_an_end_to_end_http_request() -> None:
     assert response.json()["input_ids"] == [1, 2]
     assert len(response.json()["generated_token_ids"]) == 2
     assert len(response.json()["token_ids"]) == 4
+
+
+def test_tiny_model_serves_through_the_continuous_batching_engine() -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture="tiny-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4},
+        ),
+        batching="continuous",
+        max_batch_size=2,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/generate",
+            json={"input_ids": [1, 2], "max_new_tokens": 2},
+        )
+
+    assert response.status_code == 200
+    assert len(response.json()["generated_token_ids"]) == 2
