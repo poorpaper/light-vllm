@@ -23,6 +23,7 @@ from light_vllm.runtime.kv_cache import (
     KVCacheNotFoundError,
     KVCacheSpec,
     PagedKVCacheManager,
+    UnboundedKVCacheManager,
 )
 from light_vllm.runtime.sampling import GreedySampler
 from light_vllm.runtime.scheduler import TokenBudgetScheduler
@@ -61,6 +62,25 @@ def test_logical_reservation_is_atomic_when_capacity_is_insufficient() -> None:
     with pytest.raises(KVCacheCapacityError):
         manager.reserve("request", 3)
     assert manager.num_free_blocks == 1
+
+
+def test_unbounded_manager_tracks_reservations_without_block_placement() -> None:
+    manager = UnboundedKVCacheManager()
+    manager.add_request("request")
+
+    first = manager.reserve("request", 3)
+    assert first.block_ids is None
+    assert first.num_committed_tokens == 0
+    assert first.num_reserved_tokens == 3
+
+    manager.commit("request", 1)
+    second = manager.reserve("request", 2)
+    assert second.block_ids is None
+    assert second.num_committed_tokens == 1
+    manager.commit("request", 2)
+
+    assert manager.free("request")
+    assert not manager.free("request")
 
 
 def test_contiguous_cache_appends_valid_prefix_and_checks_capacity() -> None:

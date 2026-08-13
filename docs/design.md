@@ -50,7 +50,7 @@ flowchart TB
     Bridge --> Reference["ReferenceGenerationService"]
 
     Core --> Scheduler["TokenBudgetScheduler"]
-    Scheduler --> LogicalKV["PagedKVCacheManager<br/>逻辑 block"]
+    Scheduler --> LogicalKV["KVCacheManager<br/>unbounded 或逻辑 block"]
     Core --> Executor["LocalModelExecutor"]
     Executor --> TensorKV["ContiguousKVCache<br/>物理 tensor"]
     Executor --> Sampler["GreedySampler"]
@@ -64,8 +64,9 @@ flowchart TB
     Catalog --> Loaders["Loader Registry"]
 ```
 
-逻辑 manager 名为 `PagedKVCacheManager`，因为它确实分配固定大小逻辑 block；执行侧仍是连续 tensor，
-所以当前阶段明确没有 Paged Attention。
+`UnboundedKVCacheManager` 只维护 reservation/commit 生命周期，不限制容量或产生位置；
+`PagedKVCacheManager` 分配固定大小逻辑 block。执行侧仍是连续 tensor，所以当前阶段明确没有
+Paged Attention。
 
 ## 4. 稳定契约
 
@@ -115,7 +116,8 @@ lease 在安全边界释放。不会出现逻辑状态已经前进但模型 K/V 
 
 ## 6. KV reserve / commit / rollback
 
-逻辑 KV 使用固定 `block_size`：
+无 block 基线使用 `UnboundedKVCacheManager`，其 reservation 返回 `block_ids=None`，执行成功后仍按同一
+commit 语义推进 token 计数。逻辑分页实现使用固定 `block_size`：
 
 ```text
 committed=1, reserve=4, block_size=2

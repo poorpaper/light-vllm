@@ -53,6 +53,7 @@ flowchart LR
 | --- | --- | --- |
 | `EngineCore` | 请求状态、事件、停止条件、迭代与取消 | tensor、调度策略、HTTP |
 | `TokenBudgetScheduler` | FCFS、并发槽、token budget、逻辑 KV 分配 | 模型 forward、采样、事件 |
+| `UnboundedKVCacheManager` | 无容量限制的 reservation、提交与回滚基线 | block、K/V tensor |
 | `PagedKVCacheManager` | 逻辑 block 预留、提交、回滚、释放 | K/V tensor、attention kernel |
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
 | `LocalModelExecutor` | 本地模型输入、连续 K/V、输出校验、调用 Sampler | 谁能运行、block 分配策略 |
@@ -120,13 +121,14 @@ Engine 对确认 token 逐个应用 EOS 与 `max_new_tokens`，只把真正可�
 
 ```mermaid
 flowchart TB
-    Scheduler["Scheduler / Engine Core"] --> Logical["PagedKVCacheManager<br/>逻辑 block 与容量"]
+    Scheduler["Scheduler / Engine Core"] --> Logical["KVCacheManager<br/>reservation 与可选 block"]
     Output["SchedulerOutput.block_ids<br/>optional"] --> Executor["ModelExecutor / Worker"]
     Executor --> Physical["ContiguousKVCache<br/>当前物理 tensor 基线"]
     Physical -.future.-> Paged["Paged K/V + Paged Attention"]
 ```
 
-当前已经实现逻辑分页管理：
+当前有两种逻辑 manager：`UnboundedKVCacheManager` 为连续缓存提供无 block、无容量限制的实验基线；
+`PagedKVCacheManager` 实现以下逻辑分页管理：
 
 1. `reserve(K)` 为本轮最坏情况预留 block；容量不足时该请求不能执行。
 2. 模型成功后 `commit(M)`，其中 `M <= K`。

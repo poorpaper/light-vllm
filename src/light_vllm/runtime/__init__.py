@@ -33,6 +33,7 @@ from light_vllm.runtime.kv_cache import (
     KVCacheReservation,
     KVCacheSpec,
     PagedKVCacheManager,
+    UnboundedKVCacheManager,
 )
 from light_vllm.runtime.sampling import GreedySampler, Sampler, SamplingError
 from light_vllm.runtime.scheduler import (
@@ -82,4 +83,5 @@ __all__ = [
     "TokenBudgetScheduler",
     "TokenExecutor",
     "TokenGenerated",
+    "UnboundedKVCacheManager",
 ]

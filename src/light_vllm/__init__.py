@@ -48,6 +48,7 @@ from light_vllm.runtime import (
     TokenBudgetScheduler,
     TokenExecutor,
     TokenGenerated,
+    UnboundedKVCacheManager,
 )
 
 __all__ = [
@@ -97,6 +98,7 @@ __all__ = [
     "TokenBudgetScheduler",
     "TokenExecutor",
     "TokenGenerated",
+    "UnboundedKVCacheManager",
     "create_catalog",
     "create_runner",
 ]

@@ -40,7 +40,7 @@ class KVCacheReservation:
 
 
 class KVCacheManager(Protocol):
-    """Scheduler 管理逻辑 KV 容量所需的接口。"""
+    """Scheduler 管理逻辑 KV reservation 所需的接口。"""
 
     def add_request(self, request_id: str) -> None: ...
 
@@ -56,6 +56,59 @@ class _LogicalAllocation:
     block_ids: list[int]
     num_committed_tokens: int = 0
     num_reserved_tokens: int = 0
+
+
+@dataclass(slots=True)
+class _UnboundedAllocation:
+    num_committed_tokens: int = 0
+    num_reserved_tokens: int = 0
+
+
+class UnboundedKVCacheManager:
+    """为非分页缓存维护 reservation 生命周期，不分配 block 或限制容量。"""
+
+    def __init__(self) -> None:
+        self._allocations: dict[str, _UnboundedAllocation] = {}
+
+    def add_request(self, request_id: str) -> None:
+        if not request_id:
+            raise ValueError("request_id must not be empty")
+        if request_id in self._allocations:
+            raise KVCacheError(f"KV cache for request {request_id!r} already exists")
+        self._allocations[request_id] = _UnboundedAllocation()
+
+    def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation:
+        if type(num_tokens) is not int or num_tokens <= 0:
+            raise ValueError("num_tokens must be a positive integer")
+        allocation = self._get(request_id)
+        if allocation.num_reserved_tokens:
+            raise KVCacheError(f"request {request_id!r} already has an active reservation")
+
+        allocation.num_reserved_tokens = num_tokens
+        return KVCacheReservation(
+            block_ids=None,
+            num_committed_tokens=allocation.num_committed_tokens,
+            num_reserved_tokens=num_tokens,
+        )
+
+    def commit(self, request_id: str, num_tokens: int) -> None:
+        allocation = self._get(request_id)
+        if type(num_tokens) is not int or not 0 <= num_tokens <= allocation.num_reserved_tokens:
+            raise ValueError("committed token count must be within the active reservation")
+
+        allocation.num_committed_tokens += num_tokens
+        allocation.num_reserved_tokens = 0
+
+    def free(self, request_id: str) -> bool:
+        return self._allocations.pop(request_id, None) is not None
+
+    def _get(self, request_id: str) -> _UnboundedAllocation:
+        try:
+            return self._allocations[request_id]
+        except KeyError as exc:
+            raise KVCacheNotFoundError(
+                f"KV cache for request {request_id!r} was not found"
+            ) from exc
 
 
 class PagedKVCacheManager:

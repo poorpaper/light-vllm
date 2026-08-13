@@ -1,6 +1,6 @@
 import pytest
 
-from light_vllm.runtime.kv_cache import PagedKVCacheManager
+from light_vllm.runtime.kv_cache import PagedKVCacheManager, UnboundedKVCacheManager
 from light_vllm.runtime.scheduler import SchedulerError, TokenBudgetScheduler
 
 
@@ -58,3 +58,21 @@ def test_scheduler_rejects_duplicate_request_ids() -> None:
 
     with pytest.raises(SchedulerError, match="already scheduled"):
         scheduler.add("request", num_tokens=1)
+
+
+def test_scheduler_supports_reservations_without_block_placement() -> None:
+    scheduler = TokenBudgetScheduler(
+        UnboundedKVCacheManager(),
+        max_num_sequences=1,
+        max_num_scheduled_tokens=2,
+    )
+    scheduler.add("request", num_tokens=3)
+
+    first = scheduler.schedule().requests[0]
+    assert first.block_ids is None
+    assert first.num_scheduled_tokens == 2
+    scheduler.complete("request", num_computed_tokens=2, num_new_tokens=0)
+
+    second = scheduler.schedule().requests[0]
+    assert second.block_ids is None
+    assert second.num_computed_tokens == 2
