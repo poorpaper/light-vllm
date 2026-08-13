@@ -10,12 +10,12 @@ class SchedulerError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ScheduledRequest:
-    """一个请求在本轮获得的 token 预算和逻辑 KV block table。"""
+    """一个请求在本轮获得的 token 预算和可选 KV block table。"""
 
     request_id: str
     num_computed_tokens: int
     num_scheduled_tokens: int
-    block_ids: tuple[int, ...]
+    block_ids: tuple[int, ...] | None
     sampling_required: bool
 
     def __post_init__(self) -> None:
@@ -25,7 +25,8 @@ class ScheduledRequest:
             raise ValueError("num_computed_tokens must be a non-negative integer")
         if type(self.num_scheduled_tokens) is not int or self.num_scheduled_tokens <= 0:
             raise ValueError("num_scheduled_tokens must be a positive integer")
-        object.__setattr__(self, "block_ids", tuple(self.block_ids))
+        if self.block_ids is not None:
+            object.__setattr__(self, "block_ids", tuple(self.block_ids))
 
 
 @dataclass(frozen=True, slots=True)

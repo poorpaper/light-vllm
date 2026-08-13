@@ -27,13 +27,14 @@ class KVCacheNotFoundError(KVCacheError):
 
 @dataclass(frozen=True, slots=True)
 class KVCacheReservation:
-    """Scheduler 为一次执行预留的逻辑 KV 空间。
+    """Scheduler 为一次执行预留的逻辑 KV 空间和可选物理位置。
 
-    ``block_ids`` 是请求当前完整的逻辑 block table；其中可能包含刚为本轮
-    增加、但尚未提交的 block。执行成功后只保留实际提交 token 覆盖的部分。
+    分页 manager 返回请求当前完整的 ``block_ids``；其中可能包含刚为本轮
+    增加、但尚未提交的 block。连续缓存不需要 block table，可以返回 ``None``。
+    执行成功后只保留实际提交 token 覆盖的资源。
     """
 
-    block_ids: tuple[int, ...]
+    block_ids: tuple[int, ...] | None
     num_committed_tokens: int
     num_reserved_tokens: int
 

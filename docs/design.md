@@ -72,7 +72,7 @@ flowchart TB
 | 契约 | 含义 |
 | --- | --- |
 | `GenerateRequest` / events | 协议无关的用户生成语义 |
-| `SchedulerOutput` | 本轮每请求 token 数、computed 位置和逻辑 block table |
+| `SchedulerOutput` | 本轮每请求 token 数、computed 位置和可选逻辑 block table |
 | `ExecutionBatch` | Engine 从请求状态切出的本轮真实 token |
 | `ExecutionOutput` | 每请求完成的计算量与零到多个确认 token |
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
@@ -96,7 +96,7 @@ sequenceDiagram
 
     E->>S: schedule()
     S->>K: reserve(request, K)
-    K-->>S: block_ids
+    K-->>S: optional block_ids
     S-->>E: SchedulerOutput
     E->>E: 切出 input_token_ids
     E->>X: execute(ExecutionBatch)

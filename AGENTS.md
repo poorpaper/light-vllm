@@ -21,7 +21,7 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
 - `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流。
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode。
-- `PagedKVCacheManager` 只管理逻辑 block 的预留、提交、回滚和释放，不保存 tensor。
+- KV manager 管理逻辑 reservation；`PagedKVCacheManager` 额外产生 block table，但连续缓存不要求 block。
 - `LocalModelExecutor` 拥有本地模型计算与连续 K/V tensor；它不决定谁运行或分配多少资源。
 - `ExecutionOutput` 允许一个请求返回零到多个确认 token，为 chunked prefill 和投机解码保留正确语义。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
@@ -68,13 +68,14 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 11. `InProcessEngineClient` 只做 sync-to-async 适配，不承担 scheduling。
 12. `EngineCore` 只编排请求、Scheduler、Executor 和事件，不依赖 torch、具体模型或 transport。
 13. Scheduler 决定谁能运行、运行多少，并同步拥有逻辑 KV 分配；Executor 只执行已可行批次。
-14. `SchedulerOutput` 以事实描述每请求 token 数和 block table，不使用 prefill/decode 模式枚举。
+14. `SchedulerOutput` 以事实描述每请求 token 数和可选 block table，不使用 prefill/decode 模式枚举；
+    非分页后端不得伪造 block ID。
 15. `ExecutionOutput` 可以返回零到多个确认 token；Engine 必须逐个应用 EOS 和长度停止条件。
 16. 逻辑 KV reservation 每轮必须以 commit 或 remove 结束；只提交实际计算成功的 token。
 17. 模型执行失败、输出校验失败或请求取消时，不得把本轮 token 写入 Engine 状态。
 18. 取消请求必须立即退出后续调度；已开始执行的同步步骤到达安全边界后，其结果必须丢弃。
-19. Scheduler/Engine Core 管理 block pool、容量、未来 prefix cache 和 preemption；Executor/Worker 管理
-    tensor、block table 消费与未来 Paged Attention kernel。
+19. Scheduler/Engine Core 管理 KV reservation、分页后端的 block pool、未来 prefix cache 和 preemption；
+    Executor/Worker 管理 tensor、可选 block table 消费与未来 Paged Attention kernel。
 20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。
 21. 投机解码未来由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor。
 22. 不为尚未实现的 attention、memory 或 prefix routing 创建空包。

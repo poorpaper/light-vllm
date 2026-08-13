@@ -26,7 +26,7 @@ light_vllm/
 flowchart LR
     Request["GenerateRequest"] --> Core["EngineCore<br/>请求状态与事件"]
     Core --> Scheduler["TokenBudgetScheduler"]
-    Scheduler --> Plan["SchedulerOutput<br/>token 数 · block table"]
+    Scheduler --> Plan["SchedulerOutput<br/>token 数 · optional block table"]
     Plan --> Core
     Core --> Batch["ExecutionBatch<br/>本轮 token 切片"]
     Batch --> Executor["LocalModelExecutor"]
@@ -70,7 +70,7 @@ ScheduledRequest
 ├── request_id
 ├── num_computed_tokens
 ├── num_scheduled_tokens
-├── block_ids
+├── block_ids: tuple[int, ...] | None
 └── sampling_required
 ```
 
@@ -95,7 +95,7 @@ ExecutionRequest
 ├── request_id
 ├── input_token_ids
 ├── num_computed_tokens
-├── block_ids
+├── block_ids: tuple[int, ...] | None
 └── sampling_required
 ```
 
@@ -121,7 +121,7 @@ Engine 对确认 token 逐个应用 EOS 与 `max_new_tokens`，只把真正可�
 ```mermaid
 flowchart TB
     Scheduler["Scheduler / Engine Core"] --> Logical["PagedKVCacheManager<br/>逻辑 block 与容量"]
-    Output["SchedulerOutput.block_ids"] --> Executor["ModelExecutor / Worker"]
+    Output["SchedulerOutput.block_ids<br/>optional"] --> Executor["ModelExecutor / Worker"]
     Executor --> Physical["ContiguousKVCache<br/>当前物理 tensor 基线"]
     Physical -.future.-> Paged["Paged K/V + Paged Attention"]
 ```
@@ -133,8 +133,9 @@ flowchart TB
 3. 未提交的尾部自动回滚并归还多余 block。
 4. 完成、失败或取消时释放请求全部逻辑 block。
 
-物理执行仍使用请求级连续 tensor，因此当前没有冒充已经实现 Paged Attention。`block_ids` 已经穿过稳定
-调度/执行边界；下一阶段只需让执行侧真正按 block table 读写分页 K/V。
+物理执行仍使用请求级连续 tensor，因此当前没有冒充已经实现 Paged Attention。分页 manager 产生的
+`block_ids` 已经穿过稳定调度/执行边界；非分页后端使用 `None`，不得伪造 block ID。下一阶段只需让
+分页执行侧真正按 block table 读写 K/V。
 
 执行前 Engine 取得物理缓存 lease。执行期间取消会立刻删除请求和逻辑 block，但连续 tensor 等同步模型
 步骤退出 lease 后才真正销毁；本轮输出因 request ID 已不存在而被丢弃。

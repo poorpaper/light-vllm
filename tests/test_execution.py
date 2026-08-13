@@ -93,7 +93,7 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                     request_id="request",
                     input_token_ids=(1, 2),
                     num_computed_tokens=0,
-                    block_ids=(0,),
+                    block_ids=None,
                     sampling_required=False,
                 ),
             )
@@ -106,7 +106,7 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                     request_id="request",
                     input_token_ids=(3,),
                     num_computed_tokens=2,
-                    block_ids=(0, 1),
+                    block_ids=None,
                     sampling_required=True,
                 ),
             )

@@ -14,12 +14,12 @@ class ExecutionNotReadyError(ExecutionError):
 
 @dataclass(frozen=True, slots=True)
 class ExecutionRequest:
-    """一个请求在本轮真正交给模型计算的 token 切片。"""
+    """一个请求在本轮真正交给模型计算的 token 切片和可选 KV block table。"""
 
     request_id: str
     input_token_ids: tuple[int, ...]
     num_computed_tokens: int
-    block_ids: tuple[int, ...]
+    block_ids: tuple[int, ...] | None
     sampling_required: bool
 
     def __post_init__(self) -> None:
@@ -33,7 +33,8 @@ class ExecutionRequest:
         if type(self.num_computed_tokens) is not int or self.num_computed_tokens < 0:
             raise ValueError("num_computed_tokens must be a non-negative integer")
         object.__setattr__(self, "input_token_ids", input_token_ids)
-        object.__setattr__(self, "block_ids", tuple(self.block_ids))
+        if self.block_ids is not None:
+            object.__setattr__(self, "block_ids", tuple(self.block_ids))
 
 
 @dataclass(frozen=True, slots=True)
