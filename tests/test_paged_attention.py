@@ -159,3 +159,40 @@ def test_paged_attention_rejects_an_out_of_range_history_block() -> None:
             torch.randn(1, 1, 2, 4),
             scale=0.5,
         )
+
+
+def test_paged_attention_rejects_an_aliased_block_within_one_request() -> None:
+    cache = _cache()
+    metadata = PagedAttentionMetadata(
+        block_tables=((0, 0),),
+        num_computed_tokens=(2,),
+        query_lengths=(1,),
+    )
+
+    with pytest.raises(KVCacheError, match="aliases a physical block within one request"):
+        TorchPagedAttention(cache, metadata).forward(
+            "attention",
+            torch.randn(1, 1, 2, 4),
+            torch.randn(1, 1, 2, 4),
+            torch.randn(1, 1, 2, 4),
+            scale=0.5,
+        )
+
+
+def test_paged_attention_rejects_aliased_blocks_across_requests() -> None:
+    cache = _cache()
+    metadata = PagedAttentionMetadata(
+        # 两行写不同 offset，单靠重复 slot 校验无法发现它们共享同一物理页。
+        block_tables=((0,), (0,)),
+        num_computed_tokens=(0, 1),
+        query_lengths=(1, 1),
+    )
+
+    with pytest.raises(KVCacheError, match="alias a physical block across requests"):
+        TorchPagedAttention(cache, metadata).forward(
+            "attention",
+            torch.randn(2, 1, 2, 4),
+            torch.randn(2, 1, 2, 4),
+            torch.randn(2, 1, 2, 4),
+            scale=0.5,
+        )

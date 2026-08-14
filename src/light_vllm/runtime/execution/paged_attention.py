@@ -89,6 +89,7 @@ class PagedAttentionMetadata:
     ) -> None:
         """校验本轮可能读取的完整 block table 都落在物理页池内。"""
 
+        owned_blocks: set[int] = set()
         for table, computed, query_length in zip(
             self.block_tables,
             self.num_computed_tokens,
@@ -98,8 +99,15 @@ class PagedAttentionMetadata:
             required_blocks = (computed + query_length + block_size - 1) // block_size
             if len(table) < required_blocks:
                 raise KVCacheError("block table does not cover all scheduled tokens")
-            if any(block_id >= num_blocks for block_id in table[:required_blocks]):
+            required_table = table[:required_blocks]
+            if any(block_id >= num_blocks for block_id in required_table):
                 raise KVCacheError("block table contains an out-of-range physical block")
+            if len(set(required_table)) != len(required_table):
+                raise KVCacheError("block table aliases a physical block within one request")
+            if owned_blocks.intersection(required_table):
+                # Prefix sharing 需要显式的只读 ownership；当前所有活动页必须独占。
+                raise KVCacheError("block tables alias a physical block across requests")
+            owned_blocks.update(required_table)
 
 
 class TorchPagedAttention:
