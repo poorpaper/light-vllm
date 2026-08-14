@@ -88,6 +88,15 @@ class CountingAttentionForwarder:
         return self.model(batch)
 
 
+class ReloadingSampler:
+    def __init__(self, forwarder: CountingAttentionForwarder) -> None:
+        self._forwarder = forwarder
+
+    def sample(self, logits: torch.Tensor) -> tuple[int, ...]:
+        self._forwarder.generation += 1
+        return (7,) * logits.shape[0]
+
+
 class ReloadingAttentionForwarder(CountingAttentionForwarder):
     @property
     def kv_cache_spec(self):
@@ -266,6 +275,24 @@ def test_paged_worker_rejects_output_if_the_model_changes_during_forward() -> No
         PagedModelWorker(
             ReloadingDuringForward(),
             GreedySampler(),
+            PagedKVCacheConfig(num_blocks=2, block_size=2),
+        )
+    )
+    executor.initialize()
+    executor.add_request("request", capacity=2)
+
+    with pytest.raises(ExecutionError, match="model changed during paged execution"):
+        executor.execute(
+            ExecutionBatch(requests=(ExecutionRequest("request", (1,), 0, (0,), True),))
+        )
+
+
+def test_paged_worker_rejects_output_if_the_model_changes_during_sampling() -> None:
+    forwarder = CountingAttentionForwarder()
+    executor = LocalModelExecutor(
+        PagedModelWorker(
+            forwarder,
+            ReloadingSampler(forwarder),
             PagedKVCacheConfig(num_blocks=2, block_size=2),
         )
     )

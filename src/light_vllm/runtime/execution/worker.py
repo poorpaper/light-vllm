@@ -261,7 +261,10 @@ class PagedModelWorker:
         expected_layers = frozenset(layer.layer_id for layer in cache.model_spec.layers)
         if attention.layer_ids != expected_layers:
             raise ExecutionError("model did not execute every configured paged attention layer")
-        return self._build_output(batch, output, query_lengths)
+        execution_output = self._build_output(batch, output, query_lengths)
+        if self._runner.generation != model_generation:
+            raise ExecutionError("model changed during paged execution")
+        return execution_output
 
     def _build_output(
         self,
