@@ -96,6 +96,13 @@ class ReloadingAttentionForwarder(CountingAttentionForwarder):
         return spec
 
 
+class ReloadingDuringForward(CountingAttentionForwarder):
+    def forward(self, batch: ForwardBatch) -> ModelOutput:
+        output = super().forward(batch)
+        self.generation += 1
+        return output
+
+
 def test_reference_executor_delegates_token_choice_to_sampler() -> None:
     executor = LocalTokenExecutor(IncrementingForwarder(), FixedSampler())
 
@@ -252,3 +259,20 @@ def test_paged_worker_rejects_a_model_change_during_cache_initialization() -> No
 
     with pytest.raises(ExecutionError, match="model changed while initializing"):
         executor.initialize()
+
+
+def test_paged_worker_rejects_output_if_the_model_changes_during_forward() -> None:
+    executor = LocalModelExecutor(
+        PagedModelWorker(
+            ReloadingDuringForward(),
+            GreedySampler(),
+            PagedKVCacheConfig(num_blocks=2, block_size=2),
+        )
+    )
+    executor.initialize()
+    executor.add_request("request", capacity=2)
+
+    with pytest.raises(ExecutionError, match="model changed during paged execution"):
+        executor.execute(
+            ExecutionBatch(requests=(ExecutionRequest("request", (1,), 0, (0,), True),))
+        )

@@ -211,7 +211,7 @@ class PagedModelWorker:
         return _PagedExecutionLease()
 
     def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
-        cache = self._get_cache()
+        cache, model_generation = self._get_cache()
         for request in batch.requests:
             if request.block_ids is None:
                 raise ExecutionError("paged worker requires a block table for every request")
@@ -245,6 +245,8 @@ class PagedModelWorker:
             query_lengths=tuple(query_lengths),
         )
         attention = TorchPagedAttention(cache, metadata)
+        if self._runner.generation != model_generation:
+            raise ExecutionError("model changed before paged execution")
         output = _forward(
             self._runner,
             ForwardBatch(
@@ -254,6 +256,8 @@ class PagedModelWorker:
                 attention=attention,
             ),
         )
+        if self._runner.generation != model_generation:
+            raise ExecutionError("model changed during paged execution")
         expected_layers = frozenset(layer.layer_id for layer in cache.model_spec.layers)
         if attention.layer_ids != expected_layers:
             raise ExecutionError("model did not execute every configured paged attention layer")
@@ -286,8 +290,8 @@ class PagedModelWorker:
         )
         return ExecutionOutput(requests=results)
 
-    def _get_cache(self) -> PagedKVCache:
+    def _get_cache(self) -> tuple[PagedKVCache, int]:
         with self._lock:
             if not self.ready or self._cache is None:
                 raise ExecutionNotReadyError("initialize the worker before executing")
-            return self._cache
+            return self._cache, self._model_generation
