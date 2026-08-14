@@ -98,6 +98,10 @@ tokenizer 和生产级 serving。PyTorch Paged Attention 是物理分页正确�
     `UnboundedKVCacheManager + ContiguousModelWorker`；其他组件不得按 KV 模式分支。
 28. Paged Attention 实现必须通过 `AttentionContext` 接入并直接按 block table 读取物理页；不得以拼接完整历史
     tensor 冒充分页实现。
+29. 单请求 block table 不得重复引用同一物理页；prefix sharing 拥有显式只读 ownership 之前，不同活动请求的
+    block table 也不得共享物理页。
+30. 分页 Worker 初始化和执行期间必须固定模型 generation；检测到 reload 时整批失败，不得把新模型与旧页池
+    混用或确认输出。
 
 ## 锁与资源的准确含义
 

@@ -149,6 +149,7 @@ Scheduler、Engine 和 `LocalModelExecutor` 不按该模式分支。`unbounded` 
 2. 模型成功后 `commit(M)`，其中 `M <= K`。
 3. 未提交的尾部自动回滚并归还多余 block。
 4. 完成、失败或取消时释放请求全部逻辑 block。
+5. 当前活动物理页保持请求独占；prefix sharing 落地时必须显式表达只读共享与可写尾页 ownership。
 
 分页 Worker 根据模型的 `ModelKVCacheSpec` 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
 token 通过 block table 映射到物理 slot；`TorchPagedAttention` 先原位写入本轮 K/V，再用在线 softmax 逐页读取
@@ -219,6 +220,8 @@ HTTP 的 JSON、SSE、状态码和输入上限都留在 adapter。进程拆分�
 4. 加载失败时当前模型和 generation 不变。
 5. `forward` 在锁内只复制模型引用，实际模型计算不持有生命周期锁。
 6. 可缓存模型的 KV 规格由模型声明；Worker 只能在模型加载完成且无活动请求时初始化或重建物理页池。
+7. Paged Worker 为 cache 初始化和每次执行固定 generation；期间发生 reload 时丢弃整批输出，避免新模型与旧
+   K/V 页混用。
 
 ## 后续演进顺序
 

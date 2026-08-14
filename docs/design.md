@@ -149,7 +149,8 @@ committed 变为 3 → 只需 2 blocks → 自动释放尾部 1 block
 分页 Worker 持有每层 `[block, offset, kv_head, head_size]` 的全局 K/V tensor。它把请求逻辑位置映射为
 `block_id * block_size + offset`，原位写入本轮 K/V，并按 block table 逐页完成 causal attention。不同长度
 请求会组成一个 padded forward batch，`sequence_lengths` 屏蔽 padding，`positions` 始终保存请求内绝对位置。
-模型只声明 `ModelKVCacheSpec` 并调用 `AttentionContext`，不依赖具体 page layout。
+模型只声明 `ModelKVCacheSpec` 并调用 `AttentionContext`，不依赖具体 page layout。当前每个活动物理页归一个请求
+独占；未来 prefix sharing 必须显式区分只读共享前缀与可写尾页，不能仅允许 block ID 别名。
 
 ## 7. Sampler
 
@@ -224,8 +225,9 @@ flowchart LR
 git diff --check
 ```
 
-测试必须覆盖 token budget、chunked prefill、多 token 输出、逻辑 block 回滚、非连续物理页、跨页
-prefill/decode、GQA、Sampler 替换、执行失败和取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
+测试必须覆盖 token budget、chunked prefill、多 token 输出、逻辑 block 回滚、非连续物理页、block table
+别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、执行失败和取消资源释放。核心 CPU 测试不得依赖可选 GPU
+环境。
 
 边界命名与职责参考 [vLLM Architecture Overview](https://docs.vllm.ai/en/latest/design/arch_overview/)；分页布局与
 按需读取原则参考 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)。本项目保留这些成熟边界，但以
