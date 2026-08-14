@@ -140,3 +140,22 @@ def test_slot_mapping_rejects_a_block_table_that_does_not_cover_the_query() -> N
 
     with pytest.raises(KVCacheError, match="block table does not cover"):
         metadata.slot_mapping(block_size=2, query_width=2, device=torch.device("cpu"))
+
+
+def test_paged_attention_rejects_an_out_of_range_history_block() -> None:
+    cache = _cache()
+    metadata = PagedAttentionMetadata(
+        # 当前 token 写入 block 0，但 attention 也会读取越界的历史 block 4。
+        block_tables=((4, 0),),
+        num_computed_tokens=(2,),
+        query_lengths=(1,),
+    )
+
+    with pytest.raises(KVCacheError, match="out-of-range physical block"):
+        TorchPagedAttention(cache, metadata).forward(
+            "attention",
+            torch.randn(1, 1, 2, 4),
+            torch.randn(1, 1, 2, 4),
+            torch.randn(1, 1, 2, 4),
+            scale=0.5,
+        )

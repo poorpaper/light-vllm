@@ -81,6 +81,26 @@ class PagedAttentionMetadata:
                 mapping[row, query_offset] = block_id * block_size + position % block_size
         return mapping
 
+    def validate_block_tables(
+        self,
+        *,
+        num_blocks: int,
+        block_size: int,
+    ) -> None:
+        """校验本轮可能读取的完整 block table 都落在物理页池内。"""
+
+        for table, computed, query_length in zip(
+            self.block_tables,
+            self.num_computed_tokens,
+            self.query_lengths,
+            strict=True,
+        ):
+            required_blocks = (computed + query_length + block_size - 1) // block_size
+            if len(table) < required_blocks:
+                raise KVCacheError("block table does not cover all scheduled tokens")
+            if any(block_id >= num_blocks for block_id in table[:required_blocks]):
+                raise KVCacheError("block table contains an out-of-range physical block")
+
 
 class TorchPagedAttention:
     """逐物理页读取 K/V 的在线 softmax attention。
@@ -122,6 +142,10 @@ class TorchPagedAttention:
             raise KVCacheError("paged attention query shape does not match the layer spec")
         if key.shape[2:] != (layer_spec.num_kv_heads, layer_spec.head_size):
             raise KVCacheError("paged attention K/V shape does not match the layer spec")
+        self._metadata.validate_block_tables(
+            num_blocks=config.num_blocks,
+            block_size=config.block_size,
+        )
 
         slot_mapping = self._metadata.slot_mapping(
             block_size=config.block_size,
