@@ -114,7 +114,13 @@ def test_engine_accepts_multiple_committed_tokens_from_one_execution() -> None:
 def test_cancelled_request_releases_resources_at_the_safe_boundary() -> None:
     async def run() -> None:
         executor = RecordingExecutor(block_first_step=True)
-        engine = _engine(executor)
+        kv_cache = PagedKVCacheManager(num_blocks=16, block_size=2)
+        scheduler = TokenBudgetScheduler(
+            kv_cache,
+            max_num_sequences=2,
+            max_num_scheduled_tokens=2,
+        )
+        engine = EngineCore(executor, scheduler)
         events = engine.stream(GenerateRequest(input_ids=(1,), max_new_tokens=2))
         pending = asyncio.create_task(anext(events))
         try:
@@ -126,10 +132,12 @@ def test_cancelled_request_releases_resources_at_the_safe_boundary() -> None:
             with suppress(asyncio.CancelledError):
                 await pending
             assert not executor.active
+            assert kv_cache.num_free_blocks == 15
         finally:
             executor.release_first_step.set()
         await events.aclose()
         await engine.close()
+        assert kv_cache.num_free_blocks == 16
 
     asyncio.run(run())
 

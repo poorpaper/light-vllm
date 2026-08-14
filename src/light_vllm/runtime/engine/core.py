@@ -90,6 +90,8 @@ class EngineCore:
         self._executor = executor
         self._scheduler = scheduler
         self._states: dict[str, _RequestState] = {}
+        self._executing_request_ids: set[str] = set()
+        self._pending_scheduler_removals: set[str] = set()
         self._request_ids = count(1)
         self._lock = asyncio.Lock()
         self._driver_task: asyncio.Task[None] | None = None
@@ -193,6 +195,7 @@ class EngineCore:
                     scheduled = self._scheduler.schedule()
                     batch = self._build_execution_batch_locked(scheduled)
                     lease = self._executor.acquire(batch.request_ids)
+                    self._executing_request_ids.update(batch.request_ids)
 
                 try:
                     raw_output = await asyncio.to_thread(self._executor.execute, batch)
@@ -202,7 +205,11 @@ class EngineCore:
                         self._fail_batch_locked(scheduled.request_ids, exc)
                     continue
                 finally:
-                    lease.release()
+                    try:
+                        lease.release()
+                    finally:
+                        async with self._lock:
+                            self._finish_execution_locked(batch.request_ids)
 
                 async with self._lock:
                     self._apply_output_locked(scheduled, output)
@@ -280,9 +287,21 @@ class EngineCore:
     def _remove_request_locked(self, request_id: str) -> _RequestState | None:
         state = self._states.pop(request_id, None)
         if state is not None:
-            self._scheduler.remove(request_id)
+            # 取消立即让请求离开 Engine 和 Worker，但执行中的 block table 必须
+            # 保留到当前同步模型步骤结束，避免物理页被过早复用。
+            if request_id in self._executing_request_ids:
+                self._pending_scheduler_removals.add(request_id)
+            else:
+                self._scheduler.remove(request_id)
             self._executor.free_request(request_id)
         return state
+
+    def _finish_execution_locked(self, request_ids: tuple[str, ...]) -> None:
+        for request_id in request_ids:
+            self._executing_request_ids.discard(request_id)
+            if request_id in self._pending_scheduler_removals:
+                self._pending_scheduler_removals.remove(request_id)
+                self._scheduler.remove(request_id)
 
     def _fail_batch_locked(self, request_ids: tuple[str, ...], exc: Exception) -> None:
         for request_id in request_ids:
