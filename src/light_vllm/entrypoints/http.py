@@ -21,7 +21,8 @@ from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
-from light_vllm.runtime.execution.worker import ContiguousModelWorker
+from light_vllm.runtime.execution.paged_cache import PagedKVCacheConfig
+from light_vllm.runtime.execution.worker import ContiguousModelWorker, PagedModelWorker
 from light_vllm.runtime.generation.reference import ReferenceGenerationService
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCache,
@@ -97,28 +98,41 @@ def create_serving_app(
     else:
         if runtime != "engine":
             raise ValueError(f"unsupported runtime mode: {runtime}")
-        tensor_cache = ContiguousKVCache(
-            KVCacheSpec(
-                num_layers=kv_num_layers,
-                num_kv_heads=kv_num_heads,
-                head_size=kv_head_size,
-                dtype=spec.dtype,
-                device=spec.device,
-            )
-        )
         logical_cache = _create_kv_manager(
             kv_reservation,
             num_blocks=num_kv_blocks,
             block_size=kv_block_size,
         )
-        model_executor = LocalModelExecutor(
-            ContiguousModelWorker(
+        if kv_reservation == "blocks":
+            worker = PagedModelWorker(
+                runner,
+                sampler,
+                PagedKVCacheConfig(
+                    num_blocks=num_kv_blocks,
+                    block_size=kv_block_size,
+                    dtype=spec.dtype,
+                    device=spec.device,
+                ),
+                device=spec.device,
+            )
+        else:
+            # 连续后端只用于无分页的正确性对照；每请求按最大长度分配 tensor。
+            tensor_cache = ContiguousKVCache(
+                KVCacheSpec(
+                    num_layers=kv_num_layers,
+                    num_kv_heads=kv_num_heads,
+                    head_size=kv_head_size,
+                    dtype=spec.dtype,
+                    device=spec.device,
+                )
+            )
+            worker = ContiguousModelWorker(
                 runner,
                 tensor_cache,
                 sampler,
                 device=spec.device,
             )
-        )
+        model_executor = LocalModelExecutor(worker)
         scheduler = TokenBudgetScheduler(
             logical_cache,
             max_num_sequences=max_num_sequences,
@@ -170,7 +184,7 @@ def _create_parser() -> argparse.ArgumentParser:
         "--kv-reservation",
         choices=("blocks", "unbounded"),
         default="blocks",
-        help="use logical KV blocks or an unbounded no-block experiment baseline",
+        help="use physical paged KV or a contiguous unbounded experiment baseline",
     )
     parser.add_argument("--max-num-sequences", type=int, default=8)
     parser.add_argument("--max-num-scheduled-tokens", type=int, default=256)
