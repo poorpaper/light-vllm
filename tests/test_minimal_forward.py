@@ -27,7 +27,23 @@ def test_minimal_forward_shape() -> None:
     output = runner.forward(batch)
 
     assert output.logits.shape == (2, 3, 32)
+    torch.testing.assert_close(batch.positions, torch.tensor([[0, 1, 2], [0, 1, 2]]))
     assert runner.generation == 1
+
+
+def test_forward_batch_validates_explicit_positions() -> None:
+    with pytest.raises(ValueError, match="same shape"):
+        ForwardBatch(
+            input_ids=torch.tensor([[1, 2]]),
+            positions=torch.tensor([[4]]),
+        )
+
+    batch = ForwardBatch(
+        input_ids=torch.tensor([[1, 2]]),
+        positions=torch.tensor([[4, 5]]),
+    )
+
+    torch.testing.assert_close(batch.positions, torch.tensor([[4, 5]]))
 
 
 def test_attention_model_exposes_its_kv_cache_shape_without_runner_dispatch() -> None:

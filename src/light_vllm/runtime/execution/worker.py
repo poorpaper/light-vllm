@@ -91,6 +91,12 @@ class ContiguousModelWorker:
                         dtype=torch.long,
                         device=self._device,
                     ),
+                    positions=torch.arange(
+                        cached_tokens,
+                        cached_tokens + len(request.input_token_ids),
+                        dtype=torch.long,
+                        device=self._device,
+                    ).unsqueeze(0),
                     kv_cache=self._kv_cache.view(request.request_id),
                 )
                 output = _forward(self._runner, forward_batch)
@@ -208,12 +214,19 @@ class PagedModelWorker:
             dtype=torch.long,
             device=self._device,
         )
+        positions = torch.zeros_like(input_ids)
         query_lengths: list[int] = []
         for row, request in enumerate(batch.requests):
             query_length = len(request.input_token_ids)
             query_lengths.append(query_length)
             input_ids[row, :query_length] = torch.tensor(
                 request.input_token_ids,
+                dtype=torch.long,
+                device=self._device,
+            )
+            positions[row, :query_length] = torch.arange(
+                request.num_computed_tokens,
+                request.num_computed_tokens + query_length,
                 dtype=torch.long,
                 device=self._device,
             )
@@ -228,6 +241,7 @@ class PagedModelWorker:
             self._runner,
             ForwardBatch(
                 input_ids=input_ids,
+                positions=positions,
                 sequence_lengths=tuple(query_lengths),
                 attention=attention,
             ),

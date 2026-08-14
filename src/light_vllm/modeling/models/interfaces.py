@@ -70,12 +70,14 @@ class ForwardBatch:
     """传给模型的一批输入 token。
 
     ``input_ids`` 的形状固定为 ``[batch, padded_sequence]``；
+    ``positions`` 使用相同形状，记录每个 token 在请求中的绝对位置；
     ``sequence_lengths`` 记录每行补齐前的有效长度。单请求或等长批次可以
-    省略长度，此时默认每一行都使用完整宽度。``kv_cache`` 是这些输入之前
-    已经计算过的历史，不包含本轮 token。
+    省略 positions 和长度，此时 positions 从零开始、每一行都使用完整宽度。
+    ``kv_cache`` 是这些输入之前已经计算过的历史，不包含本轮 token。
     """
 
     input_ids: Tensor
+    positions: Tensor | None = None
     sequence_lengths: tuple[int, ...] | None = None
     kv_cache: KVCacheState | None = None
     attention: AttentionContext | None = None
@@ -85,6 +87,20 @@ class ForwardBatch:
             raise ValueError("input_ids must have shape [batch, sequence]")
 
         batch_size, sequence_width = self.input_ids.shape
+        positions = self.positions
+        if positions is None:
+            positions = torch.arange(
+                sequence_width,
+                dtype=torch.long,
+                device=self.input_ids.device,
+            ).expand(batch_size, -1)
+        if positions.shape != self.input_ids.shape:
+            raise ValueError("positions must have the same shape as input_ids")
+        if positions.dtype != torch.long or positions.device != self.input_ids.device:
+            raise ValueError("positions must use torch.long on the input_ids device")
+        if bool(torch.any(positions < 0)):
+            raise ValueError("positions must not be negative")
+
         lengths = self.sequence_lengths
         # 在契约边界统一归一化，后续模型和执行器不需要处理 None。
         lengths = (sequence_width,) * batch_size if lengths is None else tuple(lengths)
@@ -97,6 +113,7 @@ class ForwardBatch:
             raise ValueError("sequence lengths must be within the padded sequence width")
         if self.kv_cache is not None and self.kv_cache.layers[0].keys.shape[0] != batch_size:
             raise ValueError("KV cache batch size must match input_ids")
+        object.__setattr__(self, "positions", positions)
         object.__setattr__(self, "sequence_lengths", lengths)
 
 

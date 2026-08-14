@@ -75,6 +75,7 @@ class CountingAttentionForwarder:
             TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
         ).eval()
         self.calls = 0
+        self.position_batches: list[torch.Tensor] = []
 
     @property
     def kv_cache_spec(self):
@@ -82,6 +83,8 @@ class CountingAttentionForwarder:
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
         self.calls += 1
+        assert batch.positions is not None
+        self.position_batches.append(batch.positions.clone())
         return self.model(batch)
 
 
@@ -180,6 +183,10 @@ def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> 
     )
     assert tuple(result.token_ids[0] for result in prefill.requests) == expected_prefill
     assert forwarder.calls == 1
+    torch.testing.assert_close(
+        forwarder.position_batches[0],
+        torch.tensor([[0, 1, 2], [0, 1, 0]]),
+    )
 
     decode = executor.execute(
         ExecutionBatch(
@@ -205,6 +212,7 @@ def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> 
 
     assert tuple(result.token_ids[0] for result in decode.requests) == expected_decode
     assert forwarder.calls == 2
+    torch.testing.assert_close(forwarder.position_batches[1], torch.tensor([[3], [2]]))
 
 
 def test_paged_worker_rejects_execution_without_block_tables() -> None:
