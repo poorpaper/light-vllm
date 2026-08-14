@@ -8,6 +8,8 @@ from typing import Protocol
 import torch
 from torch import Tensor, nn
 
+from light_vllm.modeling.attention.interfaces import AttentionContext, ModelKVCacheSpec
+
 
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
@@ -76,6 +78,7 @@ class ForwardBatch:
     input_ids: Tensor
     sequence_lengths: tuple[int, ...] | None = None
     kv_cache: KVCacheState | None = None
+    attention: AttentionContext | None = None
 
     def __post_init__(self) -> None:
         if self.input_ids.ndim != 2:
@@ -120,5 +123,8 @@ class ModelForwarder(Protocol):
 
     @property
     def generation(self) -> int: ...
+
+    @property
+    def kv_cache_spec(self) -> ModelKVCacheSpec | None: ...
 
     def forward(self, batch: ForwardBatch) -> ModelOutput: ...

@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from light_vllm import ForwardBatch, ModelOutput, ModelSpec, create_catalog, create_runner
+from light_vllm.modeling.attention import AttentionLayerSpec, ModelKVCacheSpec
 from light_vllm.modeling.models.interfaces import ModelFactory
 
 
@@ -27,6 +28,27 @@ def test_minimal_forward_shape() -> None:
 
     assert output.logits.shape == (2, 3, 32)
     assert runner.generation == 1
+
+
+def test_attention_model_exposes_its_kv_cache_shape_without_runner_dispatch() -> None:
+    runner = create_runner()
+    runner.load(
+        ModelSpec(
+            architecture="tiny-attention-causal-lm",
+            model_args={"vocab_size": 32, "hidden_size": 8, "num_heads": 2},
+        )
+    )
+
+    assert runner.kv_cache_spec == ModelKVCacheSpec(
+        layers=(
+            AttentionLayerSpec(
+                layer_id="attention",
+                num_query_heads=2,
+                num_kv_heads=2,
+                head_size=4,
+            ),
+        )
+    )
 
 
 def test_state_dict_loader_round_trip(tmp_path: Path) -> None:

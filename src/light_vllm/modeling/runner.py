@@ -5,6 +5,7 @@ from threading import RLock
 import torch
 from torch import nn
 
+from light_vllm.modeling.attention.interfaces import ModelKVCacheSpec
 from light_vllm.modeling.catalog import Catalog
 from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
@@ -27,6 +28,17 @@ class ModelRunner:
     def generation(self) -> int:
         with self._lock:
             return self._generation
+
+    @property
+    def kv_cache_spec(self) -> ModelKVCacheSpec | None:
+        with self._lock:
+            model = self._model
+        if model is None:
+            return None
+        spec = getattr(model, "kv_cache_spec", None)
+        if spec is not None and not isinstance(spec, ModelKVCacheSpec):
+            raise TypeError("model kv_cache_spec must be a ModelKVCacheSpec")
+        return spec
 
     def load(self, spec: ModelSpec) -> None:
         factory = self._catalog.models.get(spec.architecture)

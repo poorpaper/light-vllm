@@ -131,6 +131,29 @@ def test_tiny_attention_cached_logits_match_full_sequence_logits() -> None:
     torch.testing.assert_close(cached, full)
 
 
+def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
+    class RecordingAttention:
+        def __init__(self) -> None:
+            self.layer_ids: list[str] = []
+
+        def forward(self, layer_id, query, key, value, *, scale):
+            self.layer_ids.append(layer_id)
+            assert query.shape == key.shape == value.shape == (1, 2, 2, 4)
+            assert scale == 0.5
+            return query
+
+    model = TinyAttentionCausalLM(
+        TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
+    ).eval()
+    attention = RecordingAttention()
+
+    output = model(ForwardBatch(input_ids=torch.tensor([[1, 2]]), attention=attention))
+
+    assert output.logits.shape == (1, 2, 16)
+    assert output.kv_cache_updates is None
+    assert attention.layer_ids == ["attention"]
+
+
 def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> None:
     async def run() -> None:
         torch.manual_seed(11)
