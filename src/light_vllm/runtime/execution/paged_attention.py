@@ -75,6 +75,8 @@ class PagedAttentionMetadata:
             required_blocks = (total_tokens + block_size - 1) // block_size
             if len(table) < required_blocks:
                 raise KVCacheError("block table does not cover all scheduled tokens")
+            if len(table) > required_blocks:
+                raise KVCacheError("block table contains unused physical blocks")
             for query_offset in range(query_length):
                 position = computed + query_offset
                 block_id = table[position // block_size]
@@ -99,15 +101,16 @@ class PagedAttentionMetadata:
             required_blocks = (computed + query_length + block_size - 1) // block_size
             if len(table) < required_blocks:
                 raise KVCacheError("block table does not cover all scheduled tokens")
-            required_table = table[:required_blocks]
-            if any(block_id >= num_blocks for block_id in required_table):
+            if len(table) > required_blocks:
+                raise KVCacheError("block table contains unused physical blocks")
+            if any(block_id >= num_blocks for block_id in table):
                 raise KVCacheError("block table contains an out-of-range physical block")
-            if len(set(required_table)) != len(required_table):
+            if len(set(table)) != len(table):
                 raise KVCacheError("block table aliases a physical block within one request")
-            if owned_blocks.intersection(required_table):
+            if owned_blocks.intersection(table):
                 # Prefix sharing 需要显式的只读 ownership；当前所有活动页必须独占。
                 raise KVCacheError("block tables alias a physical block across requests")
-            owned_blocks.update(required_table)
+            owned_blocks.update(table)
 
 
 class TorchPagedAttention:

@@ -56,7 +56,7 @@ def test_paged_attention_matches_dense_attention_across_blocks_and_requests() ->
     torch.manual_seed(13)
     cache = _cache()
     first_metadata = PagedAttentionMetadata(
-        block_tables=((2, 0), (1, 3)),
+        block_tables=((2, 0), (1,)),
         num_computed_tokens=(0, 0),
         query_lengths=(3, 2),
     )
@@ -194,5 +194,34 @@ def test_paged_attention_rejects_aliased_blocks_across_requests() -> None:
             torch.randn(2, 1, 2, 4),
             torch.randn(2, 1, 2, 4),
             torch.randn(2, 1, 2, 4),
+            scale=0.5,
+        )
+
+
+@pytest.mark.parametrize(
+    ("block_tables", "num_computed_tokens"),
+    [
+        (((0, 0),), (0,)),
+        (((0,), (1, 0)), (0, 0)),
+    ],
+)
+def test_paged_attention_rejects_unused_trailing_blocks(
+    block_tables: tuple[tuple[int, ...], ...],
+    num_computed_tokens: tuple[int, ...],
+) -> None:
+    cache = _cache()
+    batch_size = len(block_tables)
+    metadata = PagedAttentionMetadata(
+        block_tables=block_tables,
+        num_computed_tokens=num_computed_tokens,
+        query_lengths=(1,) * batch_size,
+    )
+
+    with pytest.raises(KVCacheError, match="unused physical blocks"):
+        TorchPagedAttention(cache, metadata).forward(
+            "attention",
+            torch.randn(batch_size, 1, 2, 4),
+            torch.randn(batch_size, 1, 2, 4),
+            torch.randn(batch_size, 1, 2, 4),
             scale=0.5,
         )
