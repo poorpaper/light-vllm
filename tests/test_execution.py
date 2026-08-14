@@ -8,14 +8,20 @@ from light_vllm.modeling.models.interfaces import (
     ModelNotLoadedError,
     ModelOutput,
 )
+from light_vllm.modeling.models.tiny_attention import (
+    TinyAttentionCausalLM,
+    TinyAttentionConfig,
+)
 from light_vllm.runtime.execution import (
+    ContiguousModelWorker,
     ExecutionBatch,
     ExecutionError,
     ExecutionNotReadyError,
     ExecutionRequest,
     LocalModelExecutor,
-    LocalModelWorker,
     LocalTokenExecutor,
+    PagedKVCacheConfig,
+    PagedModelWorker,
 )
 from light_vllm.runtime.kv_cache import ContiguousKVCache, KVCacheSpec
 from light_vllm.runtime.sampling import GreedySampler
@@ -61,6 +67,24 @@ class FixedSampler:
         return (7,) * logits.shape[0]
 
 
+class CountingAttentionForwarder:
+    generation = 1
+
+    def __init__(self) -> None:
+        self.model = TinyAttentionCausalLM(
+            TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
+        ).eval()
+        self.calls = 0
+
+    @property
+    def kv_cache_spec(self):
+        return self.model.kv_cache_spec
+
+    def forward(self, batch: ForwardBatch) -> ModelOutput:
+        self.calls += 1
+        return self.model(batch)
+
+
 def test_reference_executor_delegates_token_choice_to_sampler() -> None:
     executor = LocalTokenExecutor(IncrementingForwarder(), FixedSampler())
 
@@ -84,7 +108,9 @@ def test_reference_executor_checks_model_output_shape() -> None:
 
 def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
     cache = ContiguousKVCache(KVCacheSpec(num_layers=1, num_kv_heads=1, head_size=1))
-    executor = LocalModelExecutor(LocalModelWorker(IncrementingForwarder(), cache, GreedySampler()))
+    executor = LocalModelExecutor(
+        ContiguousModelWorker(IncrementingForwarder(), cache, GreedySampler())
+    )
     executor.add_request("request", capacity=3)
 
     prefill = executor.execute(
@@ -118,3 +144,82 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
     assert prefill.token_ids == ()
     assert decode.token_ids == (4,)
     assert cache.cached_tokens("request") == 3
+
+
+def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> None:
+    torch.manual_seed(23)
+    forwarder = CountingAttentionForwarder()
+    executor = LocalModelExecutor(
+        PagedModelWorker(
+            forwarder,
+            GreedySampler(),
+            PagedKVCacheConfig(num_blocks=8, block_size=2),
+        )
+    )
+    executor.initialize()
+    executor.add_request("a", capacity=5)
+    executor.add_request("b", capacity=4)
+
+    prefill = executor.execute(
+        ExecutionBatch(
+            requests=(
+                ExecutionRequest("a", (1, 2, 3), 0, (4, 1), True),
+                ExecutionRequest("b", (5, 6), 0, (2,), True),
+            )
+        )
+    )
+
+    expected_prefill = tuple(
+        int(
+            forwarder.model(ForwardBatch(input_ids=torch.tensor([tokens])))
+            .logits[0, -1]
+            .argmax()
+            .item()
+        )
+        for tokens in ((1, 2, 3), (5, 6))
+    )
+    assert tuple(result.token_ids[0] for result in prefill.requests) == expected_prefill
+    assert forwarder.calls == 1
+
+    decode = executor.execute(
+        ExecutionBatch(
+            requests=(
+                ExecutionRequest("a", (expected_prefill[0],), 3, (4, 1), True),
+                ExecutionRequest("b", (expected_prefill[1],), 2, (2, 3), True),
+            )
+        )
+    )
+    expected_decode = tuple(
+        int(
+            forwarder.model(ForwardBatch(input_ids=torch.tensor([tokens + (generated,)])))
+            .logits[0, -1]
+            .argmax()
+            .item()
+        )
+        for tokens, generated in zip(
+            ((1, 2, 3), (5, 6)),
+            expected_prefill,
+            strict=True,
+        )
+    )
+
+    assert tuple(result.token_ids[0] for result in decode.requests) == expected_decode
+    assert forwarder.calls == 2
+
+
+def test_paged_worker_rejects_execution_without_block_tables() -> None:
+    forwarder = CountingAttentionForwarder()
+    executor = LocalModelExecutor(
+        PagedModelWorker(
+            forwarder,
+            GreedySampler(),
+            PagedKVCacheConfig(num_blocks=2, block_size=2),
+        )
+    )
+    executor.initialize()
+    executor.add_request("request", capacity=2)
+
+    with pytest.raises(ExecutionError, match="requires a block table"):
+        executor.execute(
+            ExecutionBatch(requests=(ExecutionRequest("request", (1,), 0, None, True),))
+        )

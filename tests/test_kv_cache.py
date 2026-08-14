@@ -15,7 +15,7 @@ from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionConfig,
 )
 from light_vllm.runtime.engine import EngineCore
-from light_vllm.runtime.execution import LocalModelExecutor, LocalModelWorker
+from light_vllm.runtime.execution import ContiguousModelWorker, LocalModelExecutor
 from light_vllm.runtime.generation import GenerateRequest
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCache,
@@ -179,7 +179,7 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
         tensor_cache = ContiguousKVCache(KVCacheSpec(num_layers=1, num_kv_heads=2, head_size=4))
         logical_cache = PagedKVCacheManager(num_blocks=8, block_size=2)
         engine = EngineCore(
-            LocalModelExecutor(LocalModelWorker(Forwarder(), tensor_cache, GreedySampler())),
+            LocalModelExecutor(ContiguousModelWorker(Forwarder(), tensor_cache, GreedySampler())),
             TokenBudgetScheduler(
                 logical_cache,
                 max_num_sequences=2,

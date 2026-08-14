@@ -51,6 +51,10 @@ class PagedKVCache:
     def config(self) -> PagedKVCacheConfig:
         return self._config
 
+    @property
+    def model_spec(self) -> ModelKVCacheSpec:
+        return self._model_spec
+
     def layer_spec(self, layer_id: str) -> AttentionLayerSpec:
         try:
             return self._layer_specs[layer_id]

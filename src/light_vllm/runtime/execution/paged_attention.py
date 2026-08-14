@@ -92,6 +92,11 @@ class TorchPagedAttention:
     def __init__(self, cache: PagedKVCache, metadata: PagedAttentionMetadata) -> None:
         self._cache = cache
         self._metadata = metadata
+        self._layer_ids: set[str] = set()
+
+    @property
+    def layer_ids(self) -> frozenset[str]:
+        return frozenset(self._layer_ids)
 
     def forward(
         self,
@@ -102,6 +107,9 @@ class TorchPagedAttention:
         *,
         scale: float,
     ) -> Tensor:
+        if layer_id in self._layer_ids:
+            raise KVCacheError(f"paged attention layer {layer_id!r} ran more than once")
+        self._layer_ids.add(layer_id)
         layer_spec = self._cache.layer_spec(layer_id)
         config = self._cache.config
         if query.ndim != 4:

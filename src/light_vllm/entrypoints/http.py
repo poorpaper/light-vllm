@@ -21,7 +21,7 @@ from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
-from light_vllm.runtime.execution.worker import LocalModelWorker
+from light_vllm.runtime.execution.worker import ContiguousModelWorker
 from light_vllm.runtime.generation.reference import ReferenceGenerationService
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCache,
@@ -87,6 +87,7 @@ def create_serving_app(
     # reference client 没有常驻 driver；只有批量 Engine 需要在 lifespan
     # 结束时显式等待当前模型迭代完成。
     close_engine: Callable[[], Awaitable[None]] | None = None
+    initialize_executor: Callable[[], None] | None = None
     sampler = GreedySampler()
     if runtime == "reference":
         # 保留原始单请求基线，继续通过轻量 sync-to-async bridge 对外服务。
@@ -111,7 +112,7 @@ def create_serving_app(
             block_size=kv_block_size,
         )
         model_executor = LocalModelExecutor(
-            LocalModelWorker(
+            ContiguousModelWorker(
                 runner,
                 tensor_cache,
                 sampler,
@@ -126,11 +127,14 @@ def create_serving_app(
         engine_core = EngineCore(model_executor, scheduler)
         engine = engine_core
         close_engine = engine_core.close
+        initialize_executor = model_executor.initialize
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # 模型加载成功后服务才会就绪；加载失败就停止启动。
         runner.load(spec)
+        if initialize_executor is not None:
+            initialize_executor()
         try:
             yield
         finally:

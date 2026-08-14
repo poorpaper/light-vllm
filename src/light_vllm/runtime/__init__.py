@@ -2,16 +2,18 @@
 
 from light_vllm.runtime.engine import EngineClient, EngineCore, InProcessEngineClient
 from light_vllm.runtime.execution import (
+    ContiguousModelWorker,
     ExecutionBatch,
     ExecutionError,
     ExecutionNotReadyError,
     ExecutionOutput,
     ExecutionRequest,
     LocalModelExecutor,
-    LocalModelWorker,
     LocalTokenExecutor,
     ModelExecutor,
     ModelWorker,
+    PagedKVCacheConfig,
+    PagedModelWorker,
     RequestOutput,
     TokenExecutor,
 )
@@ -48,6 +50,7 @@ from light_vllm.runtime.scheduler import (
 
 __all__ = [
     "ContiguousKVCache",
+    "ContiguousModelWorker",
     "EngineClient",
     "EngineCore",
     "ExecutionBatch",
@@ -71,10 +74,11 @@ __all__ = [
     "KVCacheReservation",
     "KVCacheSpec",
     "LocalModelExecutor",
-    "LocalModelWorker",
     "LocalTokenExecutor",
     "ModelExecutor",
     "ModelWorker",
+    "PagedKVCacheConfig",
+    "PagedModelWorker",
     "PagedKVCacheManager",
     "ReferenceGenerationService",
     "RequestOutput",

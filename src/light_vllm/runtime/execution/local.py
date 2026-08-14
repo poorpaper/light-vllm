@@ -54,6 +54,9 @@ class LocalModelExecutor:
     def ready(self) -> bool:
         return self._worker.ready
 
+    def initialize(self) -> None:
+        self._worker.initialize()
+
     def add_request(self, request_id: str, *, capacity: int) -> None:
         self._worker.add_request(request_id, capacity=capacity)
 
