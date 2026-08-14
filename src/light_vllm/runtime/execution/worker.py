@@ -161,16 +161,24 @@ class PagedModelWorker:
             )
 
     def initialize(self) -> None:
+        model_generation = self._runner.generation
         model_spec = self._runner.kv_cache_spec
-        if self._runner.generation <= 0 or model_spec is None:
+        if model_generation <= 0 or model_spec is None:
             raise ExecutionNotReadyError("load a cacheable model before initializing the worker")
+        if self._runner.generation != model_generation:
+            raise ExecutionError("model changed while initializing the paged KV cache")
         with self._lock:
             if self._active_requests:
                 raise ExecutionError("cannot initialize paged KV cache with active requests")
-            if self._model_generation == self._runner.generation and self._cache is not None:
+            if self._runner.generation != model_generation:
+                raise ExecutionError("model changed while initializing the paged KV cache")
+            if self._model_generation == model_generation and self._cache is not None:
                 return
-            self._cache = PagedKVCache(model_spec, self._cache_config)
-            self._model_generation = self._runner.generation
+            candidate = PagedKVCache(model_spec, self._cache_config)
+            if self._runner.generation != model_generation:
+                raise ExecutionError("model changed while initializing the paged KV cache")
+            self._cache = candidate
+            self._model_generation = model_generation
 
     def add_request(self, request_id: str, *, capacity: int) -> None:
         if not request_id:

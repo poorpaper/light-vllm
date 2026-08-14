@@ -88,6 +88,14 @@ class CountingAttentionForwarder:
         return self.model(batch)
 
 
+class ReloadingAttentionForwarder(CountingAttentionForwarder):
+    @property
+    def kv_cache_spec(self):
+        spec = self.model.kv_cache_spec
+        self.generation += 1
+        return spec
+
+
 def test_reference_executor_delegates_token_choice_to_sampler() -> None:
     executor = LocalTokenExecutor(IncrementingForwarder(), FixedSampler())
 
@@ -231,3 +239,16 @@ def test_paged_worker_rejects_execution_without_block_tables() -> None:
         executor.execute(
             ExecutionBatch(requests=(ExecutionRequest("request", (1,), 0, None, True),))
         )
+
+
+def test_paged_worker_rejects_a_model_change_during_cache_initialization() -> None:
+    executor = LocalModelExecutor(
+        PagedModelWorker(
+            ReloadingAttentionForwarder(),
+            GreedySampler(),
+            PagedKVCacheConfig(num_blocks=2, block_size=2),
+        )
+    )
+
+    with pytest.raises(ExecutionError, match="model changed while initializing"):
+        executor.initialize()
