@@ -21,6 +21,7 @@ from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
+from light_vllm.runtime.execution.worker import LocalModelWorker
 from light_vllm.runtime.generation.reference import ReferenceGenerationService
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCache,
@@ -110,10 +111,12 @@ def create_serving_app(
             block_size=kv_block_size,
         )
         model_executor = LocalModelExecutor(
-            runner,
-            tensor_cache,
-            sampler,
-            device=spec.device,
+            LocalModelWorker(
+                runner,
+                tensor_cache,
+                sampler,
+                device=spec.device,
+            )
         )
         scheduler = TokenBudgetScheduler(
             logical_cache,

@@ -27,6 +27,7 @@ def test_interface_modules_do_not_import_their_implementations() -> None:
         ),
         SOURCE_ROOT / "runtime" / "execution" / "interfaces.py": (
             "light_vllm.runtime.execution.local",
+            "light_vllm.runtime.execution.worker",
         ),
         SOURCE_ROOT / "runtime" / "generation" / "interfaces.py": (
             "light_vllm.runtime.generation.reference",

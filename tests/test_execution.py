@@ -14,6 +14,7 @@ from light_vllm.runtime.execution import (
     ExecutionNotReadyError,
     ExecutionRequest,
     LocalModelExecutor,
+    LocalModelWorker,
     LocalTokenExecutor,
 )
 from light_vllm.runtime.kv_cache import ContiguousKVCache, KVCacheSpec
@@ -83,7 +84,7 @@ def test_reference_executor_checks_model_output_shape() -> None:
 
 def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
     cache = ContiguousKVCache(KVCacheSpec(num_layers=1, num_kv_heads=1, head_size=1))
-    executor = LocalModelExecutor(IncrementingForwarder(), cache, GreedySampler())
+    executor = LocalModelExecutor(LocalModelWorker(IncrementingForwarder(), cache, GreedySampler()))
     executor.add_request("request", capacity=3)
 
     prefill = executor.execute(
