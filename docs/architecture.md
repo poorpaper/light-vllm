@@ -149,7 +149,8 @@ Scheduler、Engine 和 `LocalModelExecutor` 不按该模式分支。`unbounded` 
 2. 模型成功后 `commit(M)`，其中 `M <= K`。
 3. 未提交的尾部自动回滚并归还多余 block。
 4. 完成、失败或取消时释放请求全部逻辑 block。
-5. 当前活动物理页保持请求独占；prefix sharing 落地时必须显式表达只读共享与可写尾页 ownership。
+5. 交给 Worker 的 block table 精确覆盖 `computed + query`，不包含未使用尾页。
+6. 当前活动物理页保持请求独占；prefix sharing 落地时必须显式表达只读共享与可写尾页 ownership。
 
 分页 Worker 根据模型的 `ModelKVCacheSpec` 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
 token 通过 block table 映射到物理 slot；`TorchPagedAttention` 先原位写入本轮 K/V，再用在线 softmax 逐页读取

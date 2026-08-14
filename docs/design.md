@@ -149,8 +149,9 @@ committed 变为 3 → 只需 2 blocks → 自动释放尾部 1 block
 分页 Worker 持有每层 `[block, offset, kv_head, head_size]` 的全局 K/V tensor。它把请求逻辑位置映射为
 `block_id * block_size + offset`，原位写入本轮 K/V，并按 block table 逐页完成 causal attention。不同长度
 请求会组成一个 padded forward batch，`sequence_lengths` 屏蔽 padding，`positions` 始终保存请求内绝对位置。
-模型只声明 `ModelKVCacheSpec` 并调用 `AttentionContext`，不依赖具体 page layout。当前每个活动物理页归一个请求
-独占；未来 prefix sharing 必须显式区分只读共享前缀与可写尾页，不能仅允许 block ID 别名。
+模型只声明 `ModelKVCacheSpec` 并调用 `AttentionContext`，不依赖具体 page layout。block table 必须精确覆盖
+当前有效前缀与 query，不携带预分配尾页；当前每个活动物理页归一个请求独占。未来 prefix sharing 必须显式
+区分只读共享前缀与可写尾页，不能仅允许 block ID 别名。
 
 ## 7. Sampler
 
