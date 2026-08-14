@@ -23,20 +23,25 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
   `PagedKVCacheManager` 额外按容量分配 block table。
-- composition root 通过 `kv_reservation=blocks|unbounded` 选择逻辑 manager；该选择不得进入 Engine 热路径。
-- `LocalModelExecutor` 拥有本地模型计算与连续 K/V tensor；它不决定谁运行或分配多少资源。
+- composition root 通过 `kv_reservation=blocks|unbounded` 同时选择匹配的逻辑 manager 和 Worker；该选择不得进入
+  Engine 或 Executor 热路径。
+- `LocalModelExecutor` 只把执行端口委托给 `ModelWorker`。`ContiguousModelWorker` 保留无分页正确性基线；
+  `PagedModelWorker` 根据模型声明的 `ModelKVCacheSpec` 创建全局物理页池并消费 block table。
+- 模型通过 `AttentionContext` 使用执行后端提供的 attention。当前 `TorchPagedAttention` 直接逐页读取 K/V，
+  用在线 softmax 提供 CPU correctness 实现，不拼接完整历史。
 - `ExecutionOutput` 允许一个请求返回零到多个确认 token，为 chunked prefill 和投机解码保留正确语义。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
 - FastAPI adapter 只依赖 `EngineClient`，不知道 scheduler、runner、torch 或 KV cache。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
-当前尚未实现物理 Paged Attention、prefix caching、preemption、投机解码、分布式执行、tokenizer 和
-生产级 serving。逻辑 block manager 不是物理分页算子的伪实现；执行侧暂时仍使用连续 tensor。
+当前尚未实现生产级 CUDA/Triton Paged Attention kernel、prefix caching、preemption、投机解码、分布式执行、
+tokenizer 和生产级 serving。PyTorch Paged Attention 是物理分页正确性基线，不代表生产吞吐。
 
 ## 代码地图
 
 | 文件 | 职责 |
 | --- | --- |
+| `src/light_vllm/modeling/attention/interfaces.py` | 模型 KV 规格与后端 attention 契约 |
 | `src/light_vllm/modeling/models/interfaces.py` | 模型配置、forward 与 K/V 张量契约 |
 | `src/light_vllm/modeling/loaders/interfaces.py` | 权重加载器契约 |
 | `src/light_vllm/modeling/runner.py` | 模型生命周期与统一 forward |
@@ -48,7 +53,10 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 | `src/light_vllm/runtime/scheduler/interfaces.py` | `SchedulerOutput` 等稳定调度契约 |
 | `src/light_vllm/runtime/scheduler/token_budget.py` | FCFS token-budget Scheduler |
 | `src/light_vllm/runtime/execution/interfaces.py` | `ExecutionBatch`、`ExecutionOutput` 与 Executor 契约 |
-| `src/light_vllm/runtime/execution/local.py` | 本地模型执行与采样 |
+| `src/light_vllm/runtime/execution/local.py` | 本地 Executor 与 reference token 执行 |
+| `src/light_vllm/runtime/execution/worker.py` | 连续与分页本地 Worker |
+| `src/light_vllm/runtime/execution/paged_cache.py` | Worker 拥有的物理分页 K/V tensor |
+| `src/light_vllm/runtime/execution/paged_attention.py` | Paged metadata 与 PyTorch correctness backend |
 | `src/light_vllm/runtime/engine/core.py` | 请求状态、迭代循环、事件与安全取消 |
 | `src/light_vllm/runtime/engine/in_process.py` | 同步 reference 到异步 Engine 的适配器 |
 | `src/light_vllm/runtime/engine/interfaces.py` | serving 使用的异步 `EngineClient` |
@@ -76,13 +84,20 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 16. 逻辑 KV reservation 每轮必须以 commit 或 remove 结束；只提交实际计算成功的 token。
 17. 模型执行失败、输出校验失败或请求取消时，不得把本轮 token 写入 Engine 状态。
 18. 取消请求必须立即退出后续调度；已开始执行的同步步骤到达安全边界后，其结果必须丢弃。
-19. Scheduler/Engine Core 管理 KV reservation、分页后端的 block pool、未来 prefix cache 和 preemption；
-    Executor/Worker 管理 tensor、可选 block table 消费与未来 Paged Attention kernel。
+19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID 生命周期、未来 prefix cache 和 preemption；
+    Executor/Worker 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
 20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。
 21. 投机解码未来由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor。
 22. 不为尚未实现的 attention、memory 或 prefix routing 创建空包。
 23. 内部代码从所属功能域的 `interfaces.py` 导入稳定契约；需要实现时直接导入实现模块。
 24. 不维护未发布架构的历史兼容别名、空 facade 或旧路径。
+25. `ForwardBatch.positions` 表示请求内绝对位置；连续与分页 Worker 都必须显式生成，模型不得从 batch 模式猜测。
+26. 使用外部 KV 的模型必须声明 `ModelKVCacheSpec`；分页 Worker 在模型加载后据此初始化物理页，不手填模型层数和
+    head 形状。
+27. `blocks` 必须装配 `PagedKVCacheManager + PagedModelWorker`，`unbounded` 必须装配
+    `UnboundedKVCacheManager + ContiguousModelWorker`；其他组件不得按 KV 模式分支。
+28. Paged Attention 实现必须通过 `AttentionContext` 接入并直接按 block table 读取物理页；不得以拼接完整历史
+    tensor 冒充分页实现。
 
 ## 锁与资源的准确含义
 
@@ -92,7 +107,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 reference 的请求不占用 worker thread，并让同步 iterator 的创建、`next()` 和 `close()` 固定在同一线程。
 
 `EngineCore` 的异步锁保护请求状态、Scheduler 状态和 driver 生命周期。模型执行发生在锁外；执行前通过
-Executor lease 固定物理资源，取消只标记释放，tensor 等 lease 退出后再销毁。
+Executor lease 固定物理资源，取消只标记释放，tensor 等 lease 退出后再销毁。正在执行的分页请求被取消时，
+Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边界。
 
 ## 新增扩展的方式
 
@@ -102,6 +118,9 @@ Executor lease 固定物理资源，取消只标记释放，tensor 等 lease 退
 
 新增执行拓扑：实现 `ModelExecutor`，保持 `ExecutionBatch → ExecutionOutput` 语义；本地、CUDA、多进程是
 合理的 Executor 差异，greedy、KV 模式、prefill/decode 不是。
+
+新增本地计算或 attention 后端：实现/组合 `ModelWorker` 与 `AttentionContext`；保持 block table 和模型
+`ModelKVCacheSpec` 的事实型边界，不修改 Scheduler、Engine 或模型分发。
 
 新增 serving 协议：只消费 `EngineClient`，在 adapter 内转换请求、结果、错误和 wire format。
 
@@ -118,6 +137,6 @@ git diff --check
 
 ## 下一步
 
-下一阶段实现执行侧真正的 block table 与 Paged Attention，使逻辑 block ID 映射到物理分页 K/V；之后再加
-prefix caching 和 preemption。投机解码应等物理 KV 具备预留/提交/回滚能力后，从 `TokenProposer` 和
-`AcceptanceSampler` 开始，不改变 EngineClient、generation 事件或 HTTP adapter。
+下一阶段在同一 `AttentionContext` 契约下增加生产级 CUDA/Triton Paged Attention kernel，并补齐显存预算；
+之后再加 prefix caching 和 preemption。投机解码应从 `TokenProposer` 和 `AcceptanceSampler` 开始，不改变
+EngineClient、generation 事件或 HTTP adapter。

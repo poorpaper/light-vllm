@@ -28,7 +28,7 @@ HTTP / future RPC ──> EngineClient
                           │       └── reference GenerationService ──> ModelRunner.forward
                           ├── EngineCore
                           │       ├── TokenBudgetScheduler
-                          │       └── LocalModelExecutor
+                          │       └── LocalModelExecutor ──> ModelWorker
                           └── future ProcessEngineClient
 
 EngineClient.stream ──> GenerationEvent
@@ -47,7 +47,9 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `EngineCore`：按 `schedule -> execute -> update` 驱动异步请求与事件流。
 - `TokenBudgetScheduler`：统一规划 prompt、chunked prefill 与 decode 的 token 数。
 - `PagedKVCacheManager`：管理逻辑 block 的预留、提交、回滚和释放。
-- `LocalModelExecutor`：使用连续 K/V tensor 执行本地模型计算。
+- `LocalModelExecutor` / `ModelWorker`：把本地执行拓扑与具体 KV 后端分开。
+- `PagedModelWorker`：消费 block table，使用全局物理页与 PyTorch Paged Attention。
+- `ContiguousModelWorker`：保留请求级连续 K/V 的无分页正确性基线。
 - `GreedySampler`：独立于 Executor 的贪心采样策略。
 - FastAPI adapter：协议外层的 JSON/SSE 接口，只依赖 `EngineClient`。
 
@@ -93,21 +95,24 @@ light-vllm-serve \
   --kv-reservation blocks \
   --max-num-sequences 8 \
   --max-num-scheduled-tokens 256 \
-  --kv-num-heads 4 \
-  --kv-head-size 8 \
   --model-args '{"vocab_size": 128, "hidden_size": 32, "num_heads": 4}'
 ```
 
 `--runtime` 支持两条清晰路径：
 
 - `reference`：一次执行一个完整请求，作为最清楚的语义基线。
-- `engine`：token-budget Scheduler、逻辑 KV blocks 和增量模型执行。
+- `engine`：token-budget Scheduler、连续或分页 KV Worker 和增量模型执行。
 
 Engine 路径不区分 prefill/decode 模式：Scheduler 只返回每请求本轮 token 数，长 prompt 自然拆成
-chunk；追上全部已知 token 后才采样输出。当前物理 K/V 仍是连续 tensor，尚未实现 Paged Attention。
+chunk；追上全部已知 token 后才采样输出。
 
-`--kv-reservation blocks` 使用逻辑 block 容量管理；`--kv-reservation unbounded` 不分配 block，也不限制
-逻辑 KV 容量，用于在相同连续物理缓存上隔离 block 管理的实验影响。后者不是生产容量保护机制。
+`--kv-reservation blocks` 装配逻辑 block manager 与物理 `PagedModelWorker`。模型声明自己的 K/V layer/head
+规格，Worker 以 `[block, offset, kv_head, head_size]` 布局创建页池；当前 PyTorch backend 直接逐页完成
+attention，适合 CPU correctness 与后续优化 kernel 的行为基线。
+
+`--kv-reservation unbounded` 装配无 block manager 与 `ContiguousModelWorker`，不限制逻辑 KV 容量。它保留
+无 Paged Attention 的请求级连续 tensor 路径，主要用于测试和结果对照，不是生产容量保护机制；此模式下
+`--kv-num-layers`、`--kv-num-heads` 和 `--kv-head-size` 描述连续 cache 形状。
 
 当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
 
@@ -147,7 +152,7 @@ catalog.loaders.register("my-format", my_loader)
 
 ## 当前非目标
 
-当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback 和独立 Greedy
-Sampler，但物理执行仍使用连续 K/V tensor。Tokenizer、文本 prompt、随机 sampling、Paged Attention、
-prefix caching、preemption、投机解码、分布式执行和 OpenAI-compatible API 仍是后续能力。多进程实现将
-新增 `EngineClient` 实现，而不改 HTTP。
+当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback、独立 Greedy
+Sampler，以及可读性优先的物理 Paged Attention correctness backend。Tokenizer、文本 prompt、随机
+sampling、生产级 CUDA/Triton attention kernel、prefix caching、preemption、投机解码、分布式执行和
+OpenAI-compatible API 仍是后续能力。多进程实现将新增 `EngineClient` / Worker 拓扑，而不改 HTTP。

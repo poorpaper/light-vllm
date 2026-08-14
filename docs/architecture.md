@@ -30,11 +30,12 @@ flowchart LR
     Plan --> Core
     Core --> Batch["ExecutionBatch<br/>本轮 token 切片"]
     Batch --> Executor["LocalModelExecutor"]
-    Executor --> Runner["ModelRunner"]
+    Executor --> Worker["ModelWorker<br/>contiguous 或 paged"]
+    Worker --> Runner["ModelRunner"]
     Runner --> Model["Active Model"]
-    Model --> Executor
-    Executor --> Sampler["Sampler"]
-    Executor --> Output["ExecutionOutput<br/>0..N 个确认 token"]
+    Model --> Worker
+    Worker --> Sampler["Sampler"]
+    Worker --> Output["ExecutionOutput<br/>0..N 个确认 token"]
     Output --> Core
     Core --> Events["TokenGenerated · Finished"]
 ```
@@ -44,7 +45,7 @@ flowchart LR
 - prompt 和生成 token 都是“尚未计算的 token”；
 - chunked prefill 只是本轮预算不足以覆盖全部 pending token；
 - greedy/top-k/top-p 是 Sampler 差异；
-- 连续或分页 K/V 是物理执行后端差异；
+- 连续或分页 K/V 是 Worker 的物理存储与 attention 后端差异；
 - 本地、CUDA、多进程才是合理的 Executor 拓扑差异。
 
 ## 模块边界
@@ -56,7 +57,10 @@ flowchart LR
 | `UnboundedKVCacheManager` | 无容量限制的 reservation、提交与回滚基线 | block、K/V tensor |
 | `PagedKVCacheManager` | 逻辑 block 预留、提交、回滚、释放 | K/V tensor、attention kernel |
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
-| `LocalModelExecutor` | 本地模型输入、连续 K/V、输出校验、调用 Sampler | 谁能运行、block 分配策略 |
+| `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
+| `ContiguousModelWorker` | 请求级连续 K/V、模型输入与采样正确性基线 | 逻辑 block、调度策略 |
+| `PagedModelWorker` | padded batch、绝对位置、物理页池、block table 消费与采样 | 逻辑 block 分配、请求队列 |
+| `TorchPagedAttention` | 原位写 K/V、逐页 causal attention、MHA/GQA correctness | 调度、生产级 kernel 优化 |
 | `Sampler` | 从 logits 选择 token | 模型 forward、调度、停止条件 |
 | `ModelRunner` | 当前模型生命周期和统一 forward | 具体模型/loader 条件分发 |
 | `EngineClient` | serving 到 engine 的异步端口 | HTTP schema、具体运行拓扑 |
@@ -121,29 +125,54 @@ Engine 对确认 token 逐个应用 EOS 与 `max_new_tokens`，只把真正可�
 
 ```mermaid
 flowchart TB
-    Scheduler["Scheduler / Engine Core"] --> Logical["KVCacheManager<br/>reservation 与可选 block"]
-    Output["SchedulerOutput.block_ids<br/>optional"] --> Executor["ModelExecutor / Worker"]
-    Executor --> Physical["ContiguousKVCache<br/>当前物理 tensor 基线"]
-    Physical -.future.-> Paged["Paged K/V + Paged Attention"]
+    Scheduler["Scheduler / Engine Core"] --> Logical["KVCacheManager<br/>reservation 与 logical block IDs"]
+    Output["SchedulerOutput.block_ids<br/>optional"] --> Worker["ModelWorker"]
+    Worker --> Contiguous["ContiguousKVCache<br/>request-level tensors"]
+    Worker --> Paged["PagedKVCache<br/>global physical pages"]
+    Paged --> Attention["AttentionContext<br/>TorchPagedAttention"]
 ```
 
 当前有两种逻辑 manager：`UnboundedKVCacheManager` 为连续缓存提供无 block、无容量限制的实验基线；
 `PagedKVCacheManager` 实现以下逻辑分页管理：
 
-二者只在 composition root 通过 `kv_reservation=unbounded|blocks` 选择；Scheduler、Engine 和 Executor
-不按该模式分支。`unbounded` 仅用于实验，不提供生产容量保护。
+二者只在 composition root 通过 `kv_reservation=unbounded|blocks` 与对应 Worker 成对选择：
+
+```text
+unbounded → UnboundedKVCacheManager → ContiguousModelWorker
+blocks    → PagedKVCacheManager     → PagedModelWorker
+```
+
+Scheduler、Engine 和 `LocalModelExecutor` 不按该模式分支。`unbounded` 仅用于测试和正确性对照，不提供生产
+容量保护。
 
 1. `reserve(K)` 为本轮最坏情况预留 block；容量不足时该请求不能执行。
 2. 模型成功后 `commit(M)`，其中 `M <= K`。
 3. 未提交的尾部自动回滚并归还多余 block。
 4. 完成、失败或取消时释放请求全部逻辑 block。
 
-物理执行仍使用请求级连续 tensor，因此当前没有冒充已经实现 Paged Attention。分页 manager 产生的
-`block_ids` 已经穿过稳定调度/执行边界；非分页后端使用 `None`，不得伪造 block ID。下一阶段只需让
-分页执行侧真正按 block table 读写 K/V。
+分页 Worker 根据模型的 `ModelKVCacheSpec` 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
+token 通过 block table 映射到物理 slot；`TorchPagedAttention` 先原位写入本轮 K/V，再用在线 softmax 逐页读取
+有效前缀，不物化完整历史。它是可读性优先的 CPU/PyTorch correctness backend，不是生产级性能 kernel。
 
-执行前 Engine 取得物理缓存 lease。执行期间取消会立刻删除请求和逻辑 block，但连续 tensor 等同步模型
-步骤退出 lease 后才真正销毁；本轮输出因 request ID 已不存在而被丢弃。
+非分页 Worker 使用 `block_ids=None` 和请求级连续 tensor，不得伪造 block ID。两条路径共享同一个
+`ExecutionBatch → ExecutionOutput` 和模型 forward 契约，因此可以直接做结果对照。
+
+执行前 Engine 取得物理缓存 lease。执行期间取消会立刻删除请求并使其退出后续调度；连续 tensor 延迟到
+lease 退出后销毁，逻辑 block IDs 也在此安全边界之后才归还，避免仍在执行的 block table 指向已复用页。
+本轮输出因 request ID 已不存在而被丢弃。
+
+## 模型与 attention 后端边界
+
+`ForwardBatch` 的 `input_ids`、`positions` 都是 `[batch, padded_sequence]`；`positions` 是请求内绝对位置，
+不能由模型根据 prefill/decode 模式猜测。`sequence_lengths` 标识每行有效 query 长度。
+
+使用外部 KV 的模型声明 `ModelKVCacheSpec`，每层用稳定 `layer_id` 描述 query heads、KV heads 和 head size。
+attention 层只调用 `AttentionContext.forward(layer_id, query, key, value, scale)`。因此：
+
+- 模型不知道 block size、page layout 或具体 kernel；
+- Worker 不按具体模型 architecture 分支；
+- 后续 CUDA/Triton backend 可以替换 `TorchPagedAttention`，不修改 Engine、Scheduler 或模型协议；
+- Paged Worker 在模型加载成功后初始化物理页池，模型 generation 变化时要求安全地重建。
 
 ## Sampler
 
@@ -171,8 +200,9 @@ flowchart LR
     Bridge --> Reference["ReferenceGenerationService"]
     Reference --> TokenExecutor["LocalTokenExecutor"]
     Core --> ModelExecutor["LocalModelExecutor"]
+    ModelExecutor --> Worker["ModelWorker"]
     TokenExecutor --> Runner["ModelRunner"]
-    ModelExecutor --> Runner
+    Worker --> Runner
 ```
 
 Reference 路径保留同步、全序列重算和逐 token 语义，用于教学与正确性对照；生产演进发生在 Engine Core
@@ -188,11 +218,12 @@ HTTP 的 JSON、SSE、状态码和输入上限都留在 adapter。进程拆分�
 3. 候选完整可用后，`ModelRunner` 才在锁内替换引用并递增 generation。
 4. 加载失败时当前模型和 generation 不变。
 5. `forward` 在锁内只复制模型引用，实际模型计算不持有生命周期锁。
+6. 可缓存模型的 KV 规格由模型声明；Worker 只能在模型加载完成且无活动请求时初始化或重建物理页池。
 
 ## 后续演进顺序
 
-1. 执行侧分页 K/V 与 Paged Attention。
-2. prefix caching、显存预算和 preemption。
+1. 同一 `AttentionContext` 下的 CUDA/Triton Paged Attention kernel 与显存预算。
+2. prefix caching 和 preemption。
 3. 普通随机 Sampler。
 4. `TokenProposer + target verify + AcceptanceSampler` 投机解码。
 5. 进程/分布式 Worker 与生产级 serving。

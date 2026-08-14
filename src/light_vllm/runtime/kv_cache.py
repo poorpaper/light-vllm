@@ -133,8 +133,8 @@ class PagedKVCacheManager:
     """使用固定大小逻辑 block 管理全局 KV 容量。
 
     这里只实现 Scheduler 需要的预留、提交、回滚和释放语义，不保存 K/V
-    tensor，也不实现 Paged Attention。未来物理分页后端可以直接消费这里
-    产生的 block table，而不改变调度契约。
+    tensor。执行侧 ``PagedModelWorker`` 直接消费这里产生的 block table，
+    逻辑 manager 不依赖物理 cache 或 attention 实现。
     """
 
     def __init__(self, *, num_blocks: int, block_size: int) -> None:
@@ -285,8 +285,8 @@ class _ContiguousKVCacheLease:
 class ContiguousKVCache:
     """执行侧的请求级连续 K/V tensor 存储。
 
-    这是 Paged Attention 落地前的物理基线。Scheduler 看不到这些 tensor；
-    Executor 也不会修改逻辑 block 的分配策略。
+    这是无分页的物理正确性基线。Scheduler 看不到这些 tensor；Executor
+    也不会修改逻辑 KV 的分配策略。
     """
 
     def __init__(self, spec: KVCacheSpec) -> None:
