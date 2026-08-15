@@ -185,3 +185,21 @@ def test_qwen2_loads_hf_compatible_safetensors_snapshot(
     actual = runner.open_session().forward(ForwardBatch(input_ids=input_ids))
 
     torch.testing.assert_close(actual.logits, expected.logits)
+
+
+def test_qwen2_logits_match_transformers_reference() -> None:
+    transformers = pytest.importorskip("transformers")
+    config_values = qwen2_args(tie_word_embeddings=False)
+    hf_config = transformers.Qwen2Config(**config_values)
+    hf_config._attn_implementation = "eager"
+    torch.manual_seed(19)
+    reference = transformers.Qwen2ForCausalLM(hf_config).eval()
+    model = Qwen2ForCausalLM(Qwen2Config.from_mapping(config_values)).eval()
+    model.load_state_dict(reference.state_dict(), strict=True)
+    input_ids = torch.tensor([[1, 2, 3, 5, 8]])
+
+    with torch.inference_mode():
+        expected = reference(input_ids=input_ids, use_cache=False).logits
+        actual = model(ForwardBatch(input_ids=input_ids)).logits
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)

@@ -26,6 +26,9 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.9",
 ]
+validation = [
+  "transformers>=4.43,<5",
+]
 
 [project.scripts]
 light-vllm-serve = "light_vllm.entrypoints.http:main"
