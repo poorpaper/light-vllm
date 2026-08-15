@@ -1,4 +1,4 @@
-"""模型加载、原子替换与固定 generation 会话。"""
+"""加载模型，并保证一次生成不会在中途换模型。"""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _max_model_tokens(model: nn.Module) -> int | None:
 
 @dataclass(frozen=True, slots=True)
 class _PinnedModelSession:
-    """强引用一个已加载模型，reload 不会改变它。"""
+    """保存本次执行选中的模型；之后重新加载模型不会影响本次执行。"""
 
     generation: int
     _model: nn.Module
@@ -51,9 +51,9 @@ class _PinnedModelSession:
 
 
 class ModelRunner:
-    """管理当前模型指针，并为请求创建固定模型会话。
+    """管理当前加载的模型，并让每次执行先选定要使用的模型。
 
-    Runner 只负责模型生命周期，不负责请求调度、KV 生命周期或执行拓扑。
+    它只负责加载和切换模型，不负责请求调度、KV cache 或设备执行。
     """
 
     def __init__(self, catalog: Catalog) -> None:
@@ -71,22 +71,22 @@ class ModelRunner:
         factory = self._catalog.models.get(spec.architecture)
         loader = self._catalog.loaders.get(spec.loader)
 
-        # 候选模型先在锁外完整构造；加载失败不会影响当前仍可用的模型。
+        # 先把新模型完整加载好；加载失败时，旧模型仍然可以继续服务。
         candidate = loader.load(spec, factory)
         with self._lock:
-            # 只有完整可用的候选模型才能原子替换当前模型并推进 generation。
+            # 新模型加载成功后再一次性替换旧模型，并递增模型版本号。
             self._model = candidate
             self._generation += 1
 
     def open_session(self) -> ModelSession:
-        """固定当前模型和 generation，供一次完整生成持续使用。"""
+        """取得当前模型，供一次完整生成持续使用。"""
 
         with self._lock:
             model = self._model
             generation = self._generation
         if model is None:
             raise ModelNotLoadedError("load a model before opening a session")
-        # session 持有模型强引用；后续 reload 只会改变 Runner 的当前指针。
+        # 返回值保存当前模型；之后 reload 不会让正在执行的请求换模型。
         return _PinnedModelSession(
             generation=generation,
             _model=model,

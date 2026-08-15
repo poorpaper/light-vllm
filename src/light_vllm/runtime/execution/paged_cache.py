@@ -1,4 +1,4 @@
-"""Worker 拥有的物理分页 K/V tensor。"""
+"""分页 Step Handler 拥有的物理 K/V tensor。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from light_vllm.runtime.kv_cache import KVCacheCapacityError, KVCacheError
 
 
 class PagedKVCachePlanner(Protocol):
-    """模型加载后，把资源策略和真实 KV 规格解析成固定物理页配置。"""
+    """模型加载后，根据真实 KV 形状和设备内存决定分页缓存大小。"""
 
     @property
     def num_blocks(self) -> int: ...
@@ -29,7 +29,7 @@ class PagedKVCachePlanner(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class PagedKVCacheConfig:
-    """已经解析完成的固定物理页配置，也可作为确定性容量策略。"""
+    """已经确定的分页缓存配置；指定页数时也可以直接充当规划器。"""
 
     num_blocks: int
     block_size: int
@@ -93,7 +93,7 @@ class CudaMemoryKVCachePlanner:
         return self._config.num_blocks
 
     def plan(self, model_spec: ModelKVCacheSpec) -> PagedKVCacheConfig:
-        # 此时模型权重已经驻留，free_bytes 才能代表可交给 KV 的剩余显存。
+        # 模型权重加载到显卡后，剩余显存才是 KV cache 真正可以使用的空间。
         free_bytes, _ = torch.cuda.mem_get_info(self.device)
         budget_bytes = int(free_bytes * self.memory_fraction)
         bytes_per_block = kv_cache_bytes_per_block(
@@ -101,7 +101,7 @@ class CudaMemoryKVCachePlanner:
             block_size=self.block_size,
             dtype=self.dtype,
         )
-        # 向下取整保证计划不超过预算，无法组成整页的余数保持未分配。
+        # 只分配完整页，保证实际使用量不会超过显存预算。
         num_blocks = budget_bytes // bytes_per_block
         if num_blocks == 0:
             raise KVCacheCapacityError("available CUDA memory cannot hold one KV cache block")
@@ -123,7 +123,7 @@ class PagedLayerCache:
 
 
 class PagedKVCache:
-    """按全局物理 page ID 索引的逐层 K/V tensor 池。"""
+    """所有请求共用的分页 K/V 张量池，通过 page ID 找到具体存储位置。"""
 
     def __init__(self, model_spec: ModelKVCacheSpec, config: PagedKVCacheConfig) -> None:
         self._model_spec = model_spec

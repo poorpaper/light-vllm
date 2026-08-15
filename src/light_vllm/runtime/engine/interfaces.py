@@ -13,7 +13,7 @@ from light_vllm.runtime.generation.interfaces import (
 
 @dataclass(frozen=True, slots=True)
 class EngineCapabilities:
-    """模型、KV 和 Scheduler 初始化后对外暴露的静态能力事实。"""
+    """引擎对外报告的模型长度、KV cache 和调度容量上限。"""
 
     max_model_tokens: int | None = None
     max_kv_cache_tokens: int | None = None
@@ -22,7 +22,7 @@ class EngineCapabilities:
 
     @property
     def max_request_tokens(self) -> int | None:
-        """单请求确定性上限，不代表此刻剩余的可用容量。"""
+        """一个请求最多能使用的 token 数，不表示此刻还有多少空闲容量。"""
 
         limits = tuple(
             limit
@@ -33,7 +33,7 @@ class EngineCapabilities:
 
 
 class RequestAdmission(Protocol):
-    """在请求进入 Scheduler 前检查确定性的容量限制。"""
+    """请求进入调度队列前，检查它是否可能被当前引擎处理。"""
 
     def validate(self, request: GenerateRequest, capabilities: EngineCapabilities) -> None: ...
 

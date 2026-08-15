@@ -58,7 +58,7 @@ def _execution_error(exc: Exception) -> GenerationError:
 
 
 def _validated_output(batch: ExecutionBatch, output: ExecutionOutput) -> dict[str, RequestOutput]:
-    """在提交任何可变状态前，核对 Executor 返回的全部事实。"""
+    """先检查执行结果是否与本轮输入和预算一致，再更新请求状态。"""
 
     if not isinstance(output, ExecutionOutput):
         raise ExecutionError("model executor must return ExecutionOutput")
@@ -79,7 +79,7 @@ def _validated_output(batch: ExecutionBatch, output: ExecutionOutput) -> dict[st
 
 
 async def _await_safe_boundary(task: asyncio.Task[None]) -> None:
-    """外层取消时仍等待清理任务越过资源安全边界。"""
+    """即使调用方取消，也要等清理任务结束，避免缓存仍在使用时被释放。"""
 
     try:
         await asyncio.shield(task)
@@ -92,8 +92,9 @@ async def _await_safe_boundary(task: asyncio.Task[None]) -> None:
 class EngineCore:
     """按 ``schedule → execute → update`` 驱动所有活动请求。
 
-    Engine 拥有请求和事件；Scheduler 拥有策略与逻辑 KV 分配；Executor
-    拥有 tensor 和模型计算。三个阶段只通过不可变值传递状态。
+    Engine 保存请求和输出事件；Scheduler 决定哪些请求本轮运行并分配 KV；
+    Executor 负责张量和模型计算。三者只交换本轮输入和结果，不直接修改
+    对方内部状态。
     """
 
     def __init__(
@@ -182,7 +183,7 @@ class EngineCore:
                 raise GenerationError("generation engine is closed")
             if not self._executor.ready:
                 raise GenerationNotReadyError("load a model before generating")
-            # Admission 只检查空闲引擎也无法满足的确定性上限。
+            # 请求即使独占引擎也装不下时立即拒绝；暂时没资源则进入调度等待。
             self._admission.validate(request, self.capabilities)
 
             request_id = f"request-{next(self._request_ids)}"
@@ -225,10 +226,10 @@ class EngineCore:
                     lease = self._executor.acquire(batch.request_ids)
                     self._executing_request_ids.update(batch.request_ids)
 
-                # 锁内只生成计划并取得租约；同步模型计算在线程和锁外执行。
+                # 锁内只生成计划并保留缓存；耗时的模型计算在线程和锁外执行。
                 try:
                     raw_output = await asyncio.to_thread(self._executor.execute, batch)
-                    # 完整校验通过前，本轮不得推进 Engine 或逻辑 KV 状态。
+                    # 结果完整通过检查前，不更新请求进度，也不提交 KV cache。
                     output = _validated_output(batch, raw_output)
                 except Exception as exc:
                     async with self._lock:
@@ -236,7 +237,7 @@ class EngineCore:
                     continue
                 finally:
                     try:
-                        # 先释放物理资源租约，再允许调度器回收逻辑 block。
+                        # 等模型不再使用缓存后，调度器才可以回收对应 block。
                         lease.release()
                     finally:
                         async with self._lock:
@@ -285,7 +286,7 @@ class EngineCore:
             if state is None:
                 continue
             result = output[item.request_id]
-            # EOS/长度可以截断一次多 token 输出，只提交仍对用户可见的缓存前缀。
+            # 一次返回多个 token 时，遇到 EOS 或长度上限就截断后面的结果。
             visible_tokens, finish_reason = self._visible_tokens(state, result.output_token_ids)
             num_cached_visible_tokens = min(
                 result.num_cached_output_tokens,
@@ -296,7 +297,7 @@ class EngineCore:
                 num_committed_tokens=(result.num_input_tokens_computed + num_cached_visible_tokens),
                 num_new_tokens=len(visible_tokens),
             )
-            # 未缓存输出虽已确认，但没有 KV；追加后会在下一轮成为 pending 输入。
+            # 已确认但尚未写入 KV cache 的 token，会在下一轮作为输入再计算一次。
             for token_id in visible_tokens:
                 position = state.generated_count
                 state.token_ids.append(token_id)

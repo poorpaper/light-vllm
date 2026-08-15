@@ -90,7 +90,7 @@ class TokenBudgetScheduler:
         for request_id, state in self._running.items():
             if token_budget == 0:
                 break
-            # pending 是请求状态中已有、但尚未写入 KV 的 token。
+            # 这些 token 已经确定，但还没有算完并写入 KV cache。
             pending_tokens = state.num_tokens - state.num_computed_tokens
             if pending_tokens <= 0:
                 raise SchedulerError(f"request {request_id!r} has no pending tokens")
@@ -98,7 +98,7 @@ class TokenBudgetScheduler:
             num_scheduled_tokens = min(pending_tokens, token_budget)
             num_lookahead_tokens = 0
             max_output_tokens = 0
-            # 追上全部已知 token 后才位于能够产生新输出的 frontier。
+            # 只有本轮把现有 token 全部算完，才可以继续生成新 token。
             if num_scheduled_tokens == pending_tokens:
                 desired_lookahead = self._decoding_budget.num_lookahead_tokens
                 if num_scheduled_tokens + desired_lookahead <= token_budget:
@@ -108,10 +108,10 @@ class TokenBudgetScheduler:
                     # 资源紧张时退化为普通 decode，保证请求仍能前进。
                     max_output_tokens = 1
                 else:
-                    # 留一个已知 token 到下一轮，再在 frontier 申请 lookahead。
+                    # 当前预算不够时留一个 token 到下一轮，届时再申请投机位置。
                     num_scheduled_tokens -= 1
 
-            # lookahead 将来也可能写入 KV，必须与已知输入一起预留逻辑空间。
+            # 投机位置也可能写入 KV cache，因此必须和现有输入一起预留空间。
             num_reserved_tokens = num_scheduled_tokens + num_lookahead_tokens
             try:
                 reservation = self._kv_cache.reserve(request_id, num_reserved_tokens)
@@ -151,10 +151,10 @@ class TokenBudgetScheduler:
         if type(num_new_tokens) is not int or num_new_tokens < 0:
             raise ValueError("num_new_tokens must be a non-negative integer")
 
-        # committed 可以包含“已计算输入 + 已缓存的确认输出前缀”；未用预留回滚。
+        # 提交已算完的输入，以及投机解码中已经写入缓存的新 token；其余预留释放。
         self._kv_cache.commit(request_id, num_committed_tokens)
         state.num_computed_tokens += num_committed_tokens
-        # 未缓存的确认输出先成为已知 token，下一轮会自然表现为 pending 输入。
+        # 尚未写入缓存的新 token 会在下一轮作为普通输入继续计算。
         state.num_tokens += num_new_tokens
 
     def _fill_open_slots(self) -> None:

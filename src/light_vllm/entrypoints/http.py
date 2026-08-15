@@ -10,6 +10,7 @@ import argparse
 import json
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -27,7 +28,12 @@ from light_vllm.runtime.execution.paged_cache import (
     PagedKVCacheConfig,
     PagedKVCachePlanner,
 )
-from light_vllm.runtime.execution.worker import ContiguousModelWorker, PagedModelWorker
+from light_vllm.runtime.execution.worker import (
+    ContiguousStepHandler,
+    LocalModelWorker,
+    PagedStepHandler,
+    StandardDecodeHandler,
+)
 from light_vllm.runtime.generation.reference import ReferenceGenerationService
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCacheConfig,
@@ -58,7 +64,7 @@ def _create_paged_cache_planner(
     memory_fraction: float,
 ) -> PagedKVCachePlanner:
     if num_blocks is not None:
-        # 固定页数适合 CPU correctness 和可重复的容量测试。
+        # CPU 无法发现显存容量，因此测试时直接指定固定页数。
         return PagedKVCacheConfig(
             num_blocks=num_blocks,
             block_size=block_size,
@@ -118,24 +124,28 @@ def create_serving_app(
             )
             # 同一容量对象同时交给逻辑分配和物理页池，避免两份配置漂移。
             logical_cache = PagedKVCacheManager(cache_planner)
-            worker = PagedModelWorker(
-                runner,
-                sampler,
-                cache_planner,
-                TorchPagedAttentionBackend(),
-                device=spec.device,
+            step_factory = partial(
+                PagedStepHandler,
+                cache_planner=cache_planner,
+                attention_backend=TorchPagedAttentionBackend(),
             )
         elif kv_reservation == "unbounded":
-            # 连续后端同样从模型会话读取 KV 形状，装配层只提供设备配置。
+            # 连续缓存也直接读取模型声明的 KV 形状，这里只指定设备和数据类型。
             logical_cache = UnboundedKVCacheManager()
-            worker = ContiguousModelWorker(
-                runner,
-                sampler,
-                ContiguousKVCacheConfig(dtype=spec.dtype, device=spec.device),
-                device=spec.device,
+            step_factory = partial(
+                ContiguousStepHandler,
+                cache_config=ContiguousKVCacheConfig(
+                    dtype=spec.dtype,
+                    device=spec.device,
+                ),
             )
         else:
             raise ValueError(f"unsupported KV reservation mode: {kv_reservation}")
+        worker = LocalModelWorker(
+            runner,
+            step_factory,
+            StandardDecodeHandler(sampler),
+        )
         model_executor = LocalModelExecutor(worker)
         scheduler = TokenBudgetScheduler(
             logical_cache,

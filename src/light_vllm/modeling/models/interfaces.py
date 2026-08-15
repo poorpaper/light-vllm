@@ -136,7 +136,11 @@ class ModelFactory(Protocol):
 
 
 class ModelSession(Protocol):
-    """一次生成或一个 Worker 固定使用的模型快照。"""
+    """一次生成或一个 Worker 选定后持续使用的模型。
+
+    这里的“固定”只表示执行途中不会切换到后来重新加载的模型，并不表示
+    ``nn.Module`` 本身是不可修改的对象。
+    """
 
     @property
     def generation(self) -> int: ...
@@ -151,7 +155,7 @@ class ModelSession(Protocol):
 
 
 class ModelSessionProvider(Protocol):
-    """为执行路径提供当前模型的不可变会话。"""
+    """让执行代码取得当前模型，并在本次执行期间继续使用它。"""
 
     @property
     def generation(self) -> int: ...

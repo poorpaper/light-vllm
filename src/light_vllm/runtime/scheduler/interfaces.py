@@ -10,9 +10,10 @@ class SchedulerError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class DecodingBudget:
-    """输出 frontier 上一次执行可额外使用的资源预算。
+    """算完现有 token 后，本轮还可以为生成新 token 预留多少资源。
 
-    它描述资源事实，不把请求标记成 prefill、decode 或 speculative 模式。
+    普通解码使用默认值：不提前留位置，最多返回一个新 token。投机解码可以
+    提前留出多个位置，并允许执行器一次返回多个通过验证的 token。
     """
 
     num_lookahead_tokens: int = 0
@@ -27,18 +28,19 @@ class DecodingBudget:
 
 @dataclass(frozen=True, slots=True)
 class ScheduledRequest:
-    """一个请求在本轮获得的事实型执行预算。
+    """Scheduler 为一个请求安排的本轮工作量。
 
-    ``num_scheduled_tokens`` 是已有明确 token ID 的输入；lookahead 只预留
-    尚无 token ID 的投机位置。block table 覆盖两者可能写入的完整 KV 范围。
+    ``num_scheduled_tokens`` 是本轮要计算的已知 token 数；
+    ``num_lookahead_tokens`` 是为投机解码提前留出的未知 token 位置数。
+    block table 必须覆盖两部分可能写入的全部 KV cache。
     """
 
     request_id: str
     num_computed_tokens: int
     num_scheduled_tokens: int
-    # 仅表示已预留的未知输出位置；proposal 的产生属于执行侧。
+    # 这里只预留位置；候选 token 由执行器产生。
     num_lookahead_tokens: int
-    # Executor 本轮最多可以返回多少个最终确认的输出 token。
+    # 执行器本轮最多可以返回多少个通过验证的新 token。
     max_output_tokens: int
     # 分页后端返回 block table；连续缓存返回 None。
     block_ids: tuple[int, ...] | None
@@ -60,7 +62,7 @@ class ScheduledRequest:
 
 @dataclass(frozen=True, slots=True)
 class SchedulerOutput:
-    """Scheduler 在一个安全点产生的不可变执行计划。"""
+    """Scheduler 一轮调度选出的请求和工作量。"""
 
     requests: tuple[ScheduledRequest, ...]
 
@@ -79,7 +81,7 @@ class SchedulerOutput:
 
 
 class Scheduler(Protocol):
-    """根据 token budget 和逻辑 KV 容量规划每次模型执行。"""
+    """根据单轮 token 上限和 KV cache 容量安排每次模型计算。"""
 
     @property
     def has_requests(self) -> bool: ...

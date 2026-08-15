@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from threading import RLock
+from collections.abc import Callable
+from threading import Lock, RLock
 
 import torch
 
@@ -14,12 +15,14 @@ from light_vllm.modeling.models.interfaces import (
     ModelSessionProvider,
 )
 from light_vllm.runtime.execution.interfaces import (
+    DecodeHandler,
     ExecutionBatch,
     ExecutionCapabilities,
     ExecutionError,
     ExecutionLease,
     ExecutionNotReadyError,
     ExecutionOutput,
+    ModelStepHandler,
     RequestOutput,
 )
 from light_vllm.runtime.execution.paged_attention import (
@@ -49,245 +52,129 @@ def _forward(model: ModelSession, batch: ForwardBatch) -> ModelOutput:
     return output
 
 
-class ContiguousModelWorker:
-    """使用连续 K/V tensor 的进程内 Worker。"""
+class ContiguousStepHandler:
+    """使用请求级连续 KV tensor 执行模型，作为正确性基线。"""
 
-    def __init__(
-        self,
-        runner: ModelSessionProvider,
-        sampler: Sampler,
-        cache_config: ContiguousKVCacheConfig,
-        *,
-        device: str | torch.device = "cpu",
-    ) -> None:
-        self._runner = runner
-        self._sampler = sampler
-        self._cache_config = cache_config
-        self._device = torch.device(device)
-        if self._device != cache_config.device:
-            raise ValueError("worker device must match the contiguous KV cache device")
-        self._model: ModelSession | None = None
-        self._kv_cache: ContiguousKVCache | None = None
-        self._lock = RLock()
-
-    @property
-    def ready(self) -> bool:
-        with self._lock:
-            return self._model is not None and self._model.generation == self._runner.generation
-
-    @property
-    def capabilities(self) -> ExecutionCapabilities:
-        _, model = self._get_runtime()
-        return ExecutionCapabilities(
-            max_model_tokens=model.max_model_tokens,
-            max_kv_cache_tokens=None,
-        )
-
-    def initialize(self) -> None:
-        try:
-            model = self._runner.open_session()
-        except ModelNotLoadedError as exc:
-            raise ExecutionNotReadyError("load a model before initializing the worker") from exc
+    def __init__(self, model: ModelSession, cache_config: ContiguousKVCacheConfig) -> None:
         model_spec = model.kv_cache_spec
         if model_spec is None:
             raise ExecutionNotReadyError("load a cacheable model before initializing the worker")
-        # 连续缓存的层数和 head 形状只从固定 session 的模型规格获得。
-        candidate = ContiguousKVCache(model_spec, self._cache_config)
+        self._cache = ContiguousKVCache(model_spec, cache_config)
+        self._device = cache_config.device
 
-        with self._lock:
-            if self._kv_cache is not None and self._kv_cache.num_requests:
-                raise ExecutionError("cannot initialize contiguous KV cache with active requests")
-            if self._runner.generation != model.generation:
-                raise ExecutionError("model changed while initializing the contiguous KV cache")
-            if self._model is not None and self._model.generation == model.generation:
-                return
-            self._model = model
-            self._kv_cache = candidate
+    @property
+    def max_kv_cache_tokens(self) -> int | None:
+        return None
 
     def add_request(self, request_id: str, *, capacity: int) -> None:
-        if not self.ready:
-            raise ExecutionNotReadyError("initialize the worker before adding requests")
-        cache, _ = self._get_runtime()
-        cache.allocate(request_id, capacity)
+        self._cache.allocate(request_id, capacity)
 
-    def free_request(self, request_id: str) -> bool:
-        cache, _ = self._get_runtime()
-        return cache.free(request_id)
+    def free_request(self, request_id: str) -> None:
+        self._cache.free(request_id)
 
     def acquire(self, request_ids: tuple[str, ...]) -> ExecutionLease:
-        cache, _ = self._get_runtime()
-        return cache.acquire(request_ids)
+        return self._cache.acquire(request_ids)
 
-    def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
-        cache, model = self._get_runtime()
-        results: list[RequestOutput] = []
+    def forward(
+        self,
+        model: ModelSession,
+        batch: ExecutionBatch,
+    ) -> tuple[torch.Tensor, ...]:
+        logits: list[torch.Tensor] = []
         for request in batch.requests:
-            # 当前 correctness Worker 只实现普通输出；投机 Worker 将消费 lookahead。
-            if request.num_lookahead_tokens:
-                raise ExecutionError("contiguous worker does not consume lookahead tokens")
+            if request.block_ids is not None:
+                raise ExecutionError("contiguous model step does not accept a block table")
             try:
-                cached_tokens = cache.cached_tokens(request.request_id)
+                cached_tokens = self._cache.cached_tokens(request.request_id)
                 if cached_tokens != request.num_computed_tokens:
                     raise ExecutionError(
                         "physical KV length must match the scheduled computed-token count"
                     )
-                forward_batch = ForwardBatch(
-                    input_ids=torch.tensor(
-                        [request.input_token_ids],
-                        dtype=torch.long,
-                        device=self._device,
+                output = _forward(
+                    model,
+                    ForwardBatch(
+                        input_ids=torch.tensor(
+                            [request.input_token_ids],
+                            dtype=torch.long,
+                            device=self._device,
+                        ),
+                        positions=torch.arange(
+                            cached_tokens,
+                            cached_tokens + len(request.input_token_ids),
+                            dtype=torch.long,
+                            device=self._device,
+                        ).unsqueeze(0),
+                        kv_cache=self._cache.view(request.request_id),
                     ),
-                    positions=torch.arange(
-                        cached_tokens,
-                        cached_tokens + len(request.input_token_ids),
-                        dtype=torch.long,
-                        device=self._device,
-                    ).unsqueeze(0),
-                    kv_cache=cache.view(request.request_id),
                 )
-                output = _forward(model, forward_batch)
                 updates = output.kv_cache_updates
                 if updates is None:
                     raise ExecutionError("model did not return KV cache updates")
                 if updates.num_tokens != len(request.input_token_ids):
                     raise ExecutionError("model returned the wrong number of KV cache updates")
-                cache.append(request.request_id, updates)
+                self._cache.append(request.request_id, updates)
             except KVCacheError as exc:
                 raise ExecutionError(str(exc)) from exc
+            logits.append(output.logits[0])
+        return tuple(logits)
 
-            token_ids = ()
-            if request.max_output_tokens:
-                token_ids = (self._sampler.sample(output.logits[:, -1])[0],)
-            results.append(
-                RequestOutput(
-                    request_id=request.request_id,
-                    num_input_tokens_computed=len(request.input_token_ids),
-                    output_token_ids=token_ids,
-                )
-            )
-        return ExecutionOutput(requests=tuple(results))
-
-    def _get_runtime(self) -> tuple[ContiguousKVCache, ModelSession]:
-        with self._lock:
-            if self._kv_cache is None or self._model is None:
-                raise ExecutionNotReadyError("initialize the worker before executing")
-            return self._kv_cache, self._model
+    def truncate(self, request_id: str, num_cached_tokens: int) -> None:
+        try:
+            self._cache.truncate(request_id, num_cached_tokens)
+        except KVCacheError as exc:
+            raise ExecutionError(str(exc)) from exc
 
 
 class _PagedExecutionLease:
-    """页池在 Worker 关闭前恒定存在，因此执行租约只需保持幂等。"""
+    """分页缓存池不会在单次执行中销毁，所以这里无需额外保留资源。"""
 
     def release(self) -> None:
         return
 
 
-class PagedModelWorker:
-    """使用全局分页 K/V 和同批次 Paged Attention 的进程内 Worker。"""
+class PagedStepHandler:
+    """使用全局分页 KV cache 和同批次 Paged Attention 执行模型。"""
 
     def __init__(
         self,
-        runner: ModelSessionProvider,
-        sampler: Sampler,
+        model: ModelSession,
         cache_planner: PagedKVCachePlanner,
         attention_backend: PagedAttentionBackend,
-        *,
-        device: str | torch.device = "cpu",
     ) -> None:
-        self._runner = runner
-        self._sampler = sampler
-        self._cache_planner = cache_planner
-        self._attention_backend = attention_backend
-        self._device = torch.device(device)
-        if self._device != cache_planner.device:
-            raise ValueError("worker device must match the paged KV cache device")
-        self._cache: PagedKVCache | None = None
-        self._model: ModelSession | None = None
-        self._active_requests: set[str] = set()
-        self._lock = RLock()
-
-    @property
-    def ready(self) -> bool:
-        with self._lock:
-            return (
-                self._cache is not None
-                and self._model is not None
-                and self._model.generation == self._runner.generation
-            )
-
-    @property
-    def capabilities(self) -> ExecutionCapabilities:
-        cache, model = self._get_runtime()
-        return ExecutionCapabilities(
-            max_model_tokens=model.max_model_tokens,
-            max_kv_cache_tokens=(cache.config.num_blocks * cache.config.block_size),
-        )
-
-    def initialize(self) -> None:
-        with self._lock:
-            # 活动请求仍引用旧 generation 的页池，不能原地替换。
-            if self._active_requests:
-                raise ExecutionError("cannot initialize paged KV cache with active requests")
-        try:
-            model = self._runner.open_session()
-        except ModelNotLoadedError as exc:
-            raise ExecutionNotReadyError(
-                "load a cacheable model before initializing the worker"
-            ) from exc
         model_spec = model.kv_cache_spec
         if model_spec is None:
             raise ExecutionNotReadyError("load a cacheable model before initializing the worker")
-        # 模型加载后才能用真实 KV 规格和剩余显存解析物理页容量。
-        cache_config = self._cache_planner.plan(model_spec)
-        candidate = PagedKVCache(model_spec, cache_config)
+        cache_config = cache_planner.plan(model_spec)
+        self._cache = PagedKVCache(model_spec, cache_config)
+        self._attention_backend = attention_backend
+        self._device = cache_config.device
 
-        with self._lock:
-            # 页池在锁外构造；安装前再次核对请求状态和模型 generation。
-            if self._active_requests:
-                raise ExecutionError("cannot initialize paged KV cache with active requests")
-            if self._runner.generation != model.generation:
-                raise ExecutionError("model changed while initializing the paged KV cache")
-            if self._model is not None and self._model.generation == model.generation:
-                return
-            self._cache = candidate
-            self._model = model
+    @property
+    def max_kv_cache_tokens(self) -> int:
+        return self._cache.config.num_blocks * self._cache.config.block_size
 
     def add_request(self, request_id: str, *, capacity: int) -> None:
+        # 页表由 Scheduler 每轮传入，这里没有请求级页对象需要创建。
         if not request_id:
             raise ValueError("request_id must not be empty")
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("capacity must be a positive integer")
-        if not self.ready:
-            raise ExecutionNotReadyError("initialize the worker before adding requests")
-        with self._lock:
-            if request_id in self._active_requests:
-                raise ExecutionError(f"request {request_id!r} already exists in the worker")
-            self._active_requests.add(request_id)
 
-    def free_request(self, request_id: str) -> bool:
-        with self._lock:
-            existed = request_id in self._active_requests
-            self._active_requests.discard(request_id)
-            return existed
+    def free_request(self, request_id: str) -> None:
+        # Scheduler 负责归还 page ID；全局物理页池随 Handler 一起销毁。
+        return
 
     def acquire(self, request_ids: tuple[str, ...]) -> ExecutionLease:
-        request_ids = tuple(request_ids)
-        if len(set(request_ids)) != len(request_ids):
-            raise ValueError("reserved request IDs must be unique")
-        with self._lock:
-            missing = tuple(
-                request_id for request_id in request_ids if request_id not in self._active_requests
-            )
-            if missing:
-                raise ExecutionError(f"paged worker requests are not active: {missing!r}")
         return _PagedExecutionLease()
 
-    def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
-        cache, model = self._get_runtime()
+    def forward(
+        self,
+        model: ModelSession,
+        batch: ExecutionBatch,
+    ) -> tuple[torch.Tensor, ...]:
         for request in batch.requests:
             if request.block_ids is None:
-                raise ExecutionError("paged worker requires a block table for every request")
-            if request.num_lookahead_tokens:
-                raise ExecutionError("paged worker does not consume lookahead tokens")
+                raise ExecutionError("paged model step requires a block table for every request")
 
         query_width = max(len(request.input_token_ids) for request in batch.requests)
         input_ids = torch.zeros(
@@ -317,8 +204,8 @@ class PagedModelWorker:
             num_computed_tokens=tuple(request.num_computed_tokens for request in batch.requests),
             query_lengths=tuple(query_lengths),
         )
-        # Worker 依赖 backend factory；模型最终只看到通用 AttentionContext。
-        attention = self._attention_backend.create(cache, metadata)
+        # Handler 选择具体 attention 实现，模型只通过统一接口调用它。
+        attention = self._attention_backend.create(self._cache, metadata)
         output = _forward(
             model,
             ForwardBatch(
@@ -328,27 +215,53 @@ class PagedModelWorker:
                 attention=attention,
             ),
         )
-        expected_layers = frozenset(layer.layer_id for layer in cache.model_spec.layers)
+        expected_layers = frozenset(layer.layer_id for layer in self._cache.model_spec.layers)
         if attention.layer_ids != expected_layers:
             raise ExecutionError("model did not execute every configured paged attention layer")
-        return self._build_output(batch, output, query_lengths)
+        return tuple(
+            output.logits[row, :query_length] for row, query_length in enumerate(query_lengths)
+        )
 
-    def _build_output(
+    def truncate(self, request_id: str, num_cached_tokens: int) -> None:
+        # 分页页池没有请求级有效长度；被拒绝的位置会在下次写入时覆盖。
+        return
+
+
+class StandardDecodeHandler:
+    """执行一次模型步骤；只有到输出边界时才采样一个新 token。"""
+
+    def __init__(self, sampler: Sampler) -> None:
+        self._sampler = sampler
+
+    def execute(
         self,
+        model: ModelSession,
         batch: ExecutionBatch,
-        output: ModelOutput,
-        query_lengths: list[int],
+        step: ModelStepHandler,
     ) -> ExecutionOutput:
+        for request in batch.requests:
+            if request.num_lookahead_tokens:
+                raise ExecutionError("standard decode does not consume lookahead tokens")
+            if request.max_output_tokens > 1:
+                raise ExecutionError("standard decode returns at most one output token")
+
+        logits_by_request = step.forward(model, batch)
+        if len(logits_by_request) != len(batch.requests):
+            raise ExecutionError("model step must return one logits tensor per request")
+        for request, logits in zip(batch.requests, logits_by_request, strict=True):
+            if logits.ndim != 2 or logits.shape[0] != len(request.input_token_ids):
+                raise ExecutionError("model step logits must have shape [query, vocabulary]")
+
         sampling_rows = [
             row for row, request in enumerate(batch.requests) if request.max_output_tokens
         ]
         sampled: dict[int, int] = {}
         if sampling_rows:
-            # 每行只从最后一个有效 query 位置采样，不能读取右侧 padding。
-            logits = torch.stack(
-                [output.logits[row, query_lengths[row] - 1] for row in sampling_rows]
-            )
-            sampled_ids = self._sampler.sample(logits)
+            sample_logits: list[torch.Tensor] = []
+            for row in sampling_rows:
+                logits = logits_by_request[row]
+                sample_logits.append(logits[-1])
+            sampled_ids = self._sampler.sample(torch.stack(sample_logits))
             sampled = dict(zip(sampling_rows, sampled_ids, strict=True))
 
         results = tuple(
@@ -361,8 +274,127 @@ class PagedModelWorker:
         )
         return ExecutionOutput(requests=results)
 
-    def _get_runtime(self) -> tuple[PagedKVCache, ModelSession]:
+
+class LocalModelWorker:
+    """固定模型版本，并把物理执行和解码语义交给注入的 Handler。"""
+
+    def __init__(
+        self,
+        runner: ModelSessionProvider,
+        step_factory: Callable[[ModelSession], ModelStepHandler],
+        decode_handler: DecodeHandler,
+    ) -> None:
+        self._runner = runner
+        self._step_factory = step_factory
+        self._decode_handler = decode_handler
+        self._model: ModelSession | None = None
+        self._step: ModelStepHandler | None = None
+        self._active_requests: set[str] = set()
+        self._lock = RLock()
+        self._initialize_lock = Lock()
+
+    @property
+    def ready(self) -> bool:
         with self._lock:
-            if self._cache is None or self._model is None:
-                raise ExecutionNotReadyError("initialize the worker before executing")
-            return self._cache, self._model
+            return self._is_ready_locked()
+
+    @property
+    def capabilities(self) -> ExecutionCapabilities:
+        with self._lock:
+            model, step = self._get_runtime_locked()
+            return ExecutionCapabilities(
+                max_model_tokens=model.max_model_tokens,
+                max_kv_cache_tokens=step.max_kv_cache_tokens,
+            )
+
+    def initialize(self) -> None:
+        with self._initialize_lock:
+            with self._lock:
+                if self._active_requests:
+                    raise ExecutionError("cannot initialize worker with active requests")
+            try:
+                model = self._runner.open_session()
+            except ModelNotLoadedError as exc:
+                raise ExecutionNotReadyError("load a model before initializing the worker") from exc
+
+            with self._lock:
+                if self._is_model_installed_locked(model.generation):
+                    return
+
+            # 物理缓存可能很大；先完整构造候选对象，再一次性替换运行状态。
+            candidate_step = self._step_factory(model)
+            with self._lock:
+                if self._active_requests:
+                    raise ExecutionError("cannot initialize worker with active requests")
+                if self._runner.generation != model.generation:
+                    raise ExecutionError("model changed while initializing the worker")
+                if self._is_model_installed_locked(model.generation):
+                    return
+                self._model = model
+                self._step = candidate_step
+
+    def add_request(self, request_id: str, *, capacity: int) -> None:
+        if not request_id:
+            raise ValueError("request_id must not be empty")
+        with self._lock:
+            if not self._is_ready_locked():
+                raise ExecutionNotReadyError("initialize the worker before adding requests")
+            if request_id in self._active_requests:
+                raise ExecutionError(f"request {request_id!r} already exists in the worker")
+            _, step = self._get_runtime_locked()
+            step.add_request(request_id, capacity=capacity)
+            self._active_requests.add(request_id)
+
+    def free_request(self, request_id: str) -> bool:
+        with self._lock:
+            if request_id not in self._active_requests:
+                return False
+            _, step = self._get_runtime_locked()
+            step.free_request(request_id)
+            self._active_requests.remove(request_id)
+            return True
+
+    def acquire(self, request_ids: tuple[str, ...]) -> ExecutionLease:
+        request_ids = tuple(request_ids)
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("reserved request IDs must be unique")
+        with self._lock:
+            _, step = self._get_runtime_locked()
+            missing = tuple(
+                request_id for request_id in request_ids if request_id not in self._active_requests
+            )
+            if missing:
+                raise ExecutionError(f"worker requests are not active: {missing!r}")
+            return step.acquire(request_ids)
+
+    def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+        with self._lock:
+            model, step = self._get_runtime_locked()
+            missing = tuple(
+                request_id
+                for request_id in batch.request_ids
+                if request_id not in self._active_requests
+            )
+            if missing:
+                raise ExecutionError(f"worker requests are not active: {missing!r}")
+        return self._decode_handler.execute(model, batch, step)
+
+    def _is_ready_locked(self) -> bool:
+        return (
+            self._model is not None
+            and self._step is not None
+            and self._model.generation == self._runner.generation
+        )
+
+    def _is_model_installed_locked(self, generation: int) -> bool:
+        return (
+            self._model is not None
+            and self._step is not None
+            and self._model.generation == generation
+            and self._runner.generation == generation
+        )
+
+    def _get_runtime_locked(self) -> tuple[ModelSession, ModelStepHandler]:
+        if self._model is None or self._step is None:
+            raise ExecutionNotReadyError("initialize the worker before executing")
+        return self._model, self._step

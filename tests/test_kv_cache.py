@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 
 import pytest
 import torch
@@ -16,13 +17,23 @@ from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionConfig,
 )
 from light_vllm.runtime.engine import EngineCore
-from light_vllm.runtime.execution import ContiguousModelWorker, LocalModelExecutor
+from light_vllm.runtime.execution import (
+    LocalModelExecutor,
+    LocalModelWorker,
+    PagedKVCacheConfig,
+    TorchPagedAttentionBackend,
+)
+from light_vllm.runtime.execution.worker import (
+    PagedStepHandler,
+    StandardDecodeHandler,
+)
 from light_vllm.runtime.generation import GenerateRequest
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCache,
     ContiguousKVCacheConfig,
     FixedKVBlockCapacity,
     KVCacheCapacityError,
+    KVCacheError,
     KVCacheNotFoundError,
     PagedKVCacheManager,
     UnboundedKVCacheManager,
@@ -107,6 +118,19 @@ def test_contiguous_cache_appends_valid_prefix_and_checks_capacity() -> None:
     assert cache.view("request").layers[0].keys.flatten().tolist() == [1, 2]
     with pytest.raises(KVCacheCapacityError):
         cache.append("request", _updates(3))
+
+
+def test_contiguous_cache_can_truncate_a_rejected_suffix() -> None:
+    cache = ContiguousKVCache(_model_kv_spec(), ContiguousKVCacheConfig())
+    cache.allocate("request", capacity=3)
+    cache.append("request", _updates(1, 2, 3))
+
+    cache.truncate("request", 1)
+
+    assert cache.cached_tokens("request") == 1
+    assert cache.view("request").layers[0].keys.flatten().tolist() == [1]
+    with pytest.raises(KVCacheError, match="cannot extend"):
+        cache.truncate("request", 2)
 
 
 def test_cache_lease_defers_physical_release_until_execution_finishes() -> None:
@@ -199,11 +223,16 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
             expected.append(token_id)
             token_ids.append(token_id)
 
-        logical_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=8, block_size=2))
-        worker = ContiguousModelWorker(
+        cache_config = PagedKVCacheConfig(num_blocks=8, block_size=2)
+        logical_cache = PagedKVCacheManager(cache_config)
+        worker = LocalModelWorker(
             SessionProvider(),
-            GreedySampler(),
-            ContiguousKVCacheConfig(),
+            partial(
+                PagedStepHandler,
+                cache_planner=cache_config,
+                attention_backend=TorchPagedAttentionBackend(),
+            ),
+            StandardDecodeHandler(GreedySampler()),
         )
         executor = LocalModelExecutor(worker)
         executor.initialize()

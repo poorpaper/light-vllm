@@ -116,14 +116,14 @@ class PagedAttentionMetadata:
 
 
 class PagedAttentionContext(AttentionContext, Protocol):
-    """模型使用通用 AttentionContext，Worker 额外核对已执行层。"""
+    """除模型需要的 attention 接口外，还记录本轮实际运行过哪些层。"""
 
     @property
     def layer_ids(self) -> frozenset[str]: ...
 
 
 class PagedAttentionBackend(Protocol):
-    """根据页池和批次事实创建上下文；CUDA/Triton 复用同一边界。"""
+    """为本批请求创建分页 attention；PyTorch、CUDA 和 Triton 都实现它。"""
 
     def create(
         self,
@@ -135,8 +135,8 @@ class PagedAttentionBackend(Protocol):
 class TorchPagedAttention:
     """逐物理页读取 K/V 的在线 softmax attention。
 
-    该实现用于 CPU correctness 和后端契约验证。它不拼接完整历史 K/V；优化
-    后端以后可以用 Triton/CUDA 实现同一个 ``AttentionContext`` 契约。
+    这是便于阅读和测试的 PyTorch 参考实现。它不会先拼接完整历史 K/V，
+    而是边读取每一页边累计 softmax。以后 CUDA/Triton 实现继续使用同一接口。
     """
 
     def __init__(self, cache: PagedKVCache, metadata: PagedAttentionMetadata) -> None:
@@ -234,7 +234,7 @@ class TorchPagedAttention:
         )
         query_for_math = query.to(accumulator_dtype)
 
-        # 按页维护在线 softmax 状态，避免为每个 query 拼接完整历史 K/V。
+        # 每读一页就更新 softmax 的累计值，不需要先拼出完整历史 K/V。
         num_blocks = (sequence_length + block_size - 1) // block_size
         for logical_block in range(num_blocks):
             block_id = block_table[logical_block]
@@ -261,7 +261,7 @@ class TorchPagedAttention:
 
 
 class TorchPagedAttentionBackend:
-    """装配可读性优先的 PyTorch correctness backend。"""
+    """创建便于阅读和测试的 PyTorch 分页 attention。"""
 
     def create(
         self,

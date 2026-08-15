@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 from threading import Event
 
@@ -20,8 +21,14 @@ from light_vllm.runtime.scheduler import DecodingBudget, TokenBudgetScheduler
 
 
 class _Lease:
+    def __init__(self, on_release: Callable[[], None]) -> None:
+        self._on_release = on_release
+        self._released = False
+
     def release(self) -> None:
-        pass
+        if not self._released:
+            self._on_release()
+            self._released = True
 
 
 class RecordingExecutor:
@@ -43,6 +50,7 @@ class RecordingExecutor:
         self.block_first_step = block_first_step
         self.first_step_started = Event()
         self.release_first_step = Event()
+        self.lease_release_count = 0
 
     def add_request(self, request_id: str, *, capacity: int) -> None:
         self.active.add(request_id)
@@ -53,7 +61,10 @@ class RecordingExecutor:
         return existed
 
     def acquire(self, request_ids: tuple[str, ...]) -> _Lease:
-        return _Lease()
+        return _Lease(self._record_lease_release)
+
+    def _record_lease_release(self) -> None:
+        self.lease_release_count += 1
 
     def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
         step = len(self.history)
@@ -151,6 +162,7 @@ def test_cancelled_request_releases_resources_at_the_safe_boundary() -> None:
         await events.aclose()
         await engine.close()
         assert kv_cache.num_free_blocks == 16
+        assert executor.lease_release_count == 1
 
     asyncio.run(run())
 
@@ -161,9 +173,71 @@ def test_execution_failure_is_delivered_to_the_request() -> None:
             raise ExecutionError("invalid execution output")
 
     async def run() -> None:
-        engine = _engine(FailingExecutor())
+        executor = FailingExecutor()
+        engine = _engine(executor)
         with pytest.raises(GenerationError, match="invalid execution output"):
             await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
         await engine.close()
+        assert executor.lease_release_count == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("computed", "computed-token count"),
+        ("too_many_outputs", "more tokens than the execution budget"),
+        ("cached_beyond_lookahead", "cached more output tokens"),
+        ("wrong_boundary", "wrong scheduling boundary"),
+    ],
+)
+def test_engine_rejects_invalid_multi_token_execution_facts(
+    case: str,
+    expected_error: str,
+) -> None:
+    class InvalidExecutor(RecordingExecutor):
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            request = batch.requests[0]
+            computed = len(request.input_token_ids)
+            outputs: tuple[int, ...] = (2, 3)
+            cached = 1
+            if case == "computed":
+                computed += 1
+            elif case == "too_many_outputs":
+                outputs = (2, 3, 4)
+            elif case == "cached_beyond_lookahead":
+                cached = 2
+            elif case == "wrong_boundary":
+                outputs = ()
+                cached = 0
+            return ExecutionOutput(
+                requests=(
+                    RequestOutput(
+                        request_id=request.request_id,
+                        num_input_tokens_computed=computed,
+                        output_token_ids=outputs,
+                        num_cached_output_tokens=cached,
+                    ),
+                )
+            )
+
+    async def run() -> None:
+        executor = InvalidExecutor(multiple_tokens=True)
+        kv_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2))
+        scheduler = TokenBudgetScheduler(
+            kv_cache,
+            max_num_sequences=2,
+            max_num_scheduled_tokens=8,
+            decoding_budget=DecodingBudget(num_lookahead_tokens=1, max_output_tokens=2),
+        )
+        engine = EngineCore(executor, scheduler)
+        with pytest.raises(GenerationError, match=expected_error):
+            await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
+        await engine.close()
+
+        assert not executor.active
+        assert kv_cache.num_free_blocks == 16
+        assert executor.lease_release_count == 1
 
     asyncio.run(run())

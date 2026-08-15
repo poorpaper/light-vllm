@@ -25,7 +25,7 @@ from light_vllm.runtime.sampling import Sampler
 
 
 class _LocalTokenExecutionSession:
-    """reference 请求在固定模型上的本地执行会话。"""
+    """参考实现为一次生成选定模型后，用它逐个计算新 token。"""
 
     def __init__(
         self,
@@ -75,9 +75,9 @@ class LocalTokenExecutor:
 
 
 class LocalModelExecutor:
-    """把 Engine 接到单进程执行拓扑，并把设备计算委托给 Worker。
+    """在当前进程中接收 Engine 的调用，并把模型计算交给 Worker。
 
-    该层保留未来多进程或分布式 Executor 的扩展位置，不承载调度策略。
+    以后增加多进程或分布式执行时，可以替换这个 Executor；调度策略不放在这里。
     """
 
     def __init__(self, worker: ModelWorker) -> None:

@@ -1,4 +1,5 @@
 from light_vllm.runtime.execution.interfaces import (
+    DecodeHandler,
     ExecutionBatch,
     ExecutionCapabilities,
     ExecutionError,
@@ -6,6 +7,7 @@ from light_vllm.runtime.execution.interfaces import (
     ExecutionOutput,
     ExecutionRequest,
     ModelExecutor,
+    ModelStepHandler,
     ModelWorker,
     RequestOutput,
     TokenExecutionSession,
@@ -21,11 +23,11 @@ from light_vllm.runtime.execution.paged_cache import (
     PagedKVCacheConfig,
     PagedKVCachePlanner,
 )
-from light_vllm.runtime.execution.worker import ContiguousModelWorker, PagedModelWorker
+from light_vllm.runtime.execution.worker import LocalModelWorker
 
 __all__ = [
-    "ContiguousModelWorker",
     "CudaMemoryKVCachePlanner",
+    "DecodeHandler",
     "ExecutionBatch",
     "ExecutionCapabilities",
     "ExecutionError",
@@ -33,13 +35,14 @@ __all__ = [
     "ExecutionOutput",
     "ExecutionRequest",
     "LocalModelExecutor",
+    "LocalModelWorker",
     "LocalTokenExecutor",
     "ModelExecutor",
+    "ModelStepHandler",
     "ModelWorker",
     "PagedAttentionBackend",
     "PagedKVCacheConfig",
     "PagedKVCachePlanner",
-    "PagedModelWorker",
     "RequestOutput",
     "TokenExecutionSession",
     "TokenExecutor",

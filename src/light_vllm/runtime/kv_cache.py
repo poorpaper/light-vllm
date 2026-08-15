@@ -28,7 +28,7 @@ class KVCacheNotFoundError(KVCacheError):
 
 @dataclass(frozen=True, slots=True)
 class KVCacheReservation:
-    """Scheduler 为一次执行预留的逻辑 KV 空间和可选物理位置。
+    """Scheduler 为一次模型计算提前留出的 KV cache 空间。
 
     分页 manager 返回请求当前完整的 ``block_ids``；其中可能包含刚为本轮
     增加、但尚未提交的 block。连续缓存不需要 block table，可以返回 ``None``。
@@ -41,7 +41,7 @@ class KVCacheReservation:
 
 
 class KVCacheManager(Protocol):
-    """Scheduler 管理 KV 预留状态的接口。
+    """Scheduler 用来预留、确认和释放 KV cache 空间的接口。
 
     实现可以返回 block table，也可以只记录 token 数；两者都必须支持提交和释放。
     """
@@ -65,7 +65,7 @@ class KVCacheManager(Protocol):
 
 
 class KVBlockCapacity(Protocol):
-    """分页逻辑分配与物理页池共享的容量事实。"""
+    """让 Scheduler 和实际分页缓存共用同一份页数与页大小。"""
 
     @property
     def num_blocks(self) -> int: ...
@@ -76,7 +76,7 @@ class KVBlockCapacity(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class FixedKVBlockCapacity:
-    """用于确定性配置和测试的固定逻辑 block 容量。"""
+    """直接指定分页缓存的页数和每页 token 数，主要用于配置和测试。"""
 
     num_blocks: int
     block_size: int
@@ -157,9 +157,8 @@ class UnboundedKVCacheManager:
 class PagedKVCacheManager:
     """使用固定大小逻辑 block 管理全局 KV 容量。
 
-    这里只实现 Scheduler 需要的预留、提交、回滚和释放语义，不保存 K/V
-    tensor。执行侧 ``PagedModelWorker`` 直接消费这里产生的 block table，
-    逻辑 manager 不依赖物理 cache 或 attention 实现。
+    它只为 Scheduler 分配 page ID，不保存真正的 K/V 张量。
+    分页执行 Handler 使用这里生成的 block table 访问实际物理页。
     """
 
     def __init__(self, capacity: KVBlockCapacity) -> None:
@@ -242,7 +241,7 @@ class PagedKVCacheManager:
         return (num_tokens + self.block_size - 1) // self.block_size
 
     def _sync_capacity(self) -> None:
-        """Worker 规划完成后初始化；模型重载且空闲时允许重新规划。"""
+        """Step Handler 规划完成后初始化；模型重载且空闲时允许重新规划。"""
 
         num_blocks = self._capacity.num_blocks
         if self._num_blocks == num_blocks:
@@ -276,7 +275,7 @@ class ContiguousKVCacheConfig:
 
 
 class KVCacheLease(Protocol):
-    """固定一批物理缓存生命周期的幂等租约。"""
+    """保证一次模型计算结束前，对应的物理缓存仍然存在。"""
 
     def release(self) -> None: ...
 
@@ -315,8 +314,8 @@ class _ContiguousKVCacheLease:
 class ContiguousKVCache:
     """执行侧的请求级连续 K/V tensor 存储。
 
-    这是无分页的物理正确性基线。Scheduler 看不到这些 tensor；Executor
-    也不会修改逻辑 KV 的分配策略。
+    这是便于验证正确性的非分页实现。Scheduler 不直接访问这些张量，
+    Executor 也不负责决定请求之间如何分配 KV cache。
     """
 
     def __init__(
@@ -375,6 +374,17 @@ class ContiguousKVCache:
     def cached_tokens(self, request_id: str) -> int:
         with self._lock:
             return self._get_entry(request_id).length
+
+    def truncate(self, request_id: str, num_cached_tokens: int) -> None:
+        """回退有效长度；旧张量会在这些位置再次使用时被覆盖。"""
+
+        if type(num_cached_tokens) is not int or num_cached_tokens < 0:
+            raise ValueError("cached token count must be a non-negative integer")
+        with self._lock:
+            entry = self._get_entry(request_id)
+            if num_cached_tokens > entry.length:
+                raise KVCacheError("cannot extend contiguous KV cache while truncating")
+            entry.length = num_cached_tokens
 
     def view(self, request_id: str) -> KVCacheState:
         """返回当前有效前缀的语义视图，不复制 K/V。"""

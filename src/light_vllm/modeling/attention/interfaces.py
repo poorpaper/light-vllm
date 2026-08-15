@@ -31,7 +31,7 @@ class AttentionLayerSpec:
 
 @dataclass(frozen=True, slots=True)
 class ModelKVCacheSpec:
-    """模型中所有可缓存 attention 层的不可变规格。"""
+    """模型所有可缓存 attention 层的 KV 形状说明。"""
 
     layers: tuple[AttentionLayerSpec, ...]
 
@@ -46,7 +46,7 @@ class ModelKVCacheSpec:
 
 
 class AttentionContext(Protocol):
-    """由执行后端提供、供模型 attention 层调用的一批次上下文。"""
+    """模型 attention 层通过这个接口读写本批次的 KV cache。"""
 
     def forward(
         self,
