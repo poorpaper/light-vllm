@@ -5,6 +5,7 @@ from contextlib import suppress
 from fastapi.testclient import TestClient
 
 from light_vllm import (
+    EngineCapabilities,
     GenerateRequest,
     GenerateResult,
     GenerationError,
@@ -15,11 +16,12 @@ from light_vllm import (
     TokenGenerated,
 )
 from light_vllm.entrypoints.http import create_serving_app
-from light_vllm.serving.http import MAX_PROMPT_TOKENS, _encoded_stream, create_http_app
+from light_vllm.serving.http import _encoded_stream, create_http_app
 
 
 class StubEngineClient:
     ready = True
+    capabilities = EngineCapabilities()
 
     async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
         yield TokenGenerated(token_id=7, position=0)
@@ -98,6 +100,7 @@ def test_http_adapter_exposes_health_and_non_streaming_generation() -> None:
 
     assert client.get("/healthz").json() == {"status": "ok"}
     assert client.get("/readyz").json() == {"status": "ready"}
+    assert client.get("/capabilities").json()["max_request_tokens"] is None
 
     response = client.post("/generate", json={"input_ids": [1, 2], "max_new_tokens": 1})
 
@@ -234,15 +237,27 @@ def test_http_request_validation_stays_in_the_adapter() -> None:
     assert response.status_code == 422
 
 
-def test_http_adapter_rejects_prompts_over_the_reference_limit() -> None:
-    client = TestClient(create_http_app(StubEngineClient()))
-
-    response = client.post(
-        "/generate",
-        json={"input_ids": [1] * (MAX_PROMPT_TOKENS + 1), "max_new_tokens": 1},
+def test_engine_capabilities_replace_transport_token_limits() -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture="tiny-attention-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+        ),
+        runtime="engine",
+        num_kv_blocks=2,
+        kv_block_size=2,
     )
 
-    assert response.status_code == 422
+    with TestClient(app) as client:
+        capabilities = client.get("/capabilities")
+        rejected = client.post(
+            "/generate",
+            json={"input_ids": [1, 2, 3], "max_new_tokens": 2},
+        )
+
+    assert capabilities.json()["max_request_tokens"] == 4
+    assert rejected.status_code == 422
+    assert "engine supports at most 4" in rejected.json()["detail"]
 
 
 def test_tiny_model_serves_an_end_to_end_http_request() -> None:
@@ -275,9 +290,7 @@ def test_tiny_attention_model_serves_through_engine_core() -> None:
         runtime="engine",
         max_num_sequences=2,
         max_num_scheduled_tokens=2,
-        kv_num_layers=1,
-        kv_num_heads=1,
-        kv_head_size=4,
+        num_kv_blocks=256,
     )
 
     with TestClient(app) as client:
@@ -300,9 +313,6 @@ def test_engine_core_serves_with_unbounded_kv_reservations() -> None:
         kv_reservation="unbounded",
         max_num_sequences=2,
         max_num_scheduled_tokens=2,
-        kv_num_layers=1,
-        kv_num_heads=1,
-        kv_head_size=4,
     )
 
     with TestClient(app) as client:

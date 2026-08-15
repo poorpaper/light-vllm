@@ -4,16 +4,48 @@ from __future__ import annotations
 
 import torch
 
-from light_vllm.modeling.models.interfaces import ForwardBatch, ModelForwarder
+from light_vllm.modeling.models.interfaces import (
+    ForwardBatch,
+    ModelNotLoadedError,
+    ModelSession,
+    ModelSessionProvider,
+)
 from light_vllm.runtime.execution.interfaces import (
     ExecutionBatch,
+    ExecutionCapabilities,
     ExecutionError,
     ExecutionLease,
+    ExecutionNotReadyError,
     ExecutionOutput,
     ModelWorker,
+    TokenExecutionSession,
 )
 from light_vllm.runtime.execution.worker import _forward
 from light_vllm.runtime.sampling import Sampler
+
+
+class _LocalTokenExecutionSession:
+    """reference 请求在固定模型上的本地执行会话。"""
+
+    def __init__(
+        self,
+        model: ModelSession,
+        sampler: Sampler,
+        *,
+        device: str | torch.device = "cpu",
+    ) -> None:
+        self._model = model
+        self._sampler = sampler
+        self._device = torch.device(device)
+
+    def next_token(self, token_ids: tuple[int, ...]) -> int:
+        if not token_ids:
+            raise ExecutionError("token_ids must not be empty")
+        batch = ForwardBatch(
+            input_ids=torch.tensor([token_ids], dtype=torch.long, device=self._device)
+        )
+        output = _forward(self._model, batch)
+        return self._sampler.sample(output.logits[:, -1])[0]
 
 
 class LocalTokenExecutor:
@@ -21,7 +53,7 @@ class LocalTokenExecutor:
 
     def __init__(
         self,
-        runner: ModelForwarder,
+        runner: ModelSessionProvider,
         sampler: Sampler,
         *,
         device: str | torch.device = "cpu",
@@ -34,18 +66,19 @@ class LocalTokenExecutor:
     def ready(self) -> bool:
         return self._runner.generation > 0
 
-    def next_token(self, token_ids: tuple[int, ...]) -> int:
-        if not token_ids:
-            raise ExecutionError("token_ids must not be empty")
-        batch = ForwardBatch(
-            input_ids=torch.tensor([token_ids], dtype=torch.long, device=self._device)
-        )
-        output = _forward(self._runner, batch)
-        return self._sampler.sample(output.logits[:, -1])[0]
+    def open_session(self) -> TokenExecutionSession:
+        try:
+            model = self._runner.open_session()
+        except ModelNotLoadedError as exc:
+            raise ExecutionNotReadyError("load a model before executing") from exc
+        return _LocalTokenExecutionSession(model, self._sampler, device=self._device)
 
 
 class LocalModelExecutor:
-    """把 Engine 的执行端口接到一个进程内 Worker。"""
+    """把 Engine 接到单进程执行拓扑，并把设备计算委托给 Worker。
+
+    该层保留未来多进程或分布式 Executor 的扩展位置，不承载调度策略。
+    """
 
     def __init__(self, worker: ModelWorker) -> None:
         self._worker = worker
@@ -53,6 +86,10 @@ class LocalModelExecutor:
     @property
     def ready(self) -> bool:
         return self._worker.ready
+
+    @property
+    def capabilities(self) -> ExecutionCapabilities:
+        return self._worker.capabilities
 
     def initialize(self) -> None:
         self._worker.initialize()

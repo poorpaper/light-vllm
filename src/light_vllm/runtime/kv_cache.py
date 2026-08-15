@@ -10,6 +10,7 @@ from typing import Protocol
 import torch
 from torch import Tensor
 
+from light_vllm.modeling.attention.interfaces import ModelKVCacheSpec
 from light_vllm.modeling.models.interfaces import KVCacheState, LayerKeyValues
 
 
@@ -61,6 +62,30 @@ class KVCacheManager(Protocol):
         """释放请求状态；重复释放返回 False。"""
 
         ...
+
+
+class KVBlockCapacity(Protocol):
+    """分页逻辑分配与物理页池共享的容量事实。"""
+
+    @property
+    def num_blocks(self) -> int: ...
+
+    @property
+    def block_size(self) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FixedKVBlockCapacity:
+    """用于确定性配置和测试的固定逻辑 block 容量。"""
+
+    num_blocks: int
+    block_size: int
+
+    def __post_init__(self) -> None:
+        if type(self.num_blocks) is not int or self.num_blocks <= 0:
+            raise ValueError("num_blocks must be a positive integer")
+        if type(self.block_size) is not int or self.block_size <= 0:
+            raise ValueError("block_size must be a positive integer")
 
 
 @dataclass(slots=True)
@@ -137,26 +162,23 @@ class PagedKVCacheManager:
     逻辑 manager 不依赖物理 cache 或 attention 实现。
     """
 
-    def __init__(self, *, num_blocks: int, block_size: int) -> None:
-        if type(num_blocks) is not int or num_blocks <= 0:
-            raise ValueError("num_blocks must be a positive integer")
-        if type(block_size) is not int or block_size <= 0:
-            raise ValueError("block_size must be a positive integer")
-        self._num_blocks = num_blocks
-        self._block_size = block_size
-        self._free_blocks = list(range(num_blocks))
-        heapify(self._free_blocks)
+    def __init__(self, capacity: KVBlockCapacity) -> None:
+        self._capacity = capacity
+        self._num_blocks: int | None = None
+        self._free_blocks: list[int] = []
         self._allocations: dict[str, _LogicalAllocation] = {}
 
     @property
     def block_size(self) -> int:
-        return self._block_size
+        return self._capacity.block_size
 
     @property
     def num_free_blocks(self) -> int:
+        self._sync_capacity()
         return len(self._free_blocks)
 
     def add_request(self, request_id: str) -> None:
+        self._sync_capacity()
         if not request_id:
             raise ValueError("request_id must not be empty")
         if request_id in self._allocations:
@@ -166,6 +188,7 @@ class PagedKVCacheManager:
     def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation:
         """原子地预留本轮 token 可能占用的新 block。"""
 
+        self._sync_capacity()
         if type(num_tokens) is not int or num_tokens <= 0:
             raise ValueError("num_tokens must be a positive integer")
         allocation = self._get(request_id)
@@ -216,7 +239,19 @@ class PagedKVCacheManager:
             heappush(self._free_blocks, block_id)
 
     def _blocks_for(self, num_tokens: int) -> int:
-        return (num_tokens + self._block_size - 1) // self._block_size
+        return (num_tokens + self.block_size - 1) // self.block_size
+
+    def _sync_capacity(self) -> None:
+        """Worker 规划完成后初始化；模型重载且空闲时允许重新规划。"""
+
+        num_blocks = self._capacity.num_blocks
+        if self._num_blocks == num_blocks:
+            return
+        if self._allocations:
+            raise KVCacheError("cannot change paged KV capacity with active requests")
+        self._num_blocks = num_blocks
+        self._free_blocks = list(range(num_blocks))
+        heapify(self._free_blocks)
 
     def _get(self, request_id: str) -> _LogicalAllocation:
         try:
@@ -228,23 +263,13 @@ class PagedKVCacheManager:
 
 
 @dataclass(frozen=True, slots=True)
-class KVCacheSpec:
-    """本地连续 KV tensor 的逐层布局。"""
+class ContiguousKVCacheConfig:
+    """连续 KV tensor 的设备和 dtype 配置。"""
 
-    num_layers: int
-    num_kv_heads: int
-    head_size: int
     dtype: torch.dtype = torch.float32
     device: str | torch.device = "cpu"
 
     def __post_init__(self) -> None:
-        for name, value in (
-            ("num_layers", self.num_layers),
-            ("num_kv_heads", self.num_kv_heads),
-            ("head_size", self.head_size),
-        ):
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
         if not self.dtype.is_floating_point:
             raise ValueError("KV cache dtype must be floating point")
         object.__setattr__(self, "device", torch.device(self.device))
@@ -257,16 +282,21 @@ class KVCacheLease(Protocol):
 
 
 @dataclass(slots=True)
-class _CacheEntry:
+class _LayerCacheEntry:
     keys: Tensor
     values: Tensor
+
+
+@dataclass(slots=True)
+class _CacheEntry:
+    layers: tuple[_LayerCacheEntry, ...]
     length: int = 0
     users: int = 0
     released: bool = False
 
     @property
     def capacity(self) -> int:
-        return self.keys.shape[1]
+        return self.layers[0].keys.shape[0]
 
 
 @dataclass(slots=True)
@@ -289,14 +319,23 @@ class ContiguousKVCache:
     也不会修改逻辑 KV 的分配策略。
     """
 
-    def __init__(self, spec: KVCacheSpec) -> None:
-        self._spec = spec
+    def __init__(
+        self,
+        model_spec: ModelKVCacheSpec,
+        config: ContiguousKVCacheConfig,
+    ) -> None:
+        self._model_spec = model_spec
+        self._config = config
         self._entries: dict[str, _CacheEntry] = {}
         self._lock = RLock()
 
     @property
-    def spec(self) -> KVCacheSpec:
-        return self._spec
+    def model_spec(self) -> ModelKVCacheSpec:
+        return self._model_spec
+
+    @property
+    def config(self) -> ContiguousKVCacheConfig:
+        return self._config
 
     @property
     def num_requests(self) -> int:
@@ -311,16 +350,22 @@ class ContiguousKVCache:
         with self._lock:
             if request_id in self._entries:
                 raise KVCacheError(f"KV cache for request {request_id!r} already exists")
-            shape = (
-                self._spec.num_layers,
-                capacity,
-                self._spec.num_kv_heads,
-                self._spec.head_size,
+            layers = tuple(
+                _LayerCacheEntry(
+                    keys=torch.empty(
+                        (capacity, layer.num_kv_heads, layer.head_size),
+                        dtype=self._config.dtype,
+                        device=self._config.device,
+                    ),
+                    values=torch.empty(
+                        (capacity, layer.num_kv_heads, layer.head_size),
+                        dtype=self._config.dtype,
+                        device=self._config.device,
+                    ),
+                )
+                for layer in self._model_spec.layers
             )
-            self._entries[request_id] = _CacheEntry(
-                keys=torch.empty(shape, dtype=self._spec.dtype, device=self._spec.device),
-                values=torch.empty(shape, dtype=self._spec.dtype, device=self._spec.device),
-            )
+            self._entries[request_id] = _CacheEntry(layers=layers)
 
     def contains(self, request_id: str) -> bool:
         with self._lock:
@@ -336,14 +381,14 @@ class ContiguousKVCache:
 
         with self._lock:
             entry = self._get_entry(request_id)
-            layers = tuple(
+            state_layers = tuple(
                 LayerKeyValues(
-                    keys=entry.keys[layer, : entry.length].unsqueeze(0),
-                    values=entry.values[layer, : entry.length].unsqueeze(0),
+                    keys=layer.keys[: entry.length].unsqueeze(0),
+                    values=layer.values[: entry.length].unsqueeze(0),
                 )
-                for layer in range(self._spec.num_layers)
+                for layer in entry.layers
             )
-            return KVCacheState(layers=layers)
+            return KVCacheState(layers=state_layers)
 
     @torch.inference_mode()
     def append(self, request_id: str, updates: KVCacheState) -> None:
@@ -360,8 +405,9 @@ class ContiguousKVCache:
                 )
             target = slice(entry.length, new_length)
             for layer_index, layer in enumerate(updates.layers):
-                entry.keys[layer_index, target].copy_(layer.keys[0])
-                entry.values[layer_index, target].copy_(layer.values[0])
+                target_layer = entry.layers[layer_index]
+                target_layer.keys[target].copy_(layer.keys[0])
+                target_layer.values[target].copy_(layer.values[0])
             entry.length = new_length
 
     def free(self, request_id: str) -> bool:
@@ -398,18 +444,18 @@ class ContiguousKVCache:
                     self._entries.pop(request_id, None)
 
     def _validate_updates(self, updates: KVCacheState) -> None:
-        if len(updates.layers) != self._spec.num_layers:
+        if len(updates.layers) != len(self._model_spec.layers):
             raise KVCacheError("KV cache update layer count does not match the cache spec")
-        for layer in updates.layers:
+        for layer, spec in zip(updates.layers, self._model_spec.layers, strict=True):
             expected_shape = (
                 1,
                 updates.num_tokens,
-                self._spec.num_kv_heads,
-                self._spec.head_size,
+                spec.num_kv_heads,
+                spec.head_size,
             )
             if layer.keys.shape != expected_shape:
                 raise KVCacheError(f"KV cache update must have shape {expected_shape}")
-            if layer.keys.dtype != self._spec.dtype or layer.keys.device != self._spec.device:
+            if layer.keys.dtype != self._config.dtype or layer.keys.device != self._config.device:
                 raise KVCacheError("KV cache update dtype and device must match the cache spec")
 
     def _get_entry(self, request_id: str) -> _CacheEntry:

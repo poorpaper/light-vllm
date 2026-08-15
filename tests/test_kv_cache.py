@@ -5,6 +5,7 @@ import asyncio
 import pytest
 import torch
 
+from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
 from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
     KVCacheState,
@@ -19,9 +20,10 @@ from light_vllm.runtime.execution import ContiguousModelWorker, LocalModelExecut
 from light_vllm.runtime.generation import GenerateRequest
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCache,
+    ContiguousKVCacheConfig,
+    FixedKVBlockCapacity,
     KVCacheCapacityError,
     KVCacheNotFoundError,
-    KVCacheSpec,
     PagedKVCacheManager,
     UnboundedKVCacheManager,
 )
@@ -34,8 +36,21 @@ def _updates(*values: float) -> KVCacheState:
     return KVCacheState(layers=(LayerKeyValues(keys=tensor, values=tensor + 10),))
 
 
+def _model_kv_spec(*, num_kv_heads: int = 1, head_size: int = 1) -> ModelKVCacheSpec:
+    return ModelKVCacheSpec(
+        layers=(
+            AttentionLayerSpec(
+                layer_id="attention",
+                num_query_heads=num_kv_heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+            ),
+        )
+    )
+
+
 def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
-    manager = PagedKVCacheManager(num_blocks=3, block_size=2)
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=3, block_size=2))
     manager.add_request("request")
 
     first = manager.reserve("request", 3)
@@ -56,7 +71,7 @@ def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
 
 
 def test_logical_reservation_is_atomic_when_capacity_is_insufficient() -> None:
-    manager = PagedKVCacheManager(num_blocks=1, block_size=2)
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=1, block_size=2))
     manager.add_request("request")
 
     with pytest.raises(KVCacheCapacityError):
@@ -84,7 +99,7 @@ def test_unbounded_manager_tracks_reservations_without_block_placement() -> None
 
 
 def test_contiguous_cache_appends_valid_prefix_and_checks_capacity() -> None:
-    cache = ContiguousKVCache(KVCacheSpec(num_layers=1, num_kv_heads=1, head_size=1))
+    cache = ContiguousKVCache(_model_kv_spec(), ContiguousKVCacheConfig())
     cache.allocate("request", capacity=2)
     cache.append("request", _updates(1, 2))
 
@@ -95,7 +110,7 @@ def test_contiguous_cache_appends_valid_prefix_and_checks_capacity() -> None:
 
 
 def test_cache_lease_defers_physical_release_until_execution_finishes() -> None:
-    cache = ContiguousKVCache(KVCacheSpec(num_layers=1, num_kv_heads=1, head_size=1))
+    cache = ContiguousKVCache(_model_kv_spec(), ContiguousKVCacheConfig())
     cache.allocate("request", capacity=1)
     lease = cache.acquire(("request",))
 
@@ -163,9 +178,17 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
 
         class Forwarder:
             generation = 1
+            kv_cache_spec = model.kv_cache_spec
+            max_model_tokens = None
 
             def forward(self, batch: ForwardBatch):
                 return model(batch)
+
+        class SessionProvider:
+            generation = 1
+
+            def open_session(self):
+                return Forwarder()
 
         request = GenerateRequest(input_ids=(1, 2, 3), max_new_tokens=3)
         expected: list[int] = []
@@ -176,10 +199,16 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
             expected.append(token_id)
             token_ids.append(token_id)
 
-        tensor_cache = ContiguousKVCache(KVCacheSpec(num_layers=1, num_kv_heads=2, head_size=4))
-        logical_cache = PagedKVCacheManager(num_blocks=8, block_size=2)
+        logical_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=8, block_size=2))
+        worker = ContiguousModelWorker(
+            SessionProvider(),
+            GreedySampler(),
+            ContiguousKVCacheConfig(),
+        )
+        executor = LocalModelExecutor(worker)
+        executor.initialize()
         engine = EngineCore(
-            LocalModelExecutor(ContiguousModelWorker(Forwarder(), tensor_cache, GreedySampler())),
+            executor,
             TokenBudgetScheduler(
                 logical_cache,
                 max_num_sequences=2,
@@ -191,7 +220,6 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
         await engine.close()
 
         assert result.generated_token_ids == tuple(expected)
-        assert tensor_cache.num_requests == 0
         assert logical_cache.num_free_blocks == 8
 
     asyncio.run(run())

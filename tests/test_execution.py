@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
 from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
     KVCacheState,
@@ -22,13 +23,25 @@ from light_vllm.runtime.execution import (
     LocalTokenExecutor,
     PagedKVCacheConfig,
     PagedModelWorker,
+    TorchPagedAttentionBackend,
 )
-from light_vllm.runtime.kv_cache import ContiguousKVCache, KVCacheSpec
+from light_vllm.runtime.kv_cache import ContiguousKVCacheConfig
 from light_vllm.runtime.sampling import GreedySampler
 
 
 class IncrementingForwarder:
     generation = 1
+    max_model_tokens = None
+    kv_cache_spec = ModelKVCacheSpec(
+        layers=(
+            AttentionLayerSpec(
+                layer_id="attention",
+                num_query_heads=1,
+                num_kv_heads=1,
+                head_size=1,
+            ),
+        )
+    )
 
     def __init__(self, vocab_size: int = 8) -> None:
         self.vocab_size = vocab_size
@@ -50,6 +63,7 @@ class IncrementingForwarder:
 
 class UnloadedForwarder:
     generation = 0
+    max_model_tokens = None
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
         raise ModelNotLoadedError("not loaded")
@@ -57,6 +71,8 @@ class UnloadedForwarder:
 
 class InvalidOutputForwarder:
     generation = 1
+    kv_cache_spec = None
+    max_model_tokens = None
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
         return ModelOutput(logits=torch.zeros(1, 8))
@@ -69,6 +85,7 @@ class FixedSampler:
 
 class CountingAttentionForwarder:
     generation = 1
+    max_model_tokens = None
 
     def __init__(self) -> None:
         self.model = TinyAttentionCausalLM(
@@ -88,56 +105,89 @@ class CountingAttentionForwarder:
         return self.model(batch)
 
 
-class ReloadingSampler:
-    def __init__(self, forwarder: CountingAttentionForwarder) -> None:
-        self._forwarder = forwarder
+class StaticSessionProvider:
+    def __init__(self, session) -> None:
+        self.session = session
+        self.generation = session.generation
 
-    def sample(self, logits: torch.Tensor) -> tuple[int, ...]:
-        self._forwarder.generation += 1
-        return (7,) * logits.shape[0]
+    def open_session(self):
+        return self.session
 
 
-class ReloadingAttentionForwarder(CountingAttentionForwarder):
-    @property
-    def kv_cache_spec(self):
-        spec = self.model.kv_cache_spec
-        self.generation += 1
-        return spec
+class UnloadedSessionProvider:
+    generation = 0
+
+    def open_session(self):
+        raise ModelNotLoadedError("not loaded")
 
 
 class ReloadingDuringForward(CountingAttentionForwarder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.provider: StaticSessionProvider | None = None
+
     def forward(self, batch: ForwardBatch) -> ModelOutput:
         output = super().forward(batch)
-        self.generation += 1
+        assert self.provider is not None
+        self.provider.generation += 1
         return output
 
 
-def test_reference_executor_delegates_token_choice_to_sampler() -> None:
-    executor = LocalTokenExecutor(IncrementingForwarder(), FixedSampler())
+class ReloadingSessionProvider(StaticSessionProvider):
+    def open_session(self):
+        session = super().open_session()
+        self.generation += 1
+        return session
 
-    assert executor.next_token((1, 2)) == 7
+
+def _execution_request(
+    request_id: str,
+    input_token_ids: tuple[int, ...],
+    num_computed_tokens: int,
+    block_ids: tuple[int, ...] | None,
+    *,
+    max_output_tokens: int = 1,
+) -> ExecutionRequest:
+    return ExecutionRequest(
+        request_id=request_id,
+        input_token_ids=input_token_ids,
+        num_computed_tokens=num_computed_tokens,
+        num_lookahead_tokens=0,
+        max_output_tokens=max_output_tokens,
+        block_ids=block_ids,
+    )
+
+
+def test_reference_executor_delegates_token_choice_to_sampler() -> None:
+    executor = LocalTokenExecutor(StaticSessionProvider(IncrementingForwarder()), FixedSampler())
+
+    assert executor.open_session().next_token((1, 2)) == 7
 
 
 def test_reference_executor_exposes_an_unloaded_model_as_not_ready() -> None:
-    executor = LocalTokenExecutor(UnloadedForwarder(), GreedySampler())
+    executor = LocalTokenExecutor(UnloadedSessionProvider(), GreedySampler())
 
     assert not executor.ready
     with pytest.raises(ExecutionNotReadyError):
-        executor.next_token((1,))
+        executor.open_session()
 
 
 def test_reference_executor_checks_model_output_shape() -> None:
-    executor = LocalTokenExecutor(InvalidOutputForwarder(), GreedySampler())
+    executor = LocalTokenExecutor(StaticSessionProvider(InvalidOutputForwarder()), GreedySampler())
 
     with pytest.raises(ExecutionError, match="model logits"):
-        executor.next_token((1,))
+        executor.open_session().next_token((1,))
 
 
 def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
-    cache = ContiguousKVCache(KVCacheSpec(num_layers=1, num_kv_heads=1, head_size=1))
     executor = LocalModelExecutor(
-        ContiguousModelWorker(IncrementingForwarder(), cache, GreedySampler())
+        ContiguousModelWorker(
+            StaticSessionProvider(IncrementingForwarder()),
+            GreedySampler(),
+            ContiguousKVCacheConfig(),
+        )
     )
+    executor.initialize()
     executor.add_request("request", capacity=3)
 
     prefill = executor.execute(
@@ -147,8 +197,9 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                     request_id="request",
                     input_token_ids=(1, 2),
                     num_computed_tokens=0,
+                    num_lookahead_tokens=0,
+                    max_output_tokens=0,
                     block_ids=None,
-                    sampling_required=False,
                 ),
             )
         )
@@ -160,17 +211,17 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                     request_id="request",
                     input_token_ids=(3,),
                     num_computed_tokens=2,
+                    num_lookahead_tokens=0,
+                    max_output_tokens=1,
                     block_ids=None,
-                    sampling_required=True,
                 ),
             )
         )
     ).requests[0]
 
-    assert prefill.num_computed_tokens == 2
-    assert prefill.token_ids == ()
-    assert decode.token_ids == (4,)
-    assert cache.cached_tokens("request") == 3
+    assert prefill.num_input_tokens_computed == 2
+    assert prefill.output_token_ids == ()
+    assert decode.output_token_ids == (4,)
 
 
 def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> None:
@@ -178,9 +229,10 @@ def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> 
     forwarder = CountingAttentionForwarder()
     executor = LocalModelExecutor(
         PagedModelWorker(
-            forwarder,
+            StaticSessionProvider(forwarder),
             GreedySampler(),
             PagedKVCacheConfig(num_blocks=8, block_size=2),
+            TorchPagedAttentionBackend(),
         )
     )
     executor.initialize()
@@ -190,8 +242,8 @@ def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> 
     prefill = executor.execute(
         ExecutionBatch(
             requests=(
-                ExecutionRequest("a", (1, 2, 3), 0, (4, 1), True),
-                ExecutionRequest("b", (5, 6), 0, (2,), True),
+                _execution_request("a", (1, 2, 3), 0, (4, 1)),
+                _execution_request("b", (5, 6), 0, (2,)),
             )
         )
     )
@@ -205,7 +257,7 @@ def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> 
         )
         for tokens in ((1, 2, 3), (5, 6))
     )
-    assert tuple(result.token_ids[0] for result in prefill.requests) == expected_prefill
+    assert tuple(result.output_token_ids[0] for result in prefill.requests) == expected_prefill
     assert forwarder.calls == 1
     torch.testing.assert_close(
         forwarder.position_batches[0],
@@ -215,8 +267,8 @@ def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> 
     decode = executor.execute(
         ExecutionBatch(
             requests=(
-                ExecutionRequest("a", (expected_prefill[0],), 3, (4, 1), True),
-                ExecutionRequest("b", (expected_prefill[1],), 2, (2, 3), True),
+                _execution_request("a", (expected_prefill[0],), 3, (4, 1)),
+                _execution_request("b", (expected_prefill[1],), 2, (2, 3)),
             )
         )
     )
@@ -234,7 +286,7 @@ def test_paged_worker_batches_requests_and_matches_full_sequence_attention() -> 
         )
     )
 
-    assert tuple(result.token_ids[0] for result in decode.requests) == expected_decode
+    assert tuple(result.output_token_ids[0] for result in decode.requests) == expected_decode
     assert forwarder.calls == 2
     torch.testing.assert_close(forwarder.position_batches[1], torch.tensor([[3], [2]]))
 
@@ -243,26 +295,26 @@ def test_paged_worker_rejects_execution_without_block_tables() -> None:
     forwarder = CountingAttentionForwarder()
     executor = LocalModelExecutor(
         PagedModelWorker(
-            forwarder,
+            StaticSessionProvider(forwarder),
             GreedySampler(),
             PagedKVCacheConfig(num_blocks=2, block_size=2),
+            TorchPagedAttentionBackend(),
         )
     )
     executor.initialize()
     executor.add_request("request", capacity=2)
 
     with pytest.raises(ExecutionError, match="requires a block table"):
-        executor.execute(
-            ExecutionBatch(requests=(ExecutionRequest("request", (1,), 0, None, True),))
-        )
+        executor.execute(ExecutionBatch(requests=(_execution_request("request", (1,), 0, None),)))
 
 
 def test_paged_worker_rejects_a_model_change_during_cache_initialization() -> None:
     executor = LocalModelExecutor(
         PagedModelWorker(
-            ReloadingAttentionForwarder(),
+            ReloadingSessionProvider(CountingAttentionForwarder()),
             GreedySampler(),
             PagedKVCacheConfig(num_blocks=2, block_size=2),
+            TorchPagedAttentionBackend(),
         )
     )
 
@@ -270,36 +322,28 @@ def test_paged_worker_rejects_a_model_change_during_cache_initialization() -> No
         executor.initialize()
 
 
-def test_paged_worker_rejects_output_if_the_model_changes_during_forward() -> None:
+def test_paged_worker_finishes_with_its_session_after_runner_reload() -> None:
+    forwarder = ReloadingDuringForward()
+    provider = StaticSessionProvider(forwarder)
+    forwarder.provider = provider
     executor = LocalModelExecutor(
         PagedModelWorker(
-            ReloadingDuringForward(),
+            provider,
             GreedySampler(),
             PagedKVCacheConfig(num_blocks=2, block_size=2),
+            TorchPagedAttentionBackend(),
         )
     )
     executor.initialize()
     executor.add_request("request", capacity=2)
 
-    with pytest.raises(ExecutionError, match="model changed during paged execution"):
-        executor.execute(
-            ExecutionBatch(requests=(ExecutionRequest("request", (1,), 0, (0,), True),))
-        )
-
-
-def test_paged_worker_rejects_output_if_the_model_changes_during_sampling() -> None:
-    forwarder = CountingAttentionForwarder()
-    executor = LocalModelExecutor(
-        PagedModelWorker(
-            forwarder,
-            ReloadingSampler(forwarder),
-            PagedKVCacheConfig(num_blocks=2, block_size=2),
-        )
+    output = executor.execute(
+        ExecutionBatch(requests=(_execution_request("request", (1,), 0, (0,)),))
     )
-    executor.initialize()
-    executor.add_request("request", capacity=2)
 
-    with pytest.raises(ExecutionError, match="model changed during paged execution"):
-        executor.execute(
-            ExecutionBatch(requests=(ExecutionRequest("request", (1,), 0, (0,), True),))
-        )
+    assert len(output.requests[0].output_token_ids) == 1
+    assert not executor.ready
+    with pytest.raises(ExecutionError, match="active requests"):
+        executor.initialize()
+    with pytest.raises(ExecutionNotReadyError):
+        executor.add_request("new", capacity=2)

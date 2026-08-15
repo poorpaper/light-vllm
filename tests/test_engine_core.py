@@ -10,12 +10,13 @@ from light_vllm import GenerateRequest, GenerationError
 from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
     ExecutionBatch,
+    ExecutionCapabilities,
     ExecutionError,
     ExecutionOutput,
     RequestOutput,
 )
-from light_vllm.runtime.kv_cache import PagedKVCacheManager
-from light_vllm.runtime.scheduler import TokenBudgetScheduler
+from light_vllm.runtime.kv_cache import FixedKVBlockCapacity, PagedKVCacheManager
+from light_vllm.runtime.scheduler import DecodingBudget, TokenBudgetScheduler
 
 
 class _Lease:
@@ -25,6 +26,10 @@ class _Lease:
 
 class RecordingExecutor:
     ready = True
+    capabilities = ExecutionCapabilities(
+        max_model_tokens=None,
+        max_kv_cache_tokens=32,
+    )
 
     def __init__(
         self,
@@ -60,7 +65,7 @@ class RecordingExecutor:
         results = []
         for request in batch.requests:
             token_ids = ()
-            if request.sampling_required:
+            if request.max_output_tokens:
                 token_ids = (
                     (request.input_token_ids[-1] + 1, request.input_token_ids[-1] + 2)
                     if self.multiple_tokens
@@ -69,8 +74,9 @@ class RecordingExecutor:
             results.append(
                 RequestOutput(
                     request_id=request.request_id,
-                    num_computed_tokens=len(request.input_token_ids),
-                    token_ids=token_ids,
+                    num_input_tokens_computed=len(request.input_token_ids),
+                    output_token_ids=token_ids,
+                    num_cached_output_tokens=1 if self.multiple_tokens else 0,
                 )
             )
         return ExecutionOutput(requests=tuple(results))
@@ -78,9 +84,14 @@ class RecordingExecutor:
 
 def _engine(executor: RecordingExecutor, *, token_budget: int = 2) -> EngineCore:
     scheduler = TokenBudgetScheduler(
-        PagedKVCacheManager(num_blocks=16, block_size=2),
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2)),
         max_num_sequences=2,
         max_num_scheduled_tokens=token_budget,
+        decoding_budget=(
+            DecodingBudget(num_lookahead_tokens=1, max_output_tokens=2)
+            if executor.multiple_tokens
+            else None
+        ),
     )
     return EngineCore(executor, scheduler)
 
@@ -101,12 +112,14 @@ def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
 
 def test_engine_accepts_multiple_committed_tokens_from_one_execution() -> None:
     async def run() -> None:
-        engine = _engine(RecordingExecutor(multiple_tokens=True), token_budget=8)
+        executor = RecordingExecutor(multiple_tokens=True)
+        engine = _engine(executor, token_budget=8)
         result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
         await engine.close()
 
         assert result.generated_token_ids == (2, 3, 4)
         assert result.finish_reason == "length"
+        assert executor.history == [((1,),), ((3,),)]
 
     asyncio.run(run())
 
@@ -114,7 +127,7 @@ def test_engine_accepts_multiple_committed_tokens_from_one_execution() -> None:
 def test_cancelled_request_releases_resources_at_the_safe_boundary() -> None:
     async def run() -> None:
         executor = RecordingExecutor(block_first_step=True)
-        kv_cache = PagedKVCacheManager(num_blocks=16, block_size=2)
+        kv_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2))
         scheduler = TokenBudgetScheduler(
             kv_cache,
             max_num_sequences=2,

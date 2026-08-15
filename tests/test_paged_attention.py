@@ -10,8 +10,13 @@ from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionMetadata,
     TorchPagedAttention,
 )
-from light_vllm.runtime.execution.paged_cache import PagedKVCache, PagedKVCacheConfig
-from light_vllm.runtime.kv_cache import KVCacheError
+from light_vllm.runtime.execution.paged_cache import (
+    CudaMemoryKVCachePlanner,
+    PagedKVCache,
+    PagedKVCacheConfig,
+    kv_cache_bytes_per_block,
+)
+from light_vllm.runtime.kv_cache import KVCacheError, PagedKVCacheManager
 
 
 def _cache(*, num_query_heads: int = 2, num_kv_heads: int = 2) -> PagedKVCache:
@@ -28,6 +33,29 @@ def _cache(*, num_query_heads: int = 2, num_kv_heads: int = 2) -> PagedKVCache:
         ),
         PagedKVCacheConfig(num_blocks=4, block_size=2),
     )
+
+
+def test_cuda_memory_planner_derives_capacity_from_the_model_kv_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_spec = _cache().model_spec
+    planner = CudaMemoryKVCachePlanner(
+        block_size=2,
+        dtype=torch.float32,
+        device="cuda:0",
+        memory_fraction=0.5,
+    )
+    logical_cache = PagedKVCacheManager(planner)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1024, 2048))
+
+    with pytest.raises(KVCacheError, match="before planning"):
+        _ = logical_cache.num_free_blocks
+    config = planner.plan(model_spec)
+
+    assert kv_cache_bytes_per_block(model_spec, block_size=2, dtype=torch.float32) == 128
+    assert config.num_blocks == 4
+    assert planner.num_blocks == 4
+    assert logical_cache.num_free_blocks == 4
 
 
 def _dense_attention(query: torch.Tensor, keys: torch.Tensor, values: torch.Tensor) -> torch.Tensor:

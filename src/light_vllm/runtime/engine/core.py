@@ -8,6 +8,8 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from itertools import count
 
+from light_vllm.runtime.engine.admission import CapacityAdmission
+from light_vllm.runtime.engine.interfaces import EngineCapabilities, RequestAdmission
 from light_vllm.runtime.execution.interfaces import (
     ExecutionBatch,
     ExecutionError,
@@ -56,6 +58,8 @@ def _execution_error(exc: Exception) -> GenerationError:
 
 
 def _validated_output(batch: ExecutionBatch, output: ExecutionOutput) -> dict[str, RequestOutput]:
+    """在提交任何可变状态前，核对 Executor 返回的全部事实。"""
+
     if not isinstance(output, ExecutionOutput):
         raise ExecutionError("model executor must return ExecutionOutput")
     by_request_id = {result.request_id: result for result in output.requests}
@@ -63,14 +67,20 @@ def _validated_output(batch: ExecutionBatch, output: ExecutionOutput) -> dict[st
         raise ExecutionError("model executor must return one result for every request")
     for request in batch.requests:
         result = by_request_id[request.request_id]
-        if result.num_computed_tokens != len(request.input_token_ids):
+        if result.num_input_tokens_computed != len(request.input_token_ids):
             raise ExecutionError("executor computed-token count does not match its input")
-        if bool(result.token_ids) != request.sampling_required:
+        if len(result.output_token_ids) > request.max_output_tokens:
+            raise ExecutionError("executor returned more tokens than the execution budget")
+        if bool(result.output_token_ids) != bool(request.max_output_tokens):
             raise ExecutionError("executor returned tokens at the wrong scheduling boundary")
+        if result.num_cached_output_tokens > request.num_lookahead_tokens:
+            raise ExecutionError("executor cached more output tokens than reserved lookahead")
     return by_request_id
 
 
 async def _await_safe_boundary(task: asyncio.Task[None]) -> None:
+    """外层取消时仍等待清理任务越过资源安全边界。"""
+
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -86,9 +96,15 @@ class EngineCore:
     拥有 tensor 和模型计算。三个阶段只通过不可变值传递状态。
     """
 
-    def __init__(self, executor: ModelExecutor, scheduler: Scheduler) -> None:
+    def __init__(
+        self,
+        executor: ModelExecutor,
+        scheduler: Scheduler,
+        admission: RequestAdmission | None = None,
+    ) -> None:
         self._executor = executor
         self._scheduler = scheduler
+        self._admission = admission or CapacityAdmission()
         self._states: dict[str, _RequestState] = {}
         self._executing_request_ids: set[str] = set()
         self._pending_scheduler_removals: set[str] = set()
@@ -100,6 +116,16 @@ class EngineCore:
     @property
     def ready(self) -> bool:
         return not self._closed and self._executor.ready
+
+    @property
+    def capabilities(self) -> EngineCapabilities:
+        execution = self._executor.capabilities
+        return EngineCapabilities(
+            max_model_tokens=execution.max_model_tokens,
+            max_kv_cache_tokens=execution.max_kv_cache_tokens,
+            max_num_sequences=self._scheduler.max_num_sequences,
+            max_num_scheduled_tokens=self._scheduler.max_num_scheduled_tokens,
+        )
 
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         generated_token_ids: list[int] = []
@@ -156,6 +182,8 @@ class EngineCore:
                 raise GenerationError("generation engine is closed")
             if not self._executor.ready:
                 raise GenerationNotReadyError("load a model before generating")
+            # Admission 只检查空闲引擎也无法满足的确定性上限。
+            self._admission.validate(request, self.capabilities)
 
             request_id = f"request-{next(self._request_ids)}"
             state = _RequestState(request_id, request, list(request.input_ids))
@@ -197,8 +225,10 @@ class EngineCore:
                     lease = self._executor.acquire(batch.request_ids)
                     self._executing_request_ids.update(batch.request_ids)
 
+                # 锁内只生成计划并取得租约；同步模型计算在线程和锁外执行。
                 try:
                     raw_output = await asyncio.to_thread(self._executor.execute, batch)
+                    # 完整校验通过前，本轮不得推进 Engine 或逻辑 KV 状态。
                     output = _validated_output(batch, raw_output)
                 except Exception as exc:
                     async with self._lock:
@@ -206,6 +236,7 @@ class EngineCore:
                     continue
                 finally:
                     try:
+                        # 先释放物理资源租约，再允许调度器回收逻辑 block。
                         lease.release()
                     finally:
                         async with self._lock:
@@ -228,6 +259,7 @@ class EngineCore:
         for item in scheduled.requests:
             state = self._states[item.request_id]
             end = item.num_computed_tokens + item.num_scheduled_tokens
+            # Scheduler 只给位置和数量，真实 token ID 由 Engine 请求状态切出。
             input_token_ids = tuple(state.token_ids[item.num_computed_tokens : end])
             if len(input_token_ids) != item.num_scheduled_tokens:
                 raise SchedulerError("scheduler selected tokens outside the request state")
@@ -236,8 +268,9 @@ class EngineCore:
                     request_id=item.request_id,
                     input_token_ids=input_token_ids,
                     num_computed_tokens=item.num_computed_tokens,
+                    num_lookahead_tokens=item.num_lookahead_tokens,
+                    max_output_tokens=item.max_output_tokens,
                     block_ids=item.block_ids,
-                    sampling_required=item.sampling_required,
                 )
             )
         return ExecutionBatch(requests=tuple(requests))
@@ -252,12 +285,18 @@ class EngineCore:
             if state is None:
                 continue
             result = output[item.request_id]
-            visible_tokens, finish_reason = self._visible_tokens(state, result.token_ids)
+            # EOS/长度可以截断一次多 token 输出，只提交仍对用户可见的缓存前缀。
+            visible_tokens, finish_reason = self._visible_tokens(state, result.output_token_ids)
+            num_cached_visible_tokens = min(
+                result.num_cached_output_tokens,
+                len(visible_tokens),
+            )
             self._scheduler.complete(
                 item.request_id,
-                num_computed_tokens=result.num_computed_tokens,
+                num_committed_tokens=(result.num_input_tokens_computed + num_cached_visible_tokens),
                 num_new_tokens=len(visible_tokens),
             )
+            # 未缓存输出虽已确认，但没有 KV；追加后会在下一轮成为 pending 输入。
             for token_id in visible_tokens:
                 position = state.generated_count
                 state.token_ids.append(token_id)

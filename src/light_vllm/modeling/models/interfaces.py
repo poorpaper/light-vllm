@@ -135,8 +135,8 @@ class ModelFactory(Protocol):
     def __call__(self, spec: ModelSpec) -> nn.Module: ...
 
 
-class ModelForwarder(Protocol):
-    """执行层调用模型运行时所需的最小接口。"""
+class ModelSession(Protocol):
+    """一次生成或一个 Worker 固定使用的模型快照。"""
 
     @property
     def generation(self) -> int: ...
@@ -144,4 +144,16 @@ class ModelForwarder(Protocol):
     @property
     def kv_cache_spec(self) -> ModelKVCacheSpec | None: ...
 
+    @property
+    def max_model_tokens(self) -> int | None: ...
+
     def forward(self, batch: ForwardBatch) -> ModelOutput: ...
+
+
+class ModelSessionProvider(Protocol):
+    """为执行路径提供当前模型的不可变会话。"""
+
+    @property
+    def generation(self) -> int: ...
+
+    def open_session(self) -> ModelSession: ...

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 from torch import Tensor
 
+from light_vllm.modeling.attention.interfaces import AttentionContext
 from light_vllm.runtime.execution.paged_cache import PagedKVCache
 from light_vllm.runtime.kv_cache import KVCacheError
 
@@ -113,6 +115,23 @@ class PagedAttentionMetadata:
             owned_blocks.update(table)
 
 
+class PagedAttentionContext(AttentionContext, Protocol):
+    """模型使用通用 AttentionContext，Worker 额外核对已执行层。"""
+
+    @property
+    def layer_ids(self) -> frozenset[str]: ...
+
+
+class PagedAttentionBackend(Protocol):
+    """根据页池和批次事实创建上下文；CUDA/Triton 复用同一边界。"""
+
+    def create(
+        self,
+        cache: PagedKVCache,
+        metadata: PagedAttentionMetadata,
+    ) -> PagedAttentionContext: ...
+
+
 class TorchPagedAttention:
     """逐物理页读取 K/V 的在线 softmax attention。
 
@@ -163,6 +182,7 @@ class TorchPagedAttention:
             query_width=query.shape[1],
             device=config.device,
         )
+        # 先写入本轮 K/V；因果注意力随后可读取到当前位置自身。
         self._cache.write(layer_id, key, value, slot_mapping)
 
         output = torch.zeros_like(query)
@@ -214,6 +234,7 @@ class TorchPagedAttention:
         )
         query_for_math = query.to(accumulator_dtype)
 
+        # 按页维护在线 softmax 状态，避免为每个 query 拼接完整历史 K/V。
         num_blocks = (sequence_length + block_size - 1) // block_size
         for logical_block in range(num_blocks):
             block_id = block_table[logical_block]
@@ -237,3 +258,14 @@ class TorchPagedAttention:
             running_max = next_max
 
         return (running_value / running_sum.unsqueeze(1)).to(query.dtype)
+
+
+class TorchPagedAttentionBackend:
+    """装配可读性优先的 PyTorch correctness backend。"""
+
+    def create(
+        self,
+        cache: PagedKVCache,
+        metadata: PagedAttentionMetadata,
+    ) -> TorchPagedAttention:
+        return TorchPagedAttention(cache, metadata)

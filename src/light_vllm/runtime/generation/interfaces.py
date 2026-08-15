@@ -15,6 +15,10 @@ class GenerationNotReadyError(GenerationError):
     """模型还没准备好时抛出。"""
 
 
+class GenerationRejectedError(GenerationError):
+    """请求超出当前引擎明确能力时抛出。"""
+
+
 @dataclass(frozen=True, slots=True)
 class GenerateRequest:
     """一次生成请求，创建后不能修改。"""

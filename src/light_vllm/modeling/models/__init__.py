@@ -3,9 +3,10 @@ from light_vllm.modeling.models.interfaces import (
     KVCacheState,
     LayerKeyValues,
     ModelFactory,
-    ModelForwarder,
     ModelNotLoadedError,
     ModelOutput,
+    ModelSession,
+    ModelSessionProvider,
     ModelSpec,
 )
 from light_vllm.modeling.models.tiny import TinyCausalLM
@@ -16,9 +17,10 @@ __all__ = [
     "KVCacheState",
     "LayerKeyValues",
     "ModelFactory",
-    "ModelForwarder",
     "ModelNotLoadedError",
     "ModelOutput",
+    "ModelSession",
+    "ModelSessionProvider",
     "ModelSpec",
     "TinyCausalLM",
     "TinyAttentionCausalLM",

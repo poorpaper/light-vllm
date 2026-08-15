@@ -47,8 +47,10 @@ class ReferenceGenerationService:
 
         with self._execution_lock:
             try:
+                # 一个请求只打开一次 session，生成途中 reload 不会切换模型。
+                execution = self._executor.open_session()
                 for position in range(request.max_new_tokens):
-                    token_id = self._executor.next_token(tuple(token_ids))
+                    token_id = execution.next_token(tuple(token_ids))
                     token_ids.append(token_id)
                     yield TokenGenerated(token_id=token_id, position=position)
 
