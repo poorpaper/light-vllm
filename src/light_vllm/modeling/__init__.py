@@ -12,6 +12,8 @@ from light_vllm.modeling.models import (
     ModelSession,
     ModelSessionProvider,
     ModelSpec,
+    Qwen2Config,
+    Qwen2ForCausalLM,
     TinyAttentionCausalLM,
     TinyCausalLM,
 )
@@ -32,6 +34,8 @@ __all__ = [
     "ModelSessionProvider",
     "ModelRunner",
     "ModelSpec",
+    "Qwen2Config",
+    "Qwen2ForCausalLM",
     "TinyCausalLM",
     "TinyAttentionCausalLM",
 ]

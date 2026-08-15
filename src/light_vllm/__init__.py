@@ -7,6 +7,8 @@ from light_vllm.modeling import (
     ModelOutput,
     ModelRunner,
     ModelSpec,
+    Qwen2Config,
+    Qwen2ForCausalLM,
     TinyAttentionCausalLM,
 )
 from light_vllm.runtime import (
@@ -111,6 +113,8 @@ __all__ = [
     "ModelOutput",
     "ModelRunner",
     "ModelSpec",
+    "Qwen2Config",
+    "Qwen2ForCausalLM",
     "PagedKVCacheManager",
     "ReferenceGenerationService",
     "RequestAdmission",
