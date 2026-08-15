@@ -11,7 +11,6 @@ import torch
 from torch import Tensor
 
 from light_vllm.modeling.attention.interfaces import ModelKVCacheSpec
-from light_vllm.modeling.models.interfaces import KVCacheState, LayerKeyValues
 
 
 class KVCacheError(RuntimeError):
@@ -24,6 +23,48 @@ class KVCacheCapacityError(KVCacheError):
 
 class KVCacheNotFoundError(KVCacheError):
     """访问不存在或已经释放的请求缓存时抛出。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ContiguousLayerKV:
+    """连续布局中一层 K/V 的有效片段。
+
+    K 和 V 都使用 ``[batch, sequence, kv_heads, head_size]``；它既可以是
+    已缓存历史的只读视图，也可以是本轮等待追加的新片段。
+    """
+
+    keys: Tensor
+    values: Tensor
+
+    def __post_init__(self) -> None:
+        if self.keys.ndim != 4:
+            raise ValueError("keys must have shape [batch, sequence, kv_heads, head_size]")
+        if self.values.shape != self.keys.shape:
+            raise ValueError("keys and values must have the same shape")
+        if self.keys.shape[0] <= 0 or self.keys.shape[2] <= 0 or self.keys.shape[3] <= 0:
+            raise ValueError("key/value batch, head count and head size must be positive")
+        if self.values.dtype != self.keys.dtype or self.values.device != self.keys.device:
+            raise ValueError("keys and values must use the same dtype and device")
+
+
+@dataclass(frozen=True, slots=True)
+class ContiguousKVCacheState:
+    """连续缓存中同一段 token 对应的逐层 K/V。"""
+
+    layers: tuple[ContiguousLayerKV, ...]
+
+    def __post_init__(self) -> None:
+        layers = tuple(self.layers)
+        if not layers:
+            raise ValueError("contiguous KV cache state must contain at least one layer")
+        batch_and_sequence = layers[0].keys.shape[:2]
+        if any(layer.keys.shape[:2] != batch_and_sequence for layer in layers[1:]):
+            raise ValueError("all contiguous KV layers must share batch and sequence dimensions")
+        object.__setattr__(self, "layers", layers)
+
+    @property
+    def num_tokens(self) -> int:
+        return self.layers[0].keys.shape[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,22 +427,22 @@ class ContiguousKVCache:
                 raise KVCacheError("cannot extend contiguous KV cache while truncating")
             entry.length = num_cached_tokens
 
-    def view(self, request_id: str) -> KVCacheState:
+    def view(self, request_id: str) -> ContiguousKVCacheState:
         """返回当前有效前缀的语义视图，不复制 K/V。"""
 
         with self._lock:
             entry = self._get_entry(request_id)
             state_layers = tuple(
-                LayerKeyValues(
+                ContiguousLayerKV(
                     keys=layer.keys[: entry.length].unsqueeze(0),
                     values=layer.values[: entry.length].unsqueeze(0),
                 )
                 for layer in entry.layers
             )
-            return KVCacheState(layers=state_layers)
+            return ContiguousKVCacheState(layers=state_layers)
 
     @torch.inference_mode()
-    def append(self, request_id: str, updates: KVCacheState) -> None:
+    def append(self, request_id: str, updates: ContiguousKVCacheState) -> None:
         """校验所有层后，一次性追加同一段 token 的 K/V。"""
 
         with self._lock:
@@ -453,7 +494,7 @@ class ContiguousKVCache:
                 if entry.released and entry.users == 0:
                     self._entries.pop(request_id, None)
 
-    def _validate_updates(self, updates: KVCacheState) -> None:
+    def _validate_updates(self, updates: ContiguousKVCacheState) -> None:
         if len(updates.layers) != len(self._model_spec.layers):
             raise KVCacheError("KV cache update layer count does not match the cache spec")
         for layer, spec in zip(updates.layers, self._model_spec.layers, strict=True):

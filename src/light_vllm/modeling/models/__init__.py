@@ -1,7 +1,5 @@
 from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
-    KVCacheState,
-    LayerKeyValues,
     ModelFactory,
     ModelNotLoadedError,
     ModelOutput,
@@ -15,8 +13,6 @@ from light_vllm.modeling.models.tiny_attention import TinyAttentionCausalLM
 
 __all__ = [
     "ForwardBatch",
-    "KVCacheState",
-    "LayerKeyValues",
     "ModelFactory",
     "ModelNotLoadedError",
     "ModelOutput",

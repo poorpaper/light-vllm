@@ -45,6 +45,8 @@ from light_vllm.runtime.generation import (
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCache,
     ContiguousKVCacheConfig,
+    ContiguousKVCacheState,
+    ContiguousLayerKV,
     FixedKVBlockCapacity,
     KVCacheCapacityError,
     KVCacheError,
@@ -67,6 +69,8 @@ from light_vllm.runtime.scheduler import (
 __all__ = [
     "ContiguousKVCache",
     "ContiguousKVCacheConfig",
+    "ContiguousKVCacheState",
+    "ContiguousLayerKV",
     "CudaMemoryKVCachePlanner",
     "DenseAttentionMetadata",
     "CapacityAdmission",

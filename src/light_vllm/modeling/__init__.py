@@ -4,8 +4,6 @@ from light_vllm.modeling.attention import AttentionContext, AttentionLayerSpec, 
 from light_vllm.modeling.catalog import Catalog
 from light_vllm.modeling.models import (
     ForwardBatch,
-    KVCacheState,
-    LayerKeyValues,
     ModelFactory,
     ModelNotLoadedError,
     ModelOutput,
@@ -24,8 +22,6 @@ __all__ = [
     "AttentionLayerSpec",
     "Catalog",
     "ForwardBatch",
-    "KVCacheState",
-    "LayerKeyValues",
     "ModelFactory",
     "ModelKVCacheSpec",
     "ModelNotLoadedError",

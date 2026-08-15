@@ -8,8 +8,11 @@ import torch
 from torch import Tensor
 
 from light_vllm.modeling.attention.interfaces import AttentionContext, ModelKVCacheSpec
-from light_vllm.modeling.models.interfaces import KVCacheState, LayerKeyValues
-from light_vllm.runtime.kv_cache import KVCacheError
+from light_vllm.runtime.kv_cache import (
+    ContiguousKVCacheState,
+    ContiguousLayerKV,
+    KVCacheError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,12 +59,12 @@ class TorchDenseAttention(AttentionContext):
         self,
         model_spec: ModelKVCacheSpec,
         metadata: DenseAttentionMetadata,
-        past: KVCacheState | None = None,
+        past: ContiguousKVCacheState | None = None,
     ) -> None:
         self._model_spec = model_spec
         self._metadata = metadata
         self._layer_specs = {layer.layer_id: layer for layer in model_spec.layers}
-        self._past_by_layer: dict[str, LayerKeyValues] = {}
+        self._past_by_layer: dict[str, ContiguousLayerKV] = {}
         if past is not None:
             if len(past.layers) != len(model_spec.layers):
                 raise KVCacheError("dense KV cache layer count does not match the model spec")
@@ -69,14 +72,14 @@ class TorchDenseAttention(AttentionContext):
                 spec.layer_id: layer
                 for spec, layer in zip(model_spec.layers, past.layers, strict=True)
             }
-        self._updates: dict[str, LayerKeyValues] = {}
+        self._updates: dict[str, ContiguousLayerKV] = {}
 
     @property
     def layer_ids(self) -> frozenset[str]:
         return frozenset(self._updates)
 
     @property
-    def cache_updates(self) -> KVCacheState:
+    def cache_updates(self) -> ContiguousKVCacheState:
         """按模型层顺序返回本轮 K/V；缺层时拒绝产生部分更新。"""
 
         expected = frozenset(self._layer_specs)
@@ -84,7 +87,7 @@ class TorchDenseAttention(AttentionContext):
             raise KVCacheError("model did not execute every configured dense attention layer")
         if any(length != self._metadata.query_width for length in self._metadata.query_lengths):
             raise KVCacheError("padded dense batches cannot be appended to one contiguous cache")
-        return KVCacheState(
+        return ContiguousKVCacheState(
             layers=tuple(self._updates[layer.layer_id] for layer in self._model_spec.layers)
         )
 
@@ -126,7 +129,7 @@ class TorchDenseAttention(AttentionContext):
         probabilities = torch.softmax(scores.float(), dim=-1).to(query.dtype)
 
         # 这里只暂存引用；模型完整成功后，连续缓存再统一校验并复制所有层。
-        self._updates[layer_id] = LayerKeyValues(keys=key, values=value)
+        self._updates[layer_id] = ContiguousLayerKV(keys=key, values=value)
         return torch.einsum("bhqk,bkhd->bqhd", probabilities, values)
 
     def _causal_mask(self, past_length: int, device: torch.device) -> Tensor:

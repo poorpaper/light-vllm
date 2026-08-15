@@ -7,11 +7,7 @@ import pytest
 import torch
 
 from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
-from light_vllm.modeling.models.interfaces import (
-    ForwardBatch,
-    KVCacheState,
-    LayerKeyValues,
-)
+from light_vllm.modeling.models.interfaces import ForwardBatch
 from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionCausalLM,
     TinyAttentionConfig,
@@ -33,6 +29,8 @@ from light_vllm.runtime.generation import GenerateRequest
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCache,
     ContiguousKVCacheConfig,
+    ContiguousKVCacheState,
+    ContiguousLayerKV,
     FixedKVBlockCapacity,
     KVCacheCapacityError,
     KVCacheError,
@@ -44,9 +42,9 @@ from light_vllm.runtime.sampling import GreedySampler
 from light_vllm.runtime.scheduler import TokenBudgetScheduler
 
 
-def _updates(*values: float) -> KVCacheState:
+def _updates(*values: float) -> ContiguousKVCacheState:
     tensor = torch.tensor(values, dtype=torch.float32).reshape(1, len(values), 1, 1)
-    return KVCacheState(layers=(LayerKeyValues(keys=tensor, values=tensor + 10),))
+    return ContiguousKVCacheState(layers=(ContiguousLayerKV(keys=tensor, values=tensor + 10),))
 
 
 def _model_kv_spec(*, num_kv_heads: int = 1, head_size: int = 1) -> ModelKVCacheSpec:
