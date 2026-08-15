@@ -196,7 +196,7 @@ class TorchPagedAttention:
         ):
             for query_offset in range(query_length):
                 sequence_length = computed + query_offset + 1
-                output[row, query_offset] = self._attend_one(
+                output[row, query_offset] = self._attend_query_token(
                     layer_id,
                     query[row, query_offset],
                     table,
@@ -205,7 +205,7 @@ class TorchPagedAttention:
                 )
         return output
 
-    def _attend_one(
+    def _attend_query_token(
         self,
         layer_id: str,
         query: Tensor,
@@ -213,6 +213,8 @@ class TorchPagedAttention:
         sequence_length: int,
         scale: float,
     ) -> Tensor:
+        """让一个 query token 读取自己的分页历史 K/V。"""
+
         layer = self._cache.layer(layer_id)
         layer_spec = self._cache.layer_spec(layer_id)
         block_size = self._cache.config.block_size
