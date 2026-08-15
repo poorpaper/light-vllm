@@ -44,7 +44,7 @@ src/light_vllm/
 
 可视化索引（均为可直接浏览的单文件 HTML）：
 
-- [当前架构总览](diagrams/light-vllm-current-overview.html)：保留整体组件和调用方向，不承载细节；
+- [当前架构总览](diagrams/light-vllm-current-overview.html)：区分模型加载路径与固定 ModelSession 的执行热路径，不承载 KV 和 attention 细节；
 - [KV cache 容量与所有权](diagrams/light-vllm-kv-ownership.html)：从模型 KV 形状、显存预算一直画到逻辑 page ID、物理张量和提交/回收；
 - [Paged Attention 地址映射](diagrams/light-vllm-paged-attention-token-path.html)：用具体数字展示绝对位置、block table、物理 slot、K/V 写入和逐页 attention；
 - [普通与投机解码的共同执行契约](diagrams/light-vllm-iteration-transaction.html)：区分当前普通 Decode Handler 和未来投机 Decode Handler，并展示 cached prefix 如何提交；
