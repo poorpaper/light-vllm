@@ -16,6 +16,8 @@ from light_vllm.modeling.models.interfaces import ModelFactory, ModelSpec
 
 
 def _read_json(path: Path) -> Mapping[str, object]:
+    """读取快照里的配置或分片索引。"""
+
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -26,10 +28,13 @@ def _read_json(path: Path) -> Mapping[str, object]:
 
 
 def _resolve_checkpoint(spec: ModelSpec) -> tuple[Path, tuple[Path, ...]]:
+    """找到配置目录，并按索引顺序返回全部权重文件。"""
+
     if spec.weights is None:
         raise ModelLoadError("the safetensors loader requires ModelSpec.weights")
     weights = Path(spec.weights)
     if weights.is_file():
+        # 单文件快照仍从同目录读取 config.json。
         if weights.suffix != ".safetensors":
             raise ModelLoadError("safetensors weights must use the .safetensors suffix")
         return weights.parent, (weights,)
@@ -38,6 +43,7 @@ def _resolve_checkpoint(spec: ModelSpec) -> tuple[Path, tuple[Path, ...]]:
 
     index_path = weights / "model.safetensors.index.json"
     if index_path.is_file():
+        # 大模型会拆成多个文件，索引记录每个参数在哪个分片。
         index = _read_json(index_path)
         weight_map = index.get("weight_map")
         if not isinstance(weight_map, dict) or not weight_map:
@@ -53,6 +59,7 @@ def _resolve_checkpoint(spec: ModelSpec) -> tuple[Path, tuple[Path, ...]]:
                 "safetensors index shard must stay inside the checkpoint directory"
             )
     else:
+        # 小模型通常没有索引，直接读取目录中的权重文件。
         shards = tuple(sorted(weights.glob("*.safetensors")))
     if not shards:
         raise ModelLoadError(f"checkpoint directory {weights} contains no safetensors weights")
@@ -63,6 +70,8 @@ def _resolve_checkpoint(spec: ModelSpec) -> tuple[Path, tuple[Path, ...]]:
 
 
 def _optional_weight_keys(model: nn.Module) -> frozenset[str]:
+    """返回可以不单独保存的共享权重名称。"""
+
     value = getattr(model, "optional_weight_keys", frozenset())
     keys = frozenset(value)
     if any(not isinstance(key, str) or not key for key in keys):
@@ -71,6 +80,8 @@ def _optional_weight_keys(model: nn.Module) -> frozenset[str]:
 
 
 def _copy_weight(name: str, source: Tensor, target: Tensor) -> None:
+    """把一个文件张量复制到已经创建好的模型参数中。"""
+
     if source.shape != target.shape:
         raise ModelLoadError(
             f"weight {name!r} has shape {tuple(source.shape)}, expected {tuple(target.shape)}"
@@ -91,6 +102,7 @@ class SafetensorsModelLoader:
         # 显式 model_args 只用于小范围覆盖；真实模型尺寸仍会由权重形状校验。
         checkpoint_args.update(spec.model_args)
         resolved_spec = replace(spec, model_args=checkpoint_args)
+        # 先按配置创建空模型，权重文件只负责填充参数，不负责定义结构。
         model = factory(resolved_spec).to(device=spec.device, dtype=spec.dtype).eval()
         targets = model.state_dict()
         optional = _optional_weight_keys(model)
@@ -100,6 +112,7 @@ class SafetensorsModelLoader:
         with torch.no_grad():
             for shard in shards:
                 try:
+                    # 一次只打开一个分片，避免把整套权重同时放进内存。
                     with safe_open(shard, framework="pt", device="cpu") as reader:
                         for name in tuple(reader.keys()):
                             if name in loaded:
@@ -116,6 +129,7 @@ class SafetensorsModelLoader:
                     raise ModelLoadError(f"cannot read checkpoint shard {shard}") from exc
 
         missing = set(targets).difference(loaded, optional)
+        # 全部分片读完再统一报错，能一次看清缺失和多余的权重。
         if missing or unexpected:
             details: list[str] = []
             if missing:

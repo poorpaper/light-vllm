@@ -75,6 +75,7 @@ class Qwen2Config:
     def from_mapping(cls, values: Mapping[str, object]) -> Qwen2Config:
         """从 HF/ModelScope 的 config.json 读取我们已经支持的字段。"""
 
+        # 不支持的结构直接拒绝，不能悄悄换成相近算法继续计算。
         model_type = values.get("model_type")
         if model_type is not None and model_type != "qwen2":
             raise ValueError(f"expected a qwen2 config, got {model_type!r}")
@@ -86,6 +87,7 @@ class Qwen2Config:
         if layer_types is not None and any(value != "full_attention" for value in layer_types):
             raise ValueError("only full-attention Qwen2 layers are supported")
 
+        # 新旧版配置存放 RoPE 参数的位置不同，这里归一成一个 rope_theta。
         rope_theta = values.get("rope_theta", 10_000.0)
         rope_parameters = values.get("rope_parameters")
         if rope_parameters is not None:
@@ -130,6 +132,8 @@ class Qwen2Config:
 
 
 class Qwen2RMSNorm(nn.Module):
+    """按每个 token 的均方根缩放隐藏状态。"""
+
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -144,6 +148,8 @@ class Qwen2RMSNorm(nn.Module):
 
 
 class Qwen2MLP(nn.Module):
+    """Qwen2 的门控前馈网络。"""
+
     def __init__(self, config: Qwen2Config) -> None:
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -155,6 +161,8 @@ class Qwen2MLP(nn.Module):
 
 
 def _rotate_half(values: Tensor) -> Tensor:
+    """交换并旋转向量的前后两半，供 RoPE 使用。"""
+
     first, second = values.chunk(2, dim=-1)
     return torch.cat((-second, first), dim=-1)
 
@@ -165,6 +173,8 @@ def _apply_rotary(
     cosines: Tensor,
     sines: Tensor,
 ) -> tuple[Tensor, Tensor]:
+    """把绝对位置编码到 query 和 key。"""
+
     cosines = cosines.unsqueeze(2)
     sines = sines.unsqueeze(2)
     return (
@@ -174,12 +184,16 @@ def _apply_rotary(
 
 
 def _repeat_kv(values: Tensor, repeats: int) -> Tensor:
+    """让多个 query head 共享同一个 KV head。"""
+
     if repeats == 1:
         return values
     return values.repeat_interleave(repeats, dim=2)
 
 
 class Qwen2Attention(nn.Module):
+    """生成 Q/K/V，并把实际 attention 交给当前执行后端。"""
+
     def __init__(self, config: Qwen2Config, layer_index: int) -> None:
         super().__init__()
         self._layer_id = f"model.layers.{layer_index}.self_attn"
@@ -255,6 +269,8 @@ class Qwen2Attention(nn.Module):
         batch: ForwardBatch,
         past: LayerKeyValues | None,
     ) -> Tensor:
+        """连续 KV 和正确性对照使用的直白 attention 实现。"""
+
         batch_size, query_width = queries.shape[:2]
         past_length = 0
         keys = new_keys
@@ -300,6 +316,8 @@ class Qwen2Attention(nn.Module):
 
 
 class Qwen2DecoderLayer(nn.Module):
+    """一层 self-attention、前馈网络和两次残差连接。"""
+
     def __init__(self, config: Qwen2Config, layer_index: int) -> None:
         super().__init__()
         self.self_attn = Qwen2Attention(config, layer_index)
@@ -330,6 +348,8 @@ class Qwen2DecoderLayer(nn.Module):
 
 
 class Qwen2Model(nn.Module):
+    """词向量、连续多层 Decoder 和最终归一化。"""
+
     def __init__(self, config: Qwen2Config) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(
@@ -354,6 +374,7 @@ class Qwen2ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._initialize_weights)
         if config.tie_word_embeddings:
+            # 输入词向量和输出分类层可以共用同一份参数。
             self.lm_head.weight = self.model.embed_tokens.weight
 
     @classmethod
@@ -366,6 +387,8 @@ class Qwen2ForCausalLM(nn.Module):
 
     @property
     def kv_cache_spec(self) -> ModelKVCacheSpec:
+        """告诉执行端每一层需要怎样的 K/V 张量。"""
+
         return ModelKVCacheSpec(
             layers=tuple(
                 AttentionLayerSpec(
@@ -380,11 +403,15 @@ class Qwen2ForCausalLM(nn.Module):
 
     @property
     def optional_weight_keys(self) -> frozenset[str]:
+        """共享 lm_head 时，快照只保存词向量也能完整加载。"""
+
         if self.config.tie_word_embeddings:
             return frozenset({"lm_head.weight"})
         return frozenset()
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
+        """执行所有 Decoder 层，返回 logits 和连续缓存新增的 K/V。"""
+
         if batch.attention is not None and batch.kv_cache is not None:
             raise ValueError("Qwen2 cannot use contiguous and paged KV cache together")
         if batch.kv_cache is not None and len(batch.kv_cache.layers) != len(self.model.layers):
@@ -397,6 +424,7 @@ class Qwen2ForCausalLM(nn.Module):
         hidden_states = self.model.embed_tokens(batch.input_ids)
         cosines, sines = self._rotary_embeddings(positions, hidden_states.dtype)
         updates: list[LayerKeyValues] = []
+        # 每层读取自己的历史 K/V，并产生本轮要追加的 K/V。
         for layer_index, layer in enumerate(self.model.layers):
             past = None if batch.kv_cache is None else batch.kv_cache.layers[layer_index]
             hidden_states, update = layer(
@@ -419,6 +447,8 @@ class Qwen2ForCausalLM(nn.Module):
         positions: Tensor,
         dtype: torch.dtype,
     ) -> tuple[Tensor, Tensor]:
+        """按绝对位置生成 RoPE 使用的正弦和余弦。"""
+
         frequencies = 1.0 / (
             self.config.rope_theta
             ** (
