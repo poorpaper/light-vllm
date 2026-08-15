@@ -24,10 +24,11 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
   `PagedKVCacheManager` 额外按容量分配 block table。
-- composition root 通过 `kv_reservation=blocks|unbounded` 同时选择匹配的逻辑 manager 和 Worker；该选择不得进入
-  Engine 或 Executor 热路径。
-- `LocalModelExecutor` 只把执行端口委托给 `ModelWorker`。`ContiguousModelWorker` 保留无分页正确性基线；
-  `PagedModelWorker` 根据模型声明的 `ModelKVCacheSpec` 创建全局物理页池并消费 block table。
+- composition root 通过 `kv_reservation=blocks|unbounded` 同时选择匹配的逻辑 manager 和
+  `ModelStepHandler`；该选择不得进入 Engine、Executor 或 Worker 热路径。
+- `LocalModelExecutor` 只把执行端口委托给一个 `LocalModelWorker`。Worker 固定当前模型版本和请求生命周期；
+  `ContiguousStepHandler` / `PagedStepHandler` 分别负责连续与分页 KV 的输入准备、物理缓存和模型 forward。
+- `StandardDecodeHandler` 负责无输出的输入步骤和普通单 token 解码；未来投机解码替换 DecodeHandler，不新增模式专用 Worker。
 - 固定页数或 CUDA 空闲显存策略在模型加载后解析成同一个分页容量对象，同时供逻辑 manager 与物理页池使用。
 - 模型通过 `AttentionContext` 使用执行后端提供的 attention。当前 `TorchPagedAttention` 直接逐页读取 K/V，
   用在线 softmax 提供 CPU correctness 实现；`PagedAttentionBackend` 是 CUDA/Triton 的替换边界。
@@ -57,8 +58,8 @@ tokenizer 和生产级 serving。PyTorch Paged Attention 是物理分页正确�
 | `src/light_vllm/runtime/scheduler/token_budget.py` | FCFS token-budget Scheduler |
 | `src/light_vllm/runtime/execution/interfaces.py` | `ExecutionBatch`、`ExecutionOutput` 与 Executor 契约 |
 | `src/light_vllm/runtime/execution/local.py` | 本地 Executor 与 reference token 执行 |
-| `src/light_vllm/runtime/execution/worker.py` | 连续与分页本地 Worker |
-| `src/light_vllm/runtime/execution/paged_cache.py` | Worker 拥有的物理分页 K/V tensor |
+| `src/light_vllm/runtime/execution/worker.py` | 本地 Worker、Step Handler 与普通 Decode Handler |
+| `src/light_vllm/runtime/execution/paged_cache.py` | 分页 Step Handler 拥有的物理 K/V tensor |
 | `src/light_vllm/runtime/execution/paged_attention.py` | Paged metadata 与 PyTorch correctness backend |
 | `src/light_vllm/runtime/engine/admission.py` | 确定性请求容量准入 |
 | `src/light_vllm/runtime/engine/core.py` | 请求状态、迭代循环、事件与安全取消 |
@@ -91,23 +92,23 @@ tokenizer 和生产级 serving。PyTorch Paged Attention 是物理分页正确�
 17. 模型执行失败、输出校验失败或请求取消时，不得把本轮 token 写入 Engine 状态。
 18. 取消请求必须立即退出后续调度；已开始执行的同步步骤到达安全边界后，其结果必须丢弃。
 19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID 生命周期、未来 prefix cache 和 preemption；
-    Executor/Worker 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
+    Worker/Step Handler 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
 20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。
 21. 投机解码未来由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor。
 22. 不为尚未实现的 attention、memory 或 prefix routing 创建空包。
 23. 内部代码从所属功能域的 `interfaces.py` 导入稳定契约；需要实现时直接导入实现模块。
 24. 不维护未发布架构的历史兼容别名、空 facade 或旧路径。
-25. `ForwardBatch.positions` 表示请求内绝对位置；连续与分页 Worker 都必须显式生成，模型不得从 batch 模式猜测。
-26. 使用外部 KV 的模型必须声明 `ModelKVCacheSpec`；连续和分页 Worker 都从该规格初始化物理缓存，不再接受
+25. `ForwardBatch.positions` 表示请求内绝对位置；连续与分页 Step Handler 都必须显式生成，模型不得从批次形态猜测。
+26. 使用外部 KV 的模型必须声明 `ModelKVCacheSpec`；连续和分页 Step Handler 都从该规格初始化物理缓存，不再接受
     第二份层数、KV head 数或 head size 配置。
-27. `blocks` 必须装配 `PagedKVCacheManager + PagedModelWorker`，`unbounded` 必须装配
-    `UnboundedKVCacheManager + ContiguousModelWorker`；其他组件不得按 KV 模式分支。
+27. `blocks` 必须装配 `PagedKVCacheManager + PagedStepHandler`，`unbounded` 必须装配
+    `UnboundedKVCacheManager + ContiguousStepHandler`；两者共用 `LocalModelWorker`，其他组件不得按 KV 模式分支。
 28. Paged Attention 实现必须通过 `PagedAttentionBackend` 创建同一个 `AttentionContext`，并直接按 block table
     读取物理页；不得以拼接完整历史 tensor 冒充分页实现。
 29. block table 必须精确覆盖本轮 `computed + query + lookahead reservation` 所需物理页，不得携带未预留尾页
     或在单请求内重复页；
     prefix sharing 拥有显式只读 ownership 之前，不同活动请求也不得共享物理页。
-30. Worker 初始化时固定一个 `ModelSession`。reload 后活动请求继续使用旧 session，Worker 拒绝新请求；活动
+30. `LocalModelWorker` 初始化时固定一个 `ModelSession`。reload 后活动请求继续使用旧 session，Worker 拒绝新请求；活动
     请求清空后才可按新 generation 重建物理缓存。
 31. 固定页数或显存发现策略必须解析成一个共享容量事实；逻辑 block manager 和物理页池不得各自配置容量。
 32. admission 只判断请求在空闲引擎上是否必然不可满足；等待、抢占和公平性属于 Scheduler，不进入 HTTP 或
@@ -134,9 +135,11 @@ Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边
 新增执行拓扑：实现 `ModelExecutor`，保持 `ExecutionBatch → ExecutionOutput` 语义；本地、CUDA、多进程是
 合理的 Executor 差异，greedy、KV 模式、prefill/decode 不是。
 
-新增本地计算或 attention 后端：实现/组合 `ModelWorker` 与 `PagedAttentionBackend`；模型仍只看
-`AttentionContext`，并保持 block table 和模型
-`ModelKVCacheSpec` 的事实型边界，不修改 Scheduler、Engine 或模型分发。
+新增本地 KV 布局或 attention 后端：实现 `ModelStepHandler`，按需组合 `PagedAttentionBackend`；模型仍只看
+`AttentionContext`，并保持 block table 和 `ModelKVCacheSpec` 的事实型边界。
+
+新增普通或投机解码流程：实现 `DecodeHandler`，组合 proposer、target verify 与 acceptance sampler；复用同一
+`LocalModelWorker` 和 Step Handler，不修改 Scheduler、Engine 或模型分发。
 
 新增 serving 协议：只消费 `EngineClient`，在 adapter 内转换请求、结果、错误和 wire format。
 

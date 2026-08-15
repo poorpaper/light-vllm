@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>light-vllm Paged Attention 地址映射</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+    :root {
+      --paper:#f5f5f5; --ink:#2d3142; --muted:#4f5d75; --soft:#7a8399;
+      --accent:#eb6c36; --link:#2e5aa8; --rule:rgba(45,49,66,.12);
+      --sans:'Geist','Noto Sans SC','Microsoft YaHei',sans-serif;
+      --serif:'Instrument Serif','Noto Serif SC',serif;
+      --mono:'Geist Mono','Noto Sans Mono CJK SC',monospace;
+    }
+    body { min-height:100vh; padding:48px 32px; background:var(--paper); color:var(--ink); font-family:var(--sans); display:flex; justify-content:center; }
+    .frame { width:100%; max-width:1280px; }
+    .eyebrow { margin-bottom:8px; color:var(--muted); font:500 8px/1 var(--mono); letter-spacing:.18em; text-transform:uppercase; }
+    h1 { margin-bottom:8px; font:400 28px/1.15 var(--serif); letter-spacing:-.02em; }
+    .subtitle { max-width:1040px; margin-bottom:24px; color:var(--muted); font:400 12px/1.6 var(--sans); }
+    svg { width:100%; min-width:1080px; display:block; }
+    .notes { display:grid; grid-template-columns:1fr 1.15fr .85fr; gap:24px; margin-top:24px; }
+    .card { padding:20px; background:#fff; border:1px solid var(--rule); border-radius:6px; }
+    .card h2 { margin-bottom:8px; font:600 12px/1.4 var(--sans); }
+    .card p { color:var(--muted); font:400 12px/1.65 var(--sans); }
+    code { font-family:var(--mono); font-size:11px; color:var(--ink); }
+  </style>
+</head>
+<body>
+  <main class="frame">
+    <p class="eyebrow">Process · worked example · address mapping · engineer</p>
+    <h1>Paged Attention：一个 query token 如何找到自己的 K/V 页</h1>
+    <p class="subtitle">下面使用一个完整数字例子：<code>block_size=4</code>、已有 5 个 token、本轮计算 2 个 token、<code>block_table=[7,2]</code>。从绝对位置到物理 slot，再到因果注意力读取范围，每一步都对应当前代码中的字段和检查。</p>
+
+    <svg viewBox="0 0 1280 800" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="light-vllm-paged-attention-token-path-title light-vllm-paged-attention-token-path-desc">
+      <title id="light-vllm-paged-attention-token-path-title">light-vllm Paged Attention 地址映射</title>
+      <desc id="light-vllm-paged-attention-token-path-desc">用 computed 等于 5、query length 等于 2、block size 等于 4、block table 为 7 和 2 的例子，展示 PagedStepHandler 如何生成绝对位置、校验 block table、计算物理 slot、写入分页 K/V，并按页累计因果 attention。</desc>
+      <defs>
+        <marker id="lvpa-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f5d75"/></marker>
+        <marker id="lvpa-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#eb6c36"/></marker>
+        <marker id="lvpa-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#2e5aa8"/></marker>
+      </defs>
+      <rect width="1280" height="800" fill="#f5f5f5"/>
+
+      <!-- Process area -->
+      <rect x="40" y="40" width="1200" height="208" rx="8" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="56" y="64" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">FROM SCHEDULED FACTS TO ATTENTION OUTPUT</text>
+
+      <!-- Process connectors -->
+      <line x1="200" y1="148" x2="240" y2="148" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvpa-arrow)"/>
+      <line x1="400" y1="148" x2="440" y2="148" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvpa-arrow)"/>
+      <line x1="600" y1="148" x2="640" y2="148" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lvpa-arrow-accent)"/>
+      <line x1="800" y1="148" x2="840" y2="148" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvpa-arrow)"/>
+      <line x1="1000" y1="148" x2="1040" y2="148" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvpa-arrow)"/>
+
+      <!-- Process nodes -->
+      <g>
+        <rect x="40" y="84" width="160" height="128" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="52" y="96" width="24" height="16" rx="2" fill="rgba(45,49,66,.12)"/><text x="64" y="108" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">01</text>
+        <text x="120" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">本轮执行数据</text>
+        <text x="120" y="152" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">computed = 5</text>
+        <text x="120" y="168" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">scheduled/input = 2 · B = 4</text>
+        <text x="120" y="184" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">block_table = [7, 2]</text>
+      </g>
+      <g>
+        <rect x="240" y="84" width="160" height="128" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="252" y="96" width="24" height="16" rx="2" fill="rgba(45,49,66,.12)"/><text x="264" y="108" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">02</text>
+        <text x="320" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Step Handler 生成位置</text>
+        <text x="320" y="152" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">input IDs = [t5, t6]</text>
+        <text x="320" y="168" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">positions = [5, 6]</text>
+        <text x="320" y="184" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">请求内绝对位置</text>
+      </g>
+      <g>
+        <rect x="440" y="84" width="160" height="128" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="452" y="96" width="24" height="16" rx="2" fill="rgba(45,49,66,.12)"/><text x="464" y="108" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">03</text>
+        <text x="520" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">校验 block table</text>
+        <text x="520" y="152" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">required = ceil((5+2)/4) = 2</text>
+        <text x="520" y="168" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">len(table) 必须恰好为 2</text>
+        <text x="520" y="184" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">无越界 · 无重复 · 无跨请求别名</text>
+      </g>
+      <g>
+        <rect x="640" y="84" width="160" height="128" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+        <rect x="652" y="96" width="24" height="16" rx="2" fill="rgba(235,108,54,.20)"/><text x="664" y="108" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">04</text>
+        <text x="720" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">位置映射到 slot</text>
+        <text x="720" y="152" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">page = table[pos // B]</text>
+        <text x="720" y="168" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">offset = pos % B</text>
+        <text x="720" y="184" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">slot = page × B + offset</text>
+      </g>
+      <g>
+        <rect x="840" y="84" width="160" height="128" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="852" y="96" width="24" height="16" rx="2" fill="rgba(45,49,66,.12)"/><text x="864" y="108" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">05</text>
+        <text x="920" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">逐层写入 K/V</text>
+        <text x="920" y="152" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">slots = [9, 10]</text>
+        <text x="920" y="168" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">keys.index_copy_</text>
+        <text x="920" y="184" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">values 使用相同位置</text>
+      </g>
+      <g>
+        <rect x="1040" y="84" width="160" height="128" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="1052" y="96" width="24" height="16" rx="2" fill="rgba(45,49,66,.12)"/><text x="1064" y="108" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">06</text>
+        <text x="1120" y="128" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">按页计算 attention</text>
+        <text x="1120" y="152" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">当前 token 只看历史前缀</text>
+        <text x="1120" y="168" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">逐页累计 online softmax</text>
+        <text x="1120" y="184" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">不拼接完整历史 K/V</text>
+      </g>
+
+      <!-- Worked memory map -->
+      <rect x="40" y="280" width="1200" height="416" rx="8" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="56" y="304" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">WORKED MEMORY MAP · B = 4 · COMPUTED = 5 · QUERY = 2</text>
+
+      <!-- Group backgrounds -->
+      <rect x="152" y="320" width="456" height="104" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <rect x="608" y="320" width="456" height="104" rx="6" fill="rgba(46,90,168,.04)" stroke="rgba(46,90,168,.24)" stroke-width=".8"/>
+      <text x="168" y="340" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">block_table[0] = page 7</text>
+      <text x="624" y="340" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace">block_table[1] = page 2</text>
+
+      <!-- Mapping lines, drawn before cells -->
+      <line x1="772" y1="408" x2="772" y2="480" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#lvpa-arrow-link)"/>
+      <line x1="884" y1="408" x2="884" y2="480" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#lvpa-arrow-link)"/>
+
+      <!-- Logical positions -->
+      <text x="56" y="380" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">请求内位置</text>
+      <g font-family="'Geist Mono',monospace" text-anchor="middle">
+        <g><rect x="160" y="352" width="104" height="56" rx="4" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width=".8"/><text x="212" y="376" fill="#2d3142" font-size="12">0</text><text x="212" y="396" fill="#7a8399" font-size="8">cached</text></g>
+        <g><rect x="272" y="352" width="104" height="56" rx="4" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width=".8"/><text x="324" y="376" fill="#2d3142" font-size="12">1</text><text x="324" y="396" fill="#7a8399" font-size="8">cached</text></g>
+        <g><rect x="384" y="352" width="104" height="56" rx="4" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width=".8"/><text x="436" y="376" fill="#2d3142" font-size="12">2</text><text x="436" y="396" fill="#7a8399" font-size="8">cached</text></g>
+        <g><rect x="496" y="352" width="104" height="56" rx="4" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width=".8"/><text x="548" y="376" fill="#2d3142" font-size="12">3</text><text x="548" y="396" fill="#7a8399" font-size="8">cached</text></g>
+        <g><rect x="608" y="352" width="104" height="56" rx="4" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width=".8"/><text x="660" y="376" fill="#2d3142" font-size="12">4</text><text x="660" y="396" fill="#7a8399" font-size="8">cached</text></g>
+        <g><rect x="720" y="352" width="104" height="56" rx="4" fill="rgba(46,90,168,.06)" stroke="#2e5aa8" stroke-width="1.2"/><text x="772" y="376" fill="#2d3142" font-size="12">5</text><text x="772" y="396" fill="#2e5aa8" font-size="8">query t5</text></g>
+        <g><rect x="832" y="352" width="104" height="56" rx="4" fill="rgba(46,90,168,.06)" stroke="#2e5aa8" stroke-width="1.2"/><text x="884" y="376" fill="#2d3142" font-size="12">6</text><text x="884" y="396" fill="#2e5aa8" font-size="8">query t6</text></g>
+        <g><rect x="944" y="352" width="104" height="56" rx="4" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.28)" stroke-width=".8" stroke-dasharray="4,3"/><text x="996" y="376" fill="#2d3142" font-size="12">7</text><text x="996" y="396" fill="#7a8399" font-size="8">unused</text></g>
+      </g>
+
+      <!-- Physical page slots -->
+      <text x="56" y="512" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">物理 slot</text>
+      <rect x="152" y="448" width="456" height="104" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <rect x="608" y="448" width="456" height="104" rx="6" fill="rgba(46,90,168,.04)" stroke="rgba(46,90,168,.24)" stroke-width=".8"/>
+      <text x="168" y="472" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">page 7 · slots 28–31</text>
+      <text x="624" y="472" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace">page 2 · slots 8–11</text>
+      <g font-family="'Geist Mono',monospace" text-anchor="middle">
+        <g><rect x="160" y="480" width="104" height="56" rx="4" fill="#fff" stroke="#4f5d75" stroke-width=".8"/><text x="212" y="504" fill="#2d3142" font-size="12">slot 28</text><text x="212" y="524" fill="#7a8399" font-size="8">offset 0</text></g>
+        <g><rect x="272" y="480" width="104" height="56" rx="4" fill="#fff" stroke="#4f5d75" stroke-width=".8"/><text x="324" y="504" fill="#2d3142" font-size="12">slot 29</text><text x="324" y="524" fill="#7a8399" font-size="8">offset 1</text></g>
+        <g><rect x="384" y="480" width="104" height="56" rx="4" fill="#fff" stroke="#4f5d75" stroke-width=".8"/><text x="436" y="504" fill="#2d3142" font-size="12">slot 30</text><text x="436" y="524" fill="#7a8399" font-size="8">offset 2</text></g>
+        <g><rect x="496" y="480" width="104" height="56" rx="4" fill="#fff" stroke="#4f5d75" stroke-width=".8"/><text x="548" y="504" fill="#2d3142" font-size="12">slot 31</text><text x="548" y="524" fill="#7a8399" font-size="8">offset 3</text></g>
+        <g><rect x="608" y="480" width="104" height="56" rx="4" fill="#fff" stroke="#4f5d75" stroke-width=".8"/><text x="660" y="504" fill="#2d3142" font-size="12">slot 8</text><text x="660" y="524" fill="#7a8399" font-size="8">pos 4 cached</text></g>
+        <g><rect x="720" y="480" width="104" height="56" rx="4" fill="rgba(46,90,168,.06)" stroke="#2e5aa8" stroke-width="1.2"/><text x="772" y="504" fill="#2d3142" font-size="12">slot 9</text><text x="772" y="524" fill="#2e5aa8" font-size="8">write pos 5</text></g>
+        <g><rect x="832" y="480" width="104" height="56" rx="4" fill="rgba(46,90,168,.06)" stroke="#2e5aa8" stroke-width="1.2"/><text x="884" y="504" fill="#2d3142" font-size="12">slot 10</text><text x="884" y="524" fill="#2e5aa8" font-size="8">write pos 6</text></g>
+        <g><rect x="944" y="480" width="104" height="56" rx="4" fill="#fff" stroke="rgba(45,49,66,.28)" stroke-width=".8" stroke-dasharray="4,3"/><text x="996" y="504" fill="#2d3142" font-size="12">slot 11</text><text x="996" y="524" fill="#7a8399" font-size="8">not written</text></g>
+      </g>
+
+      <!-- Causal read windows -->
+      <rect x="152" y="584" width="456" height="80" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+      <text x="168" y="608" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif">q@position 5 的可见历史</text>
+      <text x="168" y="632" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">page 7 offsets [0:4] + page 2 offsets [0:2]</text>
+      <text x="168" y="648" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">sequence_length = computed + query_offset + 1 = 6</text>
+      <rect x="624" y="584" width="456" height="80" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+      <text x="640" y="608" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif">q@position 6 的可见历史</text>
+      <text x="640" y="632" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">page 7 offsets [0:4] + page 2 offsets [0:3]</text>
+      <text x="640" y="648" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">每页更新 running_max / running_sum / running_value</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="736" x2="1240" y2="736" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="40" y="764" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">READING KEY</text>
+      <rect x="160" y="752" width="16" height="12" rx="2" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width=".8"/>
+      <text x="184" y="760" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">already cached</text>
+      <rect x="336" y="752" width="16" height="12" rx="2" fill="rgba(46,90,168,.06)" stroke="#2e5aa8" stroke-width="1"/>
+      <text x="360" y="760" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">current query write</text>
+      <rect x="560" y="752" width="16" height="12" rx="2" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.28)" stroke-width=".8" stroke-dasharray="4,3"/>
+      <text x="584" y="760" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">reserved but unused</text>
+      <text x="816" y="760" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">输出形状与 query 相同；Handler 还会检查所有配置层都执行过</text>
+    </svg>
+
+    <section class="notes" aria-label="Paged Attention 图解说明">
+      <article class="card">
+        <h2>为什么 block table 必须“刚刚好”</h2>
+        <p>少一页会让本轮 token 找不到写入位置；多一页会把未使用资源混进执行边界。当前实现还检查页号不越界、单请求不重复、不同活动请求不共享页。</p>
+      </article>
+      <article class="card">
+        <h2>为什么先写 K/V 再计算 attention</h2>
+        <p>当前位置的因果注意力需要看到它自己的 K/V。写入后，位置 5 读取 0..5，位置 6 读取 0..6。PyTorch 参考实现逐页累计 softmax，没有用“先拼接完整历史”的假分页实现。</p>
+      </article>
+      <article class="card">
+        <h2>CUDA/Triton 如何接入</h2>
+        <p>替换 <code>PagedAttentionBackend</code> 即可；模型继续调用相同的 <code>AttentionContext</code>，Scheduler、Engine 和模型分发不需要增加 CUDA 分支。</p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

@@ -30,10 +30,12 @@ flowchart LR
     Plan --> Core
     Core --> Batch["ExecutionBatch<br/>本轮 token 切片"]
     Batch --> Executor["LocalModelExecutor"]
-    Executor --> Worker["ModelWorker<br/>contiguous 或 paged"]
+    Executor --> Worker["LocalModelWorker<br/>固定模型版本"]
+    Worker --> Step["ModelStepHandler<br/>contiguous 或 paged"]
+    Worker --> Decode["DecodeHandler<br/>ordinary 或 speculative"]
     Worker --> Session["ModelSession<br/>fixed generation"]
     Session --> Model["Pinned Model"]
-    Worker --> Sampler["Sampler"]
+    Decode --> Sampler["Sampler"]
     Worker --> Output["RequestOutput<br/>input computed · 0..N output<br/>cached output prefix"]
     Output --> Core
     Core --> Events["TokenGenerated · Finished"]
@@ -44,11 +46,11 @@ flowchart LR
 - prompt 和生成 token 都是“尚未计算的 token”；
 - chunked prefill 只是本轮预算不足以覆盖全部 pending token；
 - greedy/top-k/top-p 是 Sampler 差异；
-- 连续或分页 K/V 是 Worker 的物理存储与 attention 后端差异；
+- 连续或分页 K/V 是 Step Handler 的物理存储与 attention 后端差异；
 - 本地、CUDA、多进程才是合理的 Executor 拓扑差异。
 
 `LocalModelExecutor` 与 `ModelWorker` 看起来薄，是有意保留的两层：Executor 表达 Engine 可替换的执行拓扑，
-Worker 表达一个设备 rank 内的模型、KV 和 attention。未来多进程或多 rank Executor 可以管理多个 Worker，
+Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；KV 和 attention 交给 Step Handler。未来多进程或多 rank Executor 可以管理多个 Worker，
 不会迫使单机 Worker 契约进入 Engine。
 
 ## 模块边界
@@ -62,8 +64,10 @@ Worker 表达一个设备 rank 内的模型、KV 和 attention。未来多进程
 | `PagedKVCacheManager` | 逻辑 block 预留、提交、回滚、释放 | K/V tensor、attention kernel |
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
 | `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
-| `ContiguousModelWorker` | 请求级连续 K/V、模型输入与采样正确性基线 | 逻辑 block、调度策略 |
-| `PagedModelWorker` | padded batch、绝对位置、物理页池、block table 消费与采样 | 逻辑 block 分配、请求队列 |
+| `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
+| `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与逐请求 forward | 采样、逻辑 block |
+| `PagedStepHandler` | padded batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
+| `StandardDecodeHandler` | 普通 prefill/单 token decode 的结果转换与采样 | KV 布局、调度 |
 | `PagedKVCachePlanner` | 模型加载后把固定页数或空闲显存预算解析为容量 | 请求调度、page ownership |
 | `PagedAttentionBackend` | 为页池和批次事实创建 `AttentionContext` | 模型分发、调度 |
 | `TorchPagedAttention` | 原位写 K/V、逐页 causal attention、MHA/GQA correctness | 调度、生产级 kernel 优化 |
@@ -139,28 +143,30 @@ RequestOutput
 ```mermaid
 flowchart TB
     Scheduler["Scheduler / Engine Core"] --> Logical["KVCacheManager<br/>reservation 与 logical block IDs"]
-    Output["SchedulerOutput.block_ids<br/>optional"] --> Worker["ModelWorker"]
-    Worker --> Contiguous["ContiguousKVCache<br/>request-level tensors"]
-    Worker --> Paged["PagedKVCache<br/>global physical pages"]
+    Output["SchedulerOutput.block_ids<br/>optional"] --> Worker["LocalModelWorker"]
+    Worker --> Step["ModelStepHandler"]
+    Step --> Contiguous["ContiguousKVCache<br/>request-level tensors"]
+    Step --> Paged["PagedKVCache<br/>global physical pages"]
     Paged --> Attention["AttentionContext<br/>TorchPagedAttention"]
 ```
 
 当前有两种逻辑 manager：`UnboundedKVCacheManager` 为连续缓存提供无 block、无容量限制的实验基线；
 `PagedKVCacheManager` 实现以下逻辑分页管理：
 
-二者只在 composition root 通过 `kv_reservation=unbounded|blocks` 与对应 Worker 成对选择：
+二者只在 composition root 通过 `kv_reservation=unbounded|blocks` 与对应 Step Handler 成对选择：
 
 ```text
-unbounded → UnboundedKVCacheManager → ContiguousModelWorker
-blocks    → PagedKVCacheManager     → PagedModelWorker
+unbounded → UnboundedKVCacheManager → ContiguousStepHandler
+blocks    → PagedKVCacheManager     → PagedStepHandler
 ```
 
-Scheduler、Engine 和 `LocalModelExecutor` 不按该模式分支。`unbounded` 仅用于测试和正确性对照，不提供生产
+两种组合都注入同一个 `LocalModelWorker`。Scheduler、Engine、Executor 和 Worker 不按该模式分支。
+`unbounded` 仅用于测试和正确性对照，不提供生产
 容量保护。
 
 分页组合只创建一个 `PagedKVCachePlanner`：固定页数用于 CPU correctness 和确定性测试；CUDA 模式在模型权重
 加载后读取空闲显存，并按 `memory_fraction` 计算预算。每个 block 的字节数只由
-`ModelKVCacheSpec × block_size × dtype` 推导。逻辑 manager 与物理 Worker 共享同一个 planner，因此不存在两份
+`ModelKVCacheSpec × block_size × dtype` 推导。逻辑 manager 与物理 Step Handler 共享同一个 planner，因此不存在两份
 `num_blocks`。planner 解析完成后，Executor 通过 capabilities 报告实际 KV token 容量。
 
 1. `reserve(K)` 为本轮最坏情况预留 block；容量不足时该请求不能执行。
@@ -170,12 +176,12 @@ Scheduler、Engine 和 `LocalModelExecutor` 不按该模式分支。`unbounded` 
 5. 交给 Worker 的 block table 精确覆盖已提交 token、本轮 query 和显式 lookahead reservation，不包含未预留尾页。
 6. 当前活动物理页保持请求独占；prefix sharing 落地时必须显式表达只读共享与可写尾页 ownership。
 
-连续与分页 Worker 都根据模型的同一个 `ModelKVCacheSpec` 创建物理缓存；装配层不再重复填写 layer/head 形状。
-分页 Worker 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
+连续与分页 Step Handler 都根据模型的同一个 `ModelKVCacheSpec` 创建物理缓存；装配层不再重复填写 layer/head 形状。
+分页 Step Handler 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
 token 通过 block table 映射到物理 slot；`TorchPagedAttention` 先原位写入本轮 K/V，再用在线 softmax 逐页读取
 有效前缀，不物化完整历史。它是可读性优先的 CPU/PyTorch correctness backend，不是生产级性能 kernel。
 
-非分页 Worker 使用 `block_ids=None` 和请求级连续 tensor，不得伪造 block ID。两条路径共享同一个
+非分页 Step Handler 使用 `block_ids=None` 和请求级连续 tensor，不得伪造 block ID。两条路径共享同一个
 `ExecutionBatch → ExecutionOutput` 和模型 forward 契约，因此可以直接做结果对照。
 
 执行前 Engine 取得执行 lease。执行期间取消会立刻删除请求并使其退出后续调度；连续 tensor 延迟到 lease
@@ -188,17 +194,18 @@ Scheduler 将逻辑 block ID 延迟到该安全边界之后归还。本轮输出
 不能由模型根据 prefill/decode 模式猜测。`sequence_lengths` 标识每行有效 query 长度。
 
 使用外部 KV 的模型声明 `ModelKVCacheSpec`，每层用稳定 `layer_id` 描述 query heads、KV heads 和 head size。
-attention 层只调用 `AttentionContext.forward(layer_id, query, key, value, scale)`。Paged Worker 则通过
+attention 层只调用 `AttentionContext.forward(layer_id, query, key, value, scale)`。分页 Step Handler 则通过
 `PagedAttentionBackend.create(cache, metadata)` 创建这个通用上下文。因此：
 
 - 模型不知道 block size、page layout 或具体 kernel；
 - Worker 不按具体模型 architecture 分支；
 - 后续 CUDA/Triton backend 实现同一个 factory 边界，不修改 Engine、Scheduler 或模型协议；
-- Paged Worker 在模型加载成功后初始化物理页池，模型 generation 变化时要求安全地重建。
+- 分页 Step Handler 在模型加载成功后初始化物理页池，模型 generation 变化时由 Worker 安全地重建。
 
 ## Capabilities、admission 与 preemption
 
-容量事实从拥有它的实体向上汇总：模型声明 `max_model_tokens`，物理 Worker 报告 `max_kv_cache_tokens`，Scheduler
+容量事实从拥有它的实体向上汇总：模型声明 `max_model_tokens`，Step Handler 通过 Worker 报告
+`max_kv_cache_tokens`，Scheduler
 报告并发槽和单轮 token budget。`EngineCapabilities.max_request_tokens` 取模型与单请求可用 KV 上限的较小值。
 HTTP 通过 `/capabilities` 展示这些事实，不再硬编码 prompt 长度。
 
@@ -252,7 +259,7 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 4. 加载失败时当前模型和 generation 不变。
 5. `open_session()` 在锁内复制模型引用和 generation，返回对旧模型的强引用；实际模型计算不持有生命周期锁。
 6. Reference 请求和 Worker 都在请求开始前固定 session，一个请求绝不跨 generation。
-7. 可缓存模型的 KV 规格由 session 中的模型声明；Worker 只能在模型加载完成且无活动请求时初始化或重建物理页池。
+7. 可缓存模型的 KV 规格由 session 中的模型声明；Worker 只能在模型加载完成且无活动请求时初始化或重建 Step Handler。
 8. reload 后旧请求继续使用旧 session；Worker 暂停新准入，活动请求清空后才按新 generation 重新初始化。
 
 ## 后续演进顺序

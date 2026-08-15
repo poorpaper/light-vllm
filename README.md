@@ -47,9 +47,11 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `EngineCore`：按 `schedule -> execute -> update` 驱动异步请求与事件流。
 - `TokenBudgetScheduler`：统一规划 prompt、chunked prefill 与 decode 的 token 数。
 - `PagedKVCacheManager`：管理逻辑 block 的预留、提交、回滚和释放。
-- `LocalModelExecutor` / `ModelWorker`：把本地执行拓扑与具体 KV 后端分开。
-- `PagedModelWorker`：消费 block table，使用全局物理页与 PyTorch Paged Attention。
-- `ContiguousModelWorker`：保留请求级连续 K/V 的无分页正确性基线。
+- `LocalModelExecutor` / `LocalModelWorker`：把本地执行拓扑、模型版本和具体计算能力分开。
+- `LocalModelWorker`：固定当前模型版本和请求生命周期，并组合 Step / Decode Handler。
+- `PagedStepHandler`：消费 block table，使用全局物理页与 PyTorch Paged Attention。
+- `ContiguousStepHandler`：保留请求级连续 K/V 的无分页正确性基线。
+- `StandardDecodeHandler`：处理普通 prefill 和单 token decode；未来投机解码替换 Handler，不新增 Worker。
 - `GreedySampler`：独立于 Executor 的贪心采样策略。
 - FastAPI adapter：协议外层的 JSON/SSE 接口，只依赖 `EngineClient`。
 
@@ -101,18 +103,18 @@ light-vllm-serve \
 `--runtime` 支持两条清晰路径：
 
 - `reference`：一次执行一个完整请求，作为最清楚的语义基线。
-- `engine`：token-budget Scheduler、连续或分页 KV Worker 和增量模型执行。
+- `engine`：token-budget Scheduler、统一 Worker、连续或分页 Step Handler 和增量模型执行。
 
 Engine 路径不区分 prefill/decode 模式：Scheduler 只返回每请求本轮 token 数，长 prompt 自然拆成
 chunk；追上全部已知 token 后才采样输出。
 
-`--kv-reservation blocks` 装配逻辑 block manager 与物理 `PagedModelWorker`。模型声明自己的 K/V layer/head
-规格，Worker 以 `[block, offset, kv_head, head_size]` 布局创建页池；当前 PyTorch backend 直接逐页完成
+`--kv-reservation blocks` 装配逻辑 block manager 与物理 `PagedStepHandler`。模型声明自己的 K/V layer/head
+规格，Handler 以 `[block, offset, kv_head, head_size]` 布局创建页池；当前 PyTorch backend 直接逐页完成
 attention，适合 CPU correctness 与后续优化 kernel 的行为基线。
 
-`--kv-reservation unbounded` 装配无 block manager 与 `ContiguousModelWorker`，不限制逻辑 KV 容量。它保留
-无 Paged Attention 的请求级连续 tensor 路径，主要用于测试和结果对照，不是生产容量保护机制；此模式下
-`--kv-num-layers`、`--kv-num-heads` 和 `--kv-head-size` 描述连续 cache 形状。
+`--kv-reservation unbounded` 装配无 block manager 与 `ContiguousStepHandler`，不限制逻辑 KV 容量。它保留
+无 Paged Attention 的请求级连续 tensor 路径，主要用于测试和结果对照，不是生产容量保护机制。两种 Handler
+都只读取模型的 `ModelKVCacheSpec`，装配层不重复填写 K/V 形状。
 
 当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
 

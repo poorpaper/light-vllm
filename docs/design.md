@@ -12,7 +12,7 @@
 | 高可读性 | 请求、调度、执行、采样、模型和协议各有唯一职责 |
 | 高扩展性 | 模型/loader 注册；Sampler、Executor 与 attention backend 通过组合替换 |
 | 少模式分支 | 不用 prefill/decode/greedy/KV 专用 Executor |
-| 成熟实践 | 采用统一 token budget、Scheduler/KV 协作和 Worker 物理缓存边界 |
+| 成熟实践 | 采用统一 token budget、Scheduler/KV 协作和 Step Handler 物理缓存边界 |
 
 ## 2. 包结构
 
@@ -44,10 +44,11 @@ src/light_vllm/
 
 可视化索引（均为可直接浏览的单文件 HTML）：
 
-- [当前架构总览](diagrams/light-vllm-current-overview.html)：压缩后的当前实现视图；
-- [KV 双重所有权](diagrams/light-vllm-kv-ownership.html)：以 blocks 组合展示逻辑 reservation 与物理执行边界；
-- [单轮执行事务](diagrams/light-vllm-iteration-transaction.html)：reserve、execute、commit 与取消路径；
-- [Paged 执行生命周期](diagrams/light-vllm-paged-worker-lifecycle.html)：generation 固定和安全释放边界。
+- [当前架构总览](diagrams/light-vllm-current-overview.html)：保留整体组件和调用方向，不承载细节；
+- [KV cache 容量与所有权](diagrams/light-vllm-kv-ownership.html)：从模型 KV 形状、显存预算一直画到逻辑 page ID、物理张量和提交/回收；
+- [Paged Attention 地址映射](diagrams/light-vllm-paged-attention-token-path.html)：用具体数字展示绝对位置、block table、物理 slot、K/V 写入和逐页 attention；
+- [普通与投机解码的共同执行契约](diagrams/light-vllm-iteration-transaction.html)：区分当前普通 Decode Handler 和未来投机 Decode Handler，并展示 cached prefix 如何提交；
+- [Worker 与模型版本生命周期](diagrams/light-vllm-worker-lifecycle.html)：模型重新加载时，旧请求、旧 Step Handler 和新请求之间的边界。
 
 原有 [`light-vllm-overall-architecture.drawio`](assets/light-vllm-overall-architecture.drawio) 及其
 [SVG](assets/light-vllm-overall-architecture.svg) / [PNG](assets/light-vllm-overall-architecture.png) 导出继续保留；
@@ -65,11 +66,13 @@ flowchart TB
     Core --> Scheduler["TokenBudgetScheduler"]
     Scheduler --> LogicalKV["KVCacheManager<br/>reservation / logical blocks"]
     Core --> Executor["LocalModelExecutor"]
-    Executor --> Worker["ModelWorker"]
-    Worker --> Contiguous["ContiguousModelWorker<br/>request-level tensors"]
-    Worker --> Paged["PagedModelWorker<br/>global physical pages"]
+    Executor --> Worker["LocalModelWorker<br/>fixed model version"]
+    Worker --> Step["ModelStepHandler"]
+    Worker --> Decode["DecodeHandler"]
+    Step --> Contiguous["ContiguousStepHandler<br/>request-level tensors"]
+    Step --> Paged["PagedStepHandler<br/>global physical pages"]
     Paged --> Attention["PagedAttentionBackend<br/>Torch correctness"]
-    Worker --> Sampler["GreedySampler"]
+    Decode --> Sampler["GreedySampler"]
     Reference --> TokenExecutor["LocalTokenExecutor"]
     TokenExecutor --> Sampler
 
@@ -82,13 +85,14 @@ flowchart TB
 ```
 
 `UnboundedKVCacheManager` 只维护 reservation/commit 生命周期，不限制容量或产生位置；
-`PagedKVCacheManager` 分配固定大小逻辑 block。composition root 同时选择匹配的逻辑 manager 和 Worker：
+`PagedKVCacheManager` 分配固定大小逻辑 block。composition root 同时选择匹配的逻辑 manager 和 Step Handler：
 
-- `unbounded → UnboundedKVCacheManager + ContiguousModelWorker`；
-- `blocks → PagedKVCacheManager + PagedModelWorker`。
+- `unbounded → UnboundedKVCacheManager + ContiguousStepHandler`；
+- `blocks → PagedKVCacheManager + PagedStepHandler`。
 
-`LocalModelExecutor`、Scheduler 和 Engine 不包含 KV 模式判断。Executor 与 Worker 两层会保留：前者表示可替换
-执行拓扑，后者表示一个设备 rank 内的模型、KV 和 attention；未来多进程 Executor 可以管理多个 Worker。
+两种组合共用一个 `LocalModelWorker`。`LocalModelExecutor`、Worker、Scheduler 和 Engine 不包含 KV 模式判断。
+Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者表示一个设备 rank 内的模型版本和请求生命周期；
+未来多进程 Executor 可以管理多个 Worker。
 当前 `TorchPagedAttention` 是直接读取物理页的 PyTorch correctness backend；生产级 CUDA/Triton kernel 可以
 实现同一 `PagedAttentionBackend → AttentionContext` 契约。
 
@@ -101,7 +105,9 @@ flowchart TB
 | `ExecutionBatch` | Engine 从请求状态切出的本轮真实 token |
 | `RequestOutput` | 每请求完成的输入计算量、零到多个确认输出与已缓存输出前缀 |
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
-| `ModelWorker` | 一个设备 rank 内的模型计算、物理 KV 与采样单元 |
+| `ModelWorker` | 一个设备 rank 内固定模型版本并编排请求生命周期 |
+| `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回每请求有效 logits |
+| `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
 | `Sampler` | 从二维 `[batch, vocabulary]` logits 选择 token |
 | `ForwardBatch` / `ModelOutput` | token、绝对 position 与模型输出的统一张量边界 |
 | `ModelKVCacheSpec` | 模型声明的逐 attention 层 K/V 形状 |
@@ -121,6 +127,8 @@ sequenceDiagram
     participant K as Logical KV Manager
     participant X as ModelExecutor
     participant W as ModelWorker
+    participant D as DecodeHandler
+    participant H as ModelStepHandler
     participant M as ModelSession
     participant P as Sampler
 
@@ -131,10 +139,14 @@ sequenceDiagram
     E->>E: 切出 input_token_ids
     E->>X: execute(ExecutionBatch)
     X->>W: execute(ExecutionBatch)
-    W->>M: forward(ForwardBatch + AttentionContext)
-    M-->>W: logits + optional KV updates
-    W->>P: sample(last valid logits)
-    P-->>W: token IDs
+    W->>D: execute(model, batch, step)
+    D->>H: forward(model, batch)
+    H->>M: forward(ForwardBatch + AttentionContext)
+    M-->>H: logits + optional KV updates
+    H-->>D: per-request logits
+    D->>P: sample(last valid logits)
+    P-->>D: token IDs
+    D-->>W: RequestOutput
     W-->>X: RequestOutput(input, outputs, cached prefix)
     X-->>E: ExecutionOutput
     E->>S: complete(committed, visible outputs)
@@ -142,7 +154,7 @@ sequenceDiagram
     E->>E: 更新状态并发送事件
 ```
 
-执行失败时 Engine 移除本轮请求。连续 Worker 的请求级 tensor 由 lease 延迟销毁；分页页池是进程级全局
+执行失败时 Engine 移除本轮请求。连续 Step Handler 的请求级 tensor 由 lease 延迟销毁；分页页池是进程级全局
 资源，执行中的请求取消时由 Scheduler 把 block ID 延迟到安全边界后归还，防止物理页被过早复用。
 不会出现逻辑状态已经前进但模型 K/V 没有成功写入的半提交状态。
 
@@ -163,10 +175,10 @@ committed 变为 3 → 只需 2 blocks → 自动释放尾部 1 block
 bonus token 等未缓存输出仍是下一轮 pending input。取消或失败使用 `remove()` 释放整个请求，无需另外维护
 rollback API。
 
-分页 Worker 持有每层 `[block, offset, kv_head, head_size]` 的全局 K/V tensor。它把请求逻辑位置映射为
+分页 Step Handler 持有每层 `[block, offset, kv_head, head_size]` 的全局 K/V tensor。它把请求逻辑位置映射为
 `block_id * block_size + offset`，原位写入本轮 K/V，并按 block table 逐页完成 causal attention。不同长度
 请求会组成一个 padded forward batch，`sequence_lengths` 屏蔽 padding，`positions` 始终保存请求内绝对位置。
-连续与分页 Worker 都从模型唯一的 `ModelKVCacheSpec` 获取逐层 KV 形状，装配层不再重复配置层数、KV head 或
+连续与分页 Step Handler 都从模型唯一的 `ModelKVCacheSpec` 获取逐层 KV 形状，装配层不再重复配置层数、KV head 或
 head size。模型只调用 `AttentionContext`，不依赖具体 page layout。block table 必须精确覆盖当前有效前缀、
 query 与显式 lookahead reservation，不携带未预留尾页；当前每个活动物理页归一个请求独占。未来 prefix sharing 必须显式
 区分只读共享前缀与可写尾页，不能仅允许 block ID 别名。
@@ -174,13 +186,13 @@ query 与显式 lookahead reservation，不携带未预留尾页；当前每个�
 ## 7. ModelSession、容量规划与准入
 
 `ModelRunner.open_session()` 在短临界区内复制当前模型引用和 generation。Reference 请求在生成开始时打开一次
-session；Worker 初始化时也固定一次 session。reload 只替换 Runner 的当前模型，旧 session 仍强引用旧模型，
+session；`LocalModelWorker` 初始化时也固定一次 session。reload 只替换 Runner 的当前模型，旧 session 仍强引用旧模型，
 所以活动请求不会跨 generation。Worker 此时对新请求报告 not-ready；活动请求结束后才能按新 generation 重建
 物理 KV。
 
 分页组合只创建一个容量策略对象：固定 `num_blocks` 用于 CPU correctness 和确定性测试；CUDA 策略在模型权重
 已加载后读取空闲显存，按 `memory_fraction` 形成预算，再使用唯一的 `ModelKVCacheSpec`、`block_size` 和 dtype
-计算实际页数。逻辑 `PagedKVCacheManager` 与物理 `PagedModelWorker` 共享这个对象，容量不会漂移。
+计算实际页数。逻辑 `PagedKVCacheManager` 与物理 `PagedStepHandler` 共享这个对象，容量不会漂移。
 
 `EngineCapabilities` 汇总模型最大 token、KV token 容量、并发序列数与单轮 token budget。HTTP 的
 `/capabilities` 只展示这些事实，不维护固定 prompt 上限。`CapacityAdmission` 只拒绝空闲引擎也永远无法满足的
@@ -188,17 +200,22 @@ session；Worker 初始化时也固定一次 session。reload 只替换 Runner �
 
 ## 8. Sampler
 
-`GreedySampler` 已从本地 Executor 中抽离。两个执行路径显式接收 `Sampler`：
+`GreedySampler` 已从本地 Executor 中抽离。普通解码通过 `StandardDecodeHandler` 接收它：
 
 ```python
 sampler = GreedySampler()
 reference_executor = LocalTokenExecutor(runner, sampler)
-worker = PagedModelWorker(runner, sampler, paged_cache_planner, paged_attention_backend)
+step_factory = partial(
+    PagedStepHandler,
+    cache_planner=paged_cache_planner,
+    attention_backend=paged_attention_backend,
+)
+worker = LocalModelWorker(runner, step_factory, StandardDecodeHandler(sampler))
 model_executor = LocalModelExecutor(worker)
 ```
 
 新增 top-k/top-p 时实现新的 Sampler 并装配。投机解码的 acceptance sampler 不等同于普通 Sampler，
-未来会作为 speculative decoder 的内部组件与 proposer、target verify 组合。
+未来会作为投机 `DecodeHandler` 的内部组件与 proposer、target verify 组合。
 
 ## 9. Reference 与 Engine Core
 
