@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from light_vllm import ForwardBatch, KVCacheState, LayerKeyValues, ModelSpec, create_runner
-from light_vllm.modeling.models.qwen2 import Qwen2Config
+from light_vllm.modeling.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionMetadata,
     TorchPagedAttentionBackend,
@@ -124,3 +128,60 @@ def test_qwen2_config_rejects_features_not_implemented_yet() -> None:
 
     with pytest.raises(ValueError, match="rope_scaling"):
         Qwen2Config.from_mapping(qwen2_args(rope_scaling={"type": "linear"}))
+
+
+def _write_snapshot(
+    path: Path,
+    config: dict[str, object],
+    model: Qwen2ForCausalLM,
+    *,
+    sharded: bool,
+) -> None:
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    state = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+    if config["tie_word_embeddings"]:
+        # HF 保存共享权重时通常只保留其中一个名字。
+        state.pop("lm_head.weight")
+    if not sharded:
+        save_file(state, path / "model.safetensors")
+        return
+
+    names = sorted(state)
+    middle = len(names) // 2
+    shard_names = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+    save_file({name: state[name] for name in names[:middle]}, path / shard_names[0])
+    save_file({name: state[name] for name in names[middle:]}, path / shard_names[1])
+    weight_map = {
+        name: shard_names[0] if index < middle else shard_names[1]
+        for index, name in enumerate(names)
+    }
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(("sharded", "tied"), ((False, True), (True, False)))
+def test_qwen2_loads_hf_compatible_safetensors_snapshot(
+    tmp_path: Path,
+    sharded: bool,
+    tied: bool,
+) -> None:
+    config_values = qwen2_args(tie_word_embeddings=tied)
+    torch.manual_seed(11)
+    source = Qwen2ForCausalLM(Qwen2Config.from_mapping(config_values)).eval()
+    input_ids = torch.tensor([[3, 1, 4]])
+    expected = source(ForwardBatch(input_ids=input_ids))
+    _write_snapshot(tmp_path, config_values, source, sharded=sharded)
+
+    runner = create_runner()
+    runner.load(
+        ModelSpec(
+            architecture="qwen2",
+            loader="safetensors",
+            weights=tmp_path,
+        )
+    )
+    actual = runner.open_session().forward(ForwardBatch(input_ids=input_ids))
+
+    torch.testing.assert_close(actual.logits, expected.logits)
