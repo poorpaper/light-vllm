@@ -202,6 +202,23 @@ attention 层只调用 `AttentionContext.forward(layer_id, query, key, value, sc
 - 后续 CUDA/Triton backend 实现同一个 factory 边界，不修改 Engine、Scheduler 或模型协议；
 - 分页 Step Handler 在模型加载成功后初始化物理页池，模型 generation 变化时由 Worker 安全地重建。
 
+当前原生 Qwen2 路径也遵守这条边界：模型层负责 embedding、RMSNorm、RoPE、Q/K/V 投影、输出投影和 MLP；
+`AttentionContext` 才负责读取历史 K/V、因果 softmax 和 value 聚合。HF 模型里的 FlashAttention 也是 attention
+backend，不是 Qwen 权重本身的一部分；普通 HF FlashAttention 无法直接理解本项目的 block table 和物理页池。
+CPU reference/连续 KV 路径保留可读的 dense attention，分页路径使用同一个模型接入
+`TorchPagedAttention`，未来 CUDA/Triton 实现替换 backend 即可。
+
+## Qwen 与 checkpoint 来源
+
+`qwen2` 注册项当前覆盖 Qwen2/Qwen2.5 的 full-attention、default-RoPE 配置，包括 GQA、tied embedding 和
+分片 safetensors。sliding-window、rope scaling、量化权重和 tokenizer 尚未实现，遇到这些配置会明确拒绝，
+不会回退到近似计算。
+
+Hugging Face 和 ModelScope 只负责把模型快照下载到本地。两边常见的 `config.json + model*.safetensors +
+model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`；loader 解析配置、逐分片复制权重并检查
+重复、缺失、多余和形状错误。`ModelRunner` 仍然只按 Catalog 解析 `qwen2 + safetensors`，不知道快照来自哪个
+网站。Transformers 只作为可选测试 oracle，对照相同权重的 logits，不进入生产执行路径。
+
 ## Capabilities、admission 与 preemption
 
 容量事实从拥有它的实体向上汇总：模型声明 `max_model_tokens`，Step Handler 通过 Worker 报告

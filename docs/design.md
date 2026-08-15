@@ -118,6 +118,10 @@ Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者
 `SchedulerOutput` 和 `RequestOutput` 是未来扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
 并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和未来投机验证因此能共用同一循环。
 
+原生 Qwen2 模型也使用这组契约：Qwen 层生成带 RoPE 的 Q/K/V，`AttentionContext` 完成 KV 读写、softmax 和
+value 聚合。HF/ModelScope 兼容快照统一由 `SafetensorsModelLoader` 读取；来源差异不会扩散到模型、Worker 或
+Engine。当前支持 full attention 和 default RoPE，未实现配置在加载时直接报错。
+
 ## 5. 一次迭代
 
 ```mermaid
@@ -232,6 +236,8 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 | Attention 契约 | `src/light_vllm/modeling/attention/interfaces.py` |
 | 模型契约 | `src/light_vllm/modeling/models/interfaces.py` |
 | loader 契约 | `src/light_vllm/modeling/loaders/interfaces.py` |
+| safetensors 快照 | `src/light_vllm/modeling/loaders/safetensors.py` |
+| Qwen2 模型 | `src/light_vllm/modeling/models/qwen2.py` |
 | 模型生命周期 | `src/light_vllm/modeling/runner.py` |
 | 生成契约 | `src/light_vllm/runtime/generation/interfaces.py` |
 | reference 生成 | `src/light_vllm/runtime/generation/reference.py` |

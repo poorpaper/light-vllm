@@ -233,6 +233,7 @@ class Qwen2Attention(nn.Module):
         queries, keys = _apply_rotary(queries, keys, cosines, sines)
 
         if batch.attention is not None:
+            # 模型负责 Q/K/V；缓存布局、softmax 和 kernel 由执行端选择。
             attended = batch.attention.forward(
                 self._layer_id,
                 queries,
@@ -241,6 +242,7 @@ class Qwen2Attention(nn.Module):
                 scale=self._scale,
             )
         else:
+            # reference 和连续 KV 路径保留一份直白的 dense attention 基线。
             attended = self._dense_attention(queries, keys, values, batch, past)
         output = self.o_proj(attended.reshape(batch_size, query_width, -1))
         return output, LayerKeyValues(keys=keys, values=values)
@@ -289,6 +291,7 @@ class Qwen2Attention(nn.Module):
             ),
             dim=1,
         )
+        # padding token 可以经过其他层，但不能成为任何有效 query 的历史。
         causal = key_positions.unsqueeze(1) <= positions.unsqueeze(2)
         mask = causal & valid_keys.unsqueeze(1)
         scores = scores.masked_fill(~mask.unsqueeze(1), torch.finfo(scores.dtype).min)
@@ -407,6 +410,7 @@ class Qwen2ForCausalLM(nn.Module):
         logits = self.lm_head(self.model.norm(hidden_states))
         cache_updates = None
         if batch.kv_cache is not None:
+            # 连续缓存只追加本轮 K/V；分页上下文已经直接写入物理页。
             cache_updates = KVCacheState(layers=tuple(updates))
         return ModelOutput(logits=logits, kv_cache_updates=cache_updates)
 

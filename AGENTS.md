@@ -19,6 +19,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 
 - `ModelRunner` 通过 `Catalog` 中的 model/loader 注册表加载并原子替换模型；`open_session()` 固定模型对象和
   generation，一个生成请求不得跨 session。
+- 原生 `Qwen2ForCausalLM` 支持 Qwen2/Qwen2.5 的 full-attention、default-RoPE 配置；HF 与 ModelScope 下载的
+  兼容目录共用 `SafetensorsModelLoader`，不进入 Runner 或 Worker 分支。
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
 - `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流。
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode。
@@ -39,7 +41,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
 当前尚未实现生产级 CUDA/Triton Paged Attention kernel、prefix caching、preemption、投机解码、分布式执行、
-tokenizer 和生产级 serving。PyTorch Paged Attention 是物理分页正确性基线，不代表生产吞吐。
+tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorch Paged Attention 是物理分页正确性
+基线，不代表生产吞吐；当前也不宣称支持大多数 Transformers 模型。
 
 ## 代码地图
 
@@ -48,6 +51,8 @@ tokenizer 和生产级 serving。PyTorch Paged Attention 是物理分页正确�
 | `src/light_vllm/modeling/attention/interfaces.py` | 模型 KV 规格与后端 attention 契约 |
 | `src/light_vllm/modeling/models/interfaces.py` | 模型配置、forward 与 K/V 张量契约 |
 | `src/light_vllm/modeling/loaders/interfaces.py` | 权重加载器契约 |
+| `src/light_vllm/modeling/loaders/safetensors.py` | HF/ModelScope 兼容的本地分片快照加载 |
+| `src/light_vllm/modeling/models/qwen2.py` | 原生 Qwen2/Qwen2.5 推理模型 |
 | `src/light_vllm/modeling/runner.py` | 模型生命周期与固定 `ModelSession` |
 | `src/light_vllm/modeling/catalog.py` | model/loader 扩展点集合 |
 | `src/light_vllm/runtime/generation/interfaces.py` | 生成请求、结果和事件 |
@@ -113,6 +118,10 @@ tokenizer 和生产级 serving。PyTorch Paged Attention 是物理分页正确�
 31. 固定页数或显存发现策略必须解析成一个共享容量事实；逻辑 block manager 和物理页池不得各自配置容量。
 32. admission 只判断请求在空闲引擎上是否必然不可满足；等待、抢占和公平性属于 Scheduler，不进入 HTTP 或
     Executor。
+33. 模型层负责生成 Q/K/V、RoPE、norm 和 MLP；`AttentionContext` 负责 KV 读写及实际 attention 计算，模型不得
+    绕过它绑定 HF FlashAttention 或物理 page layout。
+34. Hugging Face 与 ModelScope 只是 checkpoint 来源；兼容快照先落到本地目录，再由同一个 loader 校验配置、
+    分片和权重，不能复制两套 Qwen 执行实现。
 
 ## 锁与资源的准确含义
 
