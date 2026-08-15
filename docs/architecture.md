@@ -65,10 +65,11 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
 | `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
 | `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
-| `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与逐请求 forward | 采样、逻辑 block |
+| `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
 | `PagedStepHandler` | padded batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
 | `StandardDecodeHandler` | 普通 prefill/单 token decode 的结果转换与采样 | KV 布局、调度 |
 | `PagedKVCachePlanner` | 模型加载后把固定页数或空闲显存预算解析为容量 | 请求调度、page ownership |
+| `TorchDenseAttention` | 读取连续历史、dense causal attention、暂存本轮 K/V | 模型结构、物理分页 |
 | `PagedAttentionBackend` | 为页池和批次事实创建 `AttentionContext` | 模型分发、调度 |
 | `TorchPagedAttention` | 原位写 K/V、逐页 causal attention、MHA/GQA correctness | 调度、生产级 kernel 优化 |
 | `Sampler` | 从 logits 选择 token | 模型 forward、调度、停止条件 |
@@ -147,7 +148,8 @@ flowchart TB
     Worker --> Step["ModelStepHandler"]
     Step --> Contiguous["ContiguousKVCache<br/>request-level tensors"]
     Step --> Paged["PagedKVCache<br/>global physical pages"]
-    Paged --> Attention["AttentionContext<br/>TorchPagedAttention"]
+    Contiguous --> Dense["AttentionContext<br/>TorchDenseAttention"]
+    Paged --> PagedAttention["AttentionContext<br/>TorchPagedAttention"]
 ```
 
 当前有两种逻辑 manager：`UnboundedKVCacheManager` 为连续缓存提供无 block、无容量限制的实验基线；
@@ -193,9 +195,10 @@ Scheduler 将逻辑 block ID 延迟到该安全边界之后归还。本轮输出
 `ForwardBatch` 的 `input_ids`、`positions` 都是 `[batch, padded_sequence]`；`positions` 是请求内绝对位置，
 不能由模型根据 prefill/decode 模式猜测。`sequence_lengths` 标识每行有效 query 长度。
 
-使用外部 KV 的模型声明 `ModelKVCacheSpec`，每层用稳定 `layer_id` 描述 query heads、KV heads 和 head size。
-attention 层只调用 `AttentionContext.forward(layer_id, query, key, value, scale)`。分页 Step Handler 则通过
-`PagedAttentionBackend.create(cache, metadata)` 创建这个通用上下文。因此：
+可缓存模型声明 `ModelKVCacheSpec`，每层用稳定 `layer_id` 描述 query heads、KV heads 和 head size。模型的
+attention 层只调用 `AttentionContext.forward(layer_id, query, key, value, scale)`，不得自己实现 dense fallback。
+reference 与连续 Step Handler 创建 `TorchDenseAttention`；分页 Step Handler 通过
+`PagedAttentionBackend.create(cache, metadata)` 创建分页上下文。因此：
 
 - 模型不知道 block size、page layout 或具体 kernel；
 - Worker 不按具体模型 architecture 分支；
@@ -205,8 +208,8 @@ attention 层只调用 `AttentionContext.forward(layer_id, query, key, value, sc
 当前原生 Qwen2 路径也遵守这条边界：模型层负责 embedding、RMSNorm、RoPE、Q/K/V 投影、输出投影和 MLP；
 `AttentionContext` 才负责读取历史 K/V、因果 softmax 和 value 聚合。HF 模型里的 FlashAttention 也是 attention
 backend，不是 Qwen 权重本身的一部分；普通 HF FlashAttention 无法直接理解本项目的 block table 和物理页池。
-CPU reference/连续 KV 路径保留可读的 dense attention，分页路径使用同一个模型接入
-`TorchPagedAttention`，未来 CUDA/Triton 实现替换 backend 即可。
+CPU reference/连续 KV 路径通过执行层接入可读的 `TorchDenseAttention`，分页路径让同一个模型接入
+`TorchPagedAttention`。模型在两种布局下没有条件分支，未来 CUDA/Triton 实现只替换 backend。
 
 ## Qwen 与 checkpoint 来源
 
@@ -261,8 +264,9 @@ flowchart LR
     Worker --> Runner
 ```
 
-Reference 路径保留同步、全序列重算和逐 token 语义，用于教学与正确性对照；生产演进发生在 Engine Core
-路径。两者共享 generation 请求/事件、ModelRunner 和 Sampler，但不通过兼容 facade 强行共享执行契约。
+Reference 路径保留同步、全序列重算和逐 token 语义，用于教学与正确性对照；`LocalTokenExecutor` 为每轮完整
+序列创建无历史的 `TorchDenseAttention`。生产演进发生在 Engine Core 路径。两者共享 generation 请求/事件、
+ModelRunner 和 Sampler，但不通过兼容 facade 强行共享执行契约。
 
 HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClient.capabilities`，而不是 transport 常量。
 进程拆分时可以新增 `ProcessEngineClient`，但不得

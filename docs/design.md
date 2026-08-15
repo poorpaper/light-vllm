@@ -1,4 +1,4 @@
-# light-vllm 架构设计（v0.9）
+# light-vllm 架构设计（v0.10）
 
 这份文档记录当前已经落地的设计。更细的职责说明见 [architecture.md](architecture.md)。
 
@@ -71,6 +71,7 @@ flowchart TB
     Worker --> Decode["DecodeHandler"]
     Step --> Contiguous["ContiguousStepHandler<br/>request-level tensors"]
     Step --> Paged["PagedStepHandler<br/>global physical pages"]
+    Contiguous --> Dense["TorchDenseAttention<br/>contiguous correctness"]
     Paged --> Attention["PagedAttentionBackend<br/>Torch correctness"]
     Decode --> Sampler["GreedySampler"]
     Reference --> TokenExecutor["LocalTokenExecutor"]
@@ -93,8 +94,9 @@ flowchart TB
 两种组合共用一个 `LocalModelWorker`。`LocalModelExecutor`、Worker、Scheduler 和 Engine 不包含 KV 模式判断。
 Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者表示一个设备 rank 内的模型版本和请求生命周期；
 未来多进程 Executor 可以管理多个 Worker。
-当前 `TorchPagedAttention` 是直接读取物理页的 PyTorch correctness backend；生产级 CUDA/Triton kernel 可以
-实现同一 `PagedAttentionBackend → AttentionContext` 契约。
+`TorchDenseAttention` 是 reference 与连续缓存共用的 dense correctness backend；`TorchPagedAttention` 直接读取
+物理页。两者都实现模型看到的 `AttentionContext`，生产级 CUDA/Triton kernel 继续实现
+`PagedAttentionBackend → AttentionContext` 契约。
 
 ## 4. 稳定契约
 
@@ -109,7 +111,7 @@ Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者
 | `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回每请求有效 logits |
 | `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
 | `Sampler` | 从二维 `[batch, vocabulary]` logits 选择 token |
-| `ForwardBatch` / `ModelOutput` | token、绝对 position 与模型输出的统一张量边界 |
+| `ForwardBatch` / `ModelOutput` | token、绝对 position、attention 上下文与 logits 的统一模型边界 |
 | `ModelKVCacheSpec` | 模型声明的逐 attention 层 K/V 形状 |
 | `AttentionContext` | 模型调用连续或分页 attention 后端的稳定边界 |
 | `EngineCapabilities` | 初始化后可发现的模型、KV、并发和单轮容量事实 |
@@ -118,9 +120,10 @@ Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者
 `SchedulerOutput` 和 `RequestOutput` 是未来扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
 并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和未来投机验证因此能共用同一循环。
 
-原生 Qwen2 模型也使用这组契约：Qwen 层生成带 RoPE 的 Q/K/V，`AttentionContext` 完成 KV 读写、softmax 和
-value 聚合。HF/ModelScope 兼容快照统一由 `SafetensorsModelLoader` 读取；来源差异不会扩散到模型、Worker 或
-Engine。当前支持 full attention 和 default RoPE，未实现配置在加载时直接报错。
+原生 Qwen2 模型也使用这组契约：Qwen 层只生成带 RoPE 的 Q/K/V 并调用 `AttentionContext`，不再保留模型内
+dense fallback。上下文完成 KV 读写、softmax 和 value 聚合。HF/ModelScope 兼容快照统一由
+`SafetensorsModelLoader` 读取；来源差异不会扩散到模型、Worker 或 Engine。当前支持 full attention 和
+default RoPE，未实现配置在加载时直接报错。
 
 ## 5. 一次迭代
 
@@ -133,6 +136,7 @@ sequenceDiagram
     participant W as ModelWorker
     participant D as DecodeHandler
     participant H as ModelStepHandler
+    participant A as AttentionContext
     participant M as ModelSession
     participant P as Sampler
 
@@ -145,8 +149,12 @@ sequenceDiagram
     X->>W: execute(ExecutionBatch)
     W->>D: execute(model, batch, step)
     D->>H: forward(model, batch)
+    H->>A: create(cache + batch metadata)
     H->>M: forward(ForwardBatch + AttentionContext)
-    M-->>H: logits + optional KV updates
+    M->>A: forward(layer_id, Q, K, V)
+    A-->>M: attended states
+    M-->>H: logits
+    H->>H: finalize physical KV updates
     H-->>D: per-request logits
     D->>P: sample(last valid logits)
     P-->>D: token IDs
@@ -186,6 +194,10 @@ rollback API。
 head size。模型只调用 `AttentionContext`，不依赖具体 page layout。block table 必须精确覆盖当前有效前缀、
 query 与显式 lookahead reservation，不携带未预留尾页；当前每个活动物理页归一个请求独占。未来 prefix sharing 必须显式
 区分只读共享前缀与可写尾页，不能仅允许 block ID 别名。
+
+连续 Step Handler 为每个请求创建 `TorchDenseAttention`。它读取请求级连续历史，在模型逐层调用时完成 dense
+attention 并暂存本轮 K/V；只有模型 forward 和输出校验全部成功，Handler 才把所有层一次性追加到
+`ContiguousKVCache`。因此模型不返回 K/V，连续路径仍保持跨层原子更新。
 
 ## 7. ModelSession、容量规划与准入
 
@@ -248,6 +260,7 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 | 执行契约 | `src/light_vllm/runtime/execution/interfaces.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
 | 本地 Worker | `src/light_vllm/runtime/execution/worker.py` |
+| Dense Attention | `src/light_vllm/runtime/execution/dense_attention.py` |
 | 物理分页 KV | `src/light_vllm/runtime/execution/paged_cache.py` |
 | Paged Attention | `src/light_vllm/runtime/execution/paged_attention.py` |
 | Engine Core | `src/light_vllm/runtime/engine/core.py` |

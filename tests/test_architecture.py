@@ -19,6 +19,14 @@ def _imported_modules(path: Path) -> set[str]:
     return modules
 
 
+def _class_definition(path: Path, class_name: str) -> ast.ClassDef:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return node
+    raise AssertionError(f"class {class_name!r} was not found in {path}")
+
+
 def test_interface_modules_do_not_import_their_implementations() -> None:
     boundaries = {
         SOURCE_ROOT / "runtime" / "engine" / "interfaces.py": (
@@ -74,3 +82,26 @@ def test_engine_core_does_not_import_model_or_transport_details() -> None:
         for module in modules
         for prefix in forbidden_prefixes
     )
+
+
+def test_cacheable_models_delegate_softmax_to_attention_context() -> None:
+    """模型可以生成 Q/K/V，但不能重新拥有 attention kernel。"""
+
+    targets = (
+        (SOURCE_ROOT / "modeling" / "models" / "tiny_attention.py", "TinyAttentionCausalLM"),
+        (SOURCE_ROOT / "modeling" / "models" / "qwen2.py", "Qwen2Attention"),
+    )
+    for path, class_name in targets:
+        class_node = _class_definition(path, class_name)
+        softmax_calls = [
+            node
+            for node in ast.walk(class_node)
+            if isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "softmax"
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr == "softmax"
+            )
+        ]
+        assert not softmax_calls, f"{class_name} must call AttentionContext instead"

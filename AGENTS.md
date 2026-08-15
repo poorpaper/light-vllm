@@ -32,8 +32,9 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   `ContiguousStepHandler` / `PagedStepHandler` 分别负责连续与分页 KV 的输入准备、物理缓存和模型 forward。
 - `StandardDecodeHandler` 负责无输出的输入步骤和普通单 token 解码；未来投机解码替换 DecodeHandler，不新增模式专用 Worker。
 - 固定页数或 CUDA 空闲显存策略在模型加载后解析成同一个分页容量对象，同时供逻辑 manager 与物理页池使用。
-- 模型通过 `AttentionContext` 使用执行后端提供的 attention。当前 `TorchPagedAttention` 直接逐页读取 K/V，
-  用在线 softmax 提供 CPU correctness 实现；`PagedAttentionBackend` 是 CUDA/Triton 的替换边界。
+- 可缓存模型只通过 `AttentionContext` 执行 attention，不内置 dense/paged fallback。reference 与连续缓存使用
+  `TorchDenseAttention`；分页缓存使用逐页读取 K/V、在线 softmax 的 `TorchPagedAttention`，
+  `PagedAttentionBackend` 是 CUDA/Triton 的替换边界。
 - `RequestOutput` 分开表达本轮输入计算量、零到多个确认输出，以及已经写入 KV 的输出前缀。
 - `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
@@ -64,6 +65,7 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 | `src/light_vllm/runtime/execution/interfaces.py` | `ExecutionBatch`、`ExecutionOutput` 与 Executor 契约 |
 | `src/light_vllm/runtime/execution/local.py` | 本地 Executor 与 reference token 执行 |
 | `src/light_vllm/runtime/execution/worker.py` | 本地 Worker、Step Handler 与普通 Decode Handler |
+| `src/light_vllm/runtime/execution/dense_attention.py` | reference/连续缓存共用的 dense attention 上下文 |
 | `src/light_vllm/runtime/execution/paged_cache.py` | 分页 Step Handler 拥有的物理 K/V tensor |
 | `src/light_vllm/runtime/execution/paged_attention.py` | Paged metadata 与 PyTorch correctness backend |
 | `src/light_vllm/runtime/engine/admission.py` | 确定性请求容量准入 |
@@ -81,7 +83,8 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 4. 加载失败不得改变当前模型或 generation。
 5. `open_session()` 只在锁内复制模型引用和 generation；实际计算不持有生命周期锁。一个请求始终使用同一
    session，reload 后旧 session 继续引用旧模型。
-6. 所有模型接受 `ForwardBatch`，返回 `ModelOutput`；loader 负责 device、dtype 与 `eval()`。
+6. 所有模型接受 `ForwardBatch`，返回只包含 logits 的 `ModelOutput`；K/V 读写由 `AttentionContext` 和 Step Handler
+   完成，loader 负责 device、dtype 与 `eval()`。
 7. `ReferenceGenerationService` 只依赖 `TokenExecutor`，不得依赖 runner、torch 或具体模型。
 8. transport adapter 只依赖 `EngineClient`；HTTP/RPC schema 和 wire format 不得进入核心契约。
 9. `stream` 是同步与异步生成的唯一执行路径；`generate` 只收集同一事件流。
@@ -118,8 +121,8 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 31. 固定页数或显存发现策略必须解析成一个共享容量事实；逻辑 block manager 和物理页池不得各自配置容量。
 32. admission 只判断请求在空闲引擎上是否必然不可满足；等待、抢占和公平性属于 Scheduler，不进入 HTTP 或
     Executor。
-33. 模型层负责生成 Q/K/V、RoPE、norm 和 MLP；`AttentionContext` 负责 KV 读写及实际 attention 计算，模型不得
-    绕过它绑定 HF FlashAttention 或物理 page layout。
+33. 模型层负责生成 Q/K/V、RoPE、norm 和 MLP；可缓存模型必须把 KV 读写及实际 attention 计算交给
+    `AttentionContext`，不得保留模型内 dense fallback，也不得绑定 HF FlashAttention 或物理 page layout。
 34. Hugging Face 与 ModelScope 只是 checkpoint 来源；兼容快照先落到本地目录，再由同一个 loader 校验配置、
     分片和权重，不能复制两套 Qwen 执行实现。
 
@@ -144,8 +147,8 @@ Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边
 新增执行拓扑：实现 `ModelExecutor`，保持 `ExecutionBatch → ExecutionOutput` 语义；本地、CUDA、多进程是
 合理的 Executor 差异，greedy、KV 模式、prefill/decode 不是。
 
-新增本地 KV 布局或 attention 后端：实现 `ModelStepHandler`，按需组合 `PagedAttentionBackend`；模型仍只看
-`AttentionContext`，并保持 block table 和 `ModelKVCacheSpec` 的事实型边界。
+新增本地 KV 布局或 attention 后端：实现 `ModelStepHandler`，创建相应 `AttentionContext`，分页 kernel 再通过
+`PagedAttentionBackend` 组合；模型保持唯一调用入口，并继续只声明 `ModelKVCacheSpec`。
 
 新增普通或投机解码流程：实现 `DecodeHandler`，组合 proposer、target verify 与 acceptance sampler；复用同一
 `LocalModelWorker` 和 Step Handler，不修改 Scheduler、Engine 或模型分发。
