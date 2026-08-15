@@ -18,9 +18,11 @@ from light_vllm.modeling.models.tiny_attention import (
 )
 from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
+    DenseAttentionMetadata,
     LocalModelExecutor,
     LocalModelWorker,
     PagedKVCacheConfig,
+    TorchDenseAttention,
     TorchPagedAttentionBackend,
 )
 from light_vllm.runtime.execution.worker import (
@@ -58,6 +60,28 @@ def _model_kv_spec(*, num_kv_heads: int = 1, head_size: int = 1) -> ModelKVCache
             ),
         )
     )
+
+
+def _tiny_dense_forward(model, token_ids: tuple[int, ...], *, past=None):
+    input_ids = torch.tensor([token_ids])
+    start = 0 if past is None else past.num_tokens
+    positions = torch.arange(start, start + len(token_ids)).unsqueeze(0)
+    attention = TorchDenseAttention(
+        model.kv_cache_spec,
+        DenseAttentionMetadata(
+            positions=positions,
+            query_lengths=(len(token_ids),),
+        ),
+        past,
+    )
+    output = model(
+        ForwardBatch(
+            input_ids=input_ids,
+            positions=positions,
+            attention=attention,
+        )
+    )
+    return output, attention
 
 
 def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
@@ -151,23 +175,26 @@ def test_tiny_attention_cached_logits_match_full_sequence_logits() -> None:
     model = TinyAttentionCausalLM(
         TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
     ).eval()
-    full = model(ForwardBatch(input_ids=torch.tensor([[1, 2, 3]]))).logits[:, -1]
+    full = _tiny_dense_forward(model, (1, 2, 3))[0].logits[:, -1]
 
-    empty = KVCacheState(
-        layers=(
-            LayerKeyValues(
-                keys=torch.empty(1, 0, 2, 4),
-                values=torch.empty(1, 0, 2, 4),
-            ),
-        )
-    )
-    prompt = model(ForwardBatch(input_ids=torch.tensor([[1, 2]]), kv_cache=empty))
-    assert prompt.kv_cache_updates is not None
-    cached = model(
-        ForwardBatch(input_ids=torch.tensor([[3]]), kv_cache=prompt.kv_cache_updates)
-    ).logits[:, -1]
+    prompt, prompt_attention = _tiny_dense_forward(model, (1, 2))
+    cached = _tiny_dense_forward(
+        model,
+        (3,),
+        past=prompt_attention.cache_updates,
+    )[0].logits[:, -1]
 
     torch.testing.assert_close(cached, full)
+    assert prompt.logits.shape == (1, 2, 16)
+
+
+def test_tiny_attention_requires_one_execution_attention_context() -> None:
+    model = TinyAttentionCausalLM(
+        TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
+    ).eval()
+
+    with pytest.raises(ValueError, match="requires an attention context"):
+        model(ForwardBatch(input_ids=torch.tensor([[1, 2]])))
 
 
 def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
@@ -189,7 +216,6 @@ def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
     output = model(ForwardBatch(input_ids=torch.tensor([[1, 2]]), attention=attention))
 
     assert output.logits.shape == (1, 2, 16)
-    assert output.kv_cache_updates is None
     assert attention.layer_ids == ["attention"]
 
 
@@ -218,7 +244,7 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
         expected: list[int] = []
         token_ids = list(request.input_ids)
         for _ in range(request.max_new_tokens):
-            logits = model(ForwardBatch(input_ids=torch.tensor([token_ids]))).logits
+            logits = _tiny_dense_forward(model, tuple(token_ids))[0].logits
             token_id = int(logits[0, -1].argmax().item())
             expected.append(token_id)
             token_ids.append(token_id)

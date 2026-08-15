@@ -6,8 +6,6 @@ import torch
 from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
 from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
-    KVCacheState,
-    LayerKeyValues,
     ModelNotLoadedError,
     ModelOutput,
 )
@@ -16,6 +14,7 @@ from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionConfig,
 )
 from light_vllm.runtime.execution import (
+    DenseAttentionMetadata,
     ExecutionBatch,
     ExecutionCapabilities,
     ExecutionError,
@@ -27,6 +26,7 @@ from light_vllm.runtime.execution import (
     LocalTokenExecutor,
     PagedKVCacheConfig,
     RequestOutput,
+    TorchDenseAttention,
     TorchPagedAttentionBackend,
 )
 from light_vllm.runtime.execution.worker import (
@@ -59,15 +59,16 @@ class IncrementingForwarder:
         next_ids = (batch.input_ids + 1) % self.vocab_size
         logits = torch.full((*batch.input_ids.shape, self.vocab_size), -1.0)
         logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
-        updates = KVCacheState(
-            layers=(
-                LayerKeyValues(
-                    keys=batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1),
-                    values=batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1),
-                ),
+        if batch.attention is not None:
+            keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
+            batch.attention.forward(
+                "attention",
+                keys,
+                keys,
+                keys,
+                scale=1.0,
             )
-        )
-        return ModelOutput(logits=logits, kv_cache_updates=updates)
+        return ModelOutput(logits=logits)
 
 
 class UnloadedForwarder:
@@ -212,6 +213,25 @@ def _paged_worker(
     )
 
 
+def _dense_tiny_logits(model, token_ids: tuple[int, ...]) -> torch.Tensor:
+    input_ids = torch.tensor([token_ids])
+    positions = torch.arange(len(token_ids)).unsqueeze(0)
+    attention = TorchDenseAttention(
+        model.kv_cache_spec,
+        DenseAttentionMetadata(
+            positions=positions,
+            query_lengths=(len(token_ids),),
+        ),
+    )
+    return model(
+        ForwardBatch(
+            input_ids=input_ids,
+            positions=positions,
+            attention=attention,
+        )
+    ).logits
+
+
 def test_reference_executor_delegates_token_choice_to_sampler() -> None:
     executor = LocalTokenExecutor(StaticSessionProvider(IncrementingForwarder()), FixedSampler())
 
@@ -292,12 +312,7 @@ def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> No
     )
 
     expected_prefill = tuple(
-        int(
-            forwarder.model(ForwardBatch(input_ids=torch.tensor([tokens])))
-            .logits[0, -1]
-            .argmax()
-            .item()
-        )
+        int(_dense_tiny_logits(forwarder.model, tokens)[0, -1].argmax().item())
         for tokens in ((1, 2, 3), (5, 6))
     )
     assert tuple(result.output_token_ids[0] for result in prefill.requests) == expected_prefill
@@ -316,12 +331,7 @@ def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> No
         )
     )
     expected_decode = tuple(
-        int(
-            forwarder.model(ForwardBatch(input_ids=torch.tensor([tokens + (generated,)])))
-            .logits[0, -1]
-            .argmax()
-            .item()
-        )
+        int(_dense_tiny_logits(forwarder.model, tokens + (generated,))[0, -1].argmax().item())
         for tokens, generated in zip(
             ((1, 2, 3), (5, 6)),
             expected_prefill,

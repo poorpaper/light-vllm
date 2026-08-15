@@ -7,8 +7,12 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from light_vllm import ForwardBatch, KVCacheState, LayerKeyValues, ModelSpec, create_runner
+from light_vllm import ForwardBatch, ModelSpec, create_runner
 from light_vllm.modeling.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+from light_vllm.runtime.execution.dense_attention import (
+    DenseAttentionMetadata,
+    TorchDenseAttention,
+)
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionMetadata,
     TorchPagedAttentionBackend,
@@ -40,17 +44,27 @@ def _loaded_qwen2():
     return runner.open_session()
 
 
-def _empty_cache(session) -> KVCacheState:
+def _dense_forward(session, input_ids: torch.Tensor, *, past=None):
     assert session.kv_cache_spec is not None
-    return KVCacheState(
-        layers=tuple(
-            LayerKeyValues(
-                keys=torch.empty((1, 0, layer.num_kv_heads, layer.head_size)),
-                values=torch.empty((1, 0, layer.num_kv_heads, layer.head_size)),
-            )
-            for layer in session.kv_cache_spec.layers
+    positions = torch.arange(input_ids.shape[1]).expand(input_ids.shape[0], -1)
+    if past is not None:
+        positions = positions + past.num_tokens
+    attention = TorchDenseAttention(
+        session.kv_cache_spec,
+        DenseAttentionMetadata(
+            positions=positions,
+            query_lengths=(input_ids.shape[1],) * input_ids.shape[0],
+        ),
+        past,
+    )
+    output = session.forward(
+        ForwardBatch(
+            input_ids=input_ids,
+            positions=positions,
+            attention=attention,
         )
     )
+    return output, attention
 
 
 def test_qwen2_exposes_model_limits_and_kv_shape() -> None:
@@ -69,22 +83,13 @@ def test_qwen2_exposes_model_limits_and_kv_shape() -> None:
 def test_qwen2_contiguous_kv_matches_full_sequence() -> None:
     session = _loaded_qwen2()
     input_ids = torch.tensor([[1, 5, 9, 13]])
-    full = session.forward(ForwardBatch(input_ids=input_ids))
+    full, _ = _dense_forward(session, input_ids)
 
-    prefill = session.forward(
-        ForwardBatch(
-            input_ids=input_ids[:, :3],
-            positions=torch.tensor([[0, 1, 2]]),
-            kv_cache=_empty_cache(session),
-        )
-    )
-    assert prefill.kv_cache_updates is not None
-    decode = session.forward(
-        ForwardBatch(
-            input_ids=input_ids[:, 3:],
-            positions=torch.tensor([[3]]),
-            kv_cache=prefill.kv_cache_updates,
-        )
+    prefill, prefill_attention = _dense_forward(session, input_ids[:, :3])
+    decode, _ = _dense_forward(
+        session,
+        input_ids[:, 3:],
+        past=prefill_attention.cache_updates,
     )
 
     torch.testing.assert_close(prefill.logits, full.logits[:, :3], atol=1e-6, rtol=1e-5)
@@ -95,7 +100,7 @@ def test_qwen2_paged_attention_matches_full_sequence() -> None:
     session = _loaded_qwen2()
     assert session.kv_cache_spec is not None
     input_ids = torch.tensor([[2, 4, 6, 8]])
-    full = session.forward(ForwardBatch(input_ids=input_ids))
+    full, _ = _dense_forward(session, input_ids)
     cache = PagedKVCache(
         session.kv_cache_spec,
         PagedKVCacheConfig(
@@ -171,7 +176,7 @@ def test_qwen2_loads_hf_compatible_safetensors_snapshot(
     torch.manual_seed(11)
     source = Qwen2ForCausalLM(Qwen2Config.from_mapping(config_values)).eval()
     input_ids = torch.tensor([[3, 1, 4]])
-    expected = source(ForwardBatch(input_ids=input_ids))
+    expected, _ = _dense_forward(source, input_ids)
     _write_snapshot(tmp_path, config_values, source, sharded=sharded)
 
     runner = create_runner()
@@ -182,7 +187,7 @@ def test_qwen2_loads_hf_compatible_safetensors_snapshot(
             weights=tmp_path,
         )
     )
-    actual = runner.open_session().forward(ForwardBatch(input_ids=input_ids))
+    actual, _ = _dense_forward(runner.open_session(), input_ids)
 
     torch.testing.assert_close(actual.logits, expected.logits)
 
@@ -200,6 +205,6 @@ def test_qwen2_logits_match_transformers_reference() -> None:
 
     with torch.inference_mode():
         expected = reference(input_ids=input_ids, use_cache=False).logits
-        actual = model(ForwardBatch(input_ids=input_ids)).logits
+        actual = _dense_forward(model, input_ids)[0].logits
 
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)

@@ -10,6 +10,7 @@ from light_vllm.runtime.engine import (
 )
 from light_vllm.runtime.execution import (
     CudaMemoryKVCachePlanner,
+    DenseAttentionMetadata,
     ExecutionBatch,
     ExecutionCapabilities,
     ExecutionError,
@@ -26,6 +27,7 @@ from light_vllm.runtime.execution import (
     PagedKVCachePlanner,
     RequestOutput,
     TokenExecutor,
+    TorchDenseAttention,
     TorchPagedAttentionBackend,
 )
 from light_vllm.runtime.generation import (
@@ -66,6 +68,7 @@ __all__ = [
     "ContiguousKVCache",
     "ContiguousKVCacheConfig",
     "CudaMemoryKVCachePlanner",
+    "DenseAttentionMetadata",
     "CapacityAdmission",
     "DecodingBudget",
     "EngineCapabilities",
@@ -114,6 +117,7 @@ __all__ = [
     "TokenBudgetScheduler",
     "TokenExecutor",
     "TokenGenerated",
+    "TorchDenseAttention",
     "TorchPagedAttentionBackend",
     "UnboundedKVCacheManager",
 ]

@@ -1,3 +1,7 @@
+from light_vllm.runtime.execution.dense_attention import (
+    DenseAttentionMetadata,
+    TorchDenseAttention,
+)
 from light_vllm.runtime.execution.interfaces import (
     DecodeHandler,
     ExecutionBatch,
@@ -27,6 +31,7 @@ from light_vllm.runtime.execution.worker import LocalModelWorker
 
 __all__ = [
     "CudaMemoryKVCachePlanner",
+    "DenseAttentionMetadata",
     "DecodeHandler",
     "ExecutionBatch",
     "ExecutionCapabilities",
@@ -46,5 +51,6 @@ __all__ = [
     "RequestOutput",
     "TokenExecutionSession",
     "TokenExecutor",
+    "TorchDenseAttention",
     "TorchPagedAttentionBackend",
 ]

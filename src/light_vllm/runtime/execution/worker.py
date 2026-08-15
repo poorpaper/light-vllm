@@ -14,6 +14,10 @@ from light_vllm.modeling.models.interfaces import (
     ModelSession,
     ModelSessionProvider,
 )
+from light_vllm.runtime.execution.dense_attention import (
+    DenseAttentionMetadata,
+    TorchDenseAttention,
+)
 from light_vllm.runtime.execution.interfaces import (
     DecodeHandler,
     ExecutionBatch,
@@ -90,28 +94,38 @@ class ContiguousStepHandler:
                     raise ExecutionError(
                         "physical KV length must match the scheduled computed-token count"
                     )
+                input_ids = torch.tensor(
+                    [request.input_token_ids],
+                    dtype=torch.long,
+                    device=self._device,
+                )
+                positions = torch.arange(
+                    cached_tokens,
+                    cached_tokens + len(request.input_token_ids),
+                    dtype=torch.long,
+                    device=self._device,
+                ).unsqueeze(0)
+                # 连续与分页路径都向模型提供同一个 AttentionContext。
+                # 区别只留在上下文如何读取和写入物理 K/V。
+                attention = TorchDenseAttention(
+                    self._cache.model_spec,
+                    DenseAttentionMetadata(
+                        positions=positions,
+                        query_lengths=(len(request.input_token_ids),),
+                    ),
+                    self._cache.view(request.request_id),
+                )
                 output = _forward(
                     model,
                     ForwardBatch(
-                        input_ids=torch.tensor(
-                            [request.input_token_ids],
-                            dtype=torch.long,
-                            device=self._device,
-                        ),
-                        positions=torch.arange(
-                            cached_tokens,
-                            cached_tokens + len(request.input_token_ids),
-                            dtype=torch.long,
-                            device=self._device,
-                        ).unsqueeze(0),
-                        kv_cache=self._cache.view(request.request_id),
+                        input_ids=input_ids,
+                        positions=positions,
+                        attention=attention,
                     ),
                 )
-                updates = output.kv_cache_updates
-                if updates is None:
-                    raise ExecutionError("model did not return KV cache updates")
+                updates = attention.cache_updates
                 if updates.num_tokens != len(request.input_token_ids):
-                    raise ExecutionError("model returned the wrong number of KV cache updates")
+                    raise ExecutionError("attention returned the wrong number of KV cache updates")
                 self._cache.append(request.request_id, updates)
             except KVCacheError as exc:
                 raise ExecutionError(str(exc)) from exc

@@ -16,8 +16,6 @@ from light_vllm.modeling.attention.interfaces import (
 )
 from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
-    KVCacheState,
-    LayerKeyValues,
     ModelOutput,
     ModelSpec,
 )
@@ -183,14 +181,6 @@ def _apply_rotary(
     )
 
 
-def _repeat_kv(values: Tensor, repeats: int) -> Tensor:
-    """让多个 query head 共享同一个 KV head。"""
-
-    if repeats == 1:
-        return values
-    return values.repeat_interleave(repeats, dim=2)
-
-
 class Qwen2Attention(nn.Module):
     """生成 Q/K/V，并把实际 attention 交给当前执行后端。"""
 
@@ -228,8 +218,7 @@ class Qwen2Attention(nn.Module):
         batch: ForwardBatch,
         cosines: Tensor,
         sines: Tensor,
-        past: LayerKeyValues | None,
-    ) -> tuple[Tensor, LayerKeyValues]:
+    ) -> Tensor:
         batch_size, query_width, _ = hidden_states.shape
         queries = self.q_proj(hidden_states).view(
             batch_size,
@@ -246,73 +235,19 @@ class Qwen2Attention(nn.Module):
         values = self.v_proj(hidden_states).view_as(keys)
         queries, keys = _apply_rotary(queries, keys, cosines, sines)
 
-        if batch.attention is not None:
-            # 模型负责 Q/K/V；缓存布局、softmax 和 kernel 由执行端选择。
-            attended = batch.attention.forward(
-                self._layer_id,
-                queries,
-                keys,
-                values,
-                scale=self._scale,
-            )
-        else:
-            # reference 和连续 KV 路径保留一份直白的 dense attention 基线。
-            attended = self._dense_attention(queries, keys, values, batch, past)
-        output = self.o_proj(attended.reshape(batch_size, query_width, -1))
-        return output, LayerKeyValues(keys=keys, values=values)
-
-    def _dense_attention(
-        self,
-        queries: Tensor,
-        new_keys: Tensor,
-        new_values: Tensor,
-        batch: ForwardBatch,
-        past: LayerKeyValues | None,
-    ) -> Tensor:
-        """连续 KV 和正确性对照使用的直白 attention 实现。"""
-
-        batch_size, query_width = queries.shape[:2]
-        past_length = 0
-        keys = new_keys
-        values = new_values
-        if past is not None:
-            past_length = past.keys.shape[1]
-            keys = torch.cat((past.keys, new_keys), dim=1)
-            values = torch.cat((past.values, new_values), dim=1)
-
-        repeats = self._num_query_heads // self._num_kv_heads
-        keys = _repeat_kv(keys, repeats)
-        values = _repeat_kv(values, repeats)
-        scores = torch.einsum("bqhd,bkhd->bhqk", queries, keys) * self._scale
-
-        positions = batch.positions
-        assert positions is not None
-        past_positions = torch.arange(
-            past_length,
-            dtype=torch.long,
-            device=positions.device,
-        ).expand(batch_size, -1)
-        key_positions = torch.cat((past_positions, positions), dim=1)
-        query_offsets = torch.arange(query_width, device=positions.device)
-        lengths = torch.tensor(batch.sequence_lengths, device=positions.device).unsqueeze(1)
-        valid_new_keys = query_offsets.unsqueeze(0) < lengths
-        valid_keys = torch.cat(
-            (
-                torch.ones(
-                    (batch_size, past_length),
-                    dtype=torch.bool,
-                    device=positions.device,
-                ),
-                valid_new_keys,
-            ),
-            dim=1,
+        attention = batch.attention
+        if attention is None:
+            raise ValueError("Qwen2 requires an attention context")
+        # 模型只描述 Q/K/V；缓存布局、softmax 和 kernel 由执行端选择。
+        attended = attention.forward(
+            self._layer_id,
+            queries,
+            keys,
+            values,
+            scale=self._scale,
         )
-        # padding token 可以经过其他层，但不能成为任何有效 query 的历史。
-        causal = key_positions.unsqueeze(1) <= positions.unsqueeze(2)
-        mask = causal & valid_keys.unsqueeze(1)
-        scores = scores.masked_fill(~mask.unsqueeze(1), torch.finfo(scores.dtype).min)
-        probabilities = torch.softmax(scores.float(), dim=-1).to(queries.dtype)
-        return torch.einsum("bhqk,bkhd->bqhd", probabilities, values)
+        output = self.o_proj(attended.reshape(batch_size, query_width, -1))
+        return output
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -331,20 +266,18 @@ class Qwen2DecoderLayer(nn.Module):
         batch: ForwardBatch,
         cosines: Tensor,
         sines: Tensor,
-        past: LayerKeyValues | None,
-    ) -> tuple[Tensor, LayerKeyValues]:
+    ) -> Tensor:
         residual = hidden_states
-        hidden_states, update = self.self_attn(
+        hidden_states = self.self_attn(
             self.input_layernorm(hidden_states),
             batch,
             cosines,
             sines,
-            past,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
-        return residual + hidden_states, update
+        return residual + hidden_states
 
 
 class Qwen2Model(nn.Module):
@@ -410,12 +343,10 @@ class Qwen2ForCausalLM(nn.Module):
         return frozenset()
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
-        """执行所有 Decoder 层，返回 logits 和连续缓存新增的 K/V。"""
+        """执行所有 Decoder 层；attention 计算统一交给当前上下文。"""
 
-        if batch.attention is not None and batch.kv_cache is not None:
-            raise ValueError("Qwen2 cannot use contiguous and paged KV cache together")
-        if batch.kv_cache is not None and len(batch.kv_cache.layers) != len(self.model.layers):
-            raise ValueError("Qwen2 KV cache layer count does not match the model")
+        if batch.attention is None:
+            raise ValueError("Qwen2 requires an attention context")
 
         positions = batch.positions
         assert positions is not None
@@ -423,24 +354,15 @@ class Qwen2ForCausalLM(nn.Module):
             raise ValueError("Qwen2 position exceeds max_position_embeddings")
         hidden_states = self.model.embed_tokens(batch.input_ids)
         cosines, sines = self._rotary_embeddings(positions, hidden_states.dtype)
-        updates: list[LayerKeyValues] = []
-        # 每层读取自己的历史 K/V，并产生本轮要追加的 K/V。
-        for layer_index, layer in enumerate(self.model.layers):
-            past = None if batch.kv_cache is None else batch.kv_cache.layers[layer_index]
-            hidden_states, update = layer(
+        for layer in self.model.layers:
+            hidden_states = layer(
                 hidden_states,
                 batch,
                 cosines,
                 sines,
-                past,
             )
-            updates.append(update)
         logits = self.lm_head(self.model.norm(hidden_states))
-        cache_updates = None
-        if batch.kv_cache is not None:
-            # 连续缓存只追加本轮 K/V；分页上下文已经直接写入物理页。
-            cache_updates = KVCacheState(layers=tuple(updates))
-        return ModelOutput(logits=logits, kv_cache_updates=cache_updates)
+        return ModelOutput(logits=logits)
 
     def _rotary_embeddings(
         self,
