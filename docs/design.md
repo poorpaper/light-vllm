@@ -1,4 +1,4 @@
-# light-vllm 架构设计（v0.10）
+# light-vllm 架构设计（v0.11）
 
 这份文档记录当前已经落地的设计。更细的职责说明见 [architecture.md](architecture.md)。
 
@@ -72,7 +72,7 @@ flowchart TB
     Step --> Contiguous["ContiguousStepHandler<br/>request-level tensors"]
     Step --> Paged["PagedStepHandler<br/>global physical pages"]
     Contiguous --> Dense["TorchDenseAttention<br/>contiguous correctness"]
-    Paged --> Attention["PagedAttentionBackend<br/>Torch correctness"]
+    Paged --> Attention["PagedAttentionBackend<br/>Torch / Triton"]
     Decode --> Sampler["GreedySampler"]
     Reference --> TokenExecutor["LocalTokenExecutor"]
     TokenExecutor --> Sampler
@@ -95,8 +95,8 @@ flowchart TB
 Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者表示一个设备 rank 内的模型版本和请求生命周期；
 未来多进程 Executor 可以管理多个 Worker。
 `TorchDenseAttention` 是 reference 与连续缓存共用的 dense correctness backend；`TorchPagedAttention` 直接读取
-物理页。两者都实现模型看到的 `AttentionContext`，生产级 CUDA/Triton kernel 继续实现
-`PagedAttentionBackend → AttentionContext` 契约。
+物理页。可选 `TritonPagedAttention` 复用同一批次事实和物理页池，在一个 kernel 中完成 QK、在线 softmax 与
+PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改变模型、Worker 或 Scheduler 契约。
 
 ## 4. 稳定契约
 
@@ -196,6 +196,11 @@ query 与显式 lookahead reservation，不携带未预留尾页。可选 prefix
 哈希链保留父摘要和本页精确 token，零引用页进入 LRU。跨请求只允许在相同逻辑位置共享双方都声明为只读的前缀页，
 query 与未填满尾页始终独占。命中时至少留一个 token 重新计算 logits；prompt 恰好整页时会重算最后一整页。
 
+Triton backend 在 context 创建时把 block table、已计算长度和 query 长度一次转成 GPU tensor，供所有模型层复用。
+本轮 K/V 先写入物理页，再在同一 CUDA stream 启动 fused attention；两步不放进同一个 grid，避免 prefill 的某个
+query program 读取到另一个 program 尚未写完的 K/V。首版一个 program 负责一个 query token 的一个 query head，
+直接按逻辑位置查页表，并用 FP32 累计在线 softmax。这个结构便于检查，长上下文的分段并行与归并留给后续优化。
+
 连续 Step Handler 为每个请求创建 `TorchDenseAttention`。它读取请求级连续历史，在模型逐层调用时完成 dense
 attention 并暂存本轮 K/V；只有模型 forward 和输出校验全部成功，Handler 才把所有层一次性追加到
 `ContiguousKVCache`。因此模型不返回 K/V，连续路径仍保持跨层原子更新。
@@ -267,6 +272,7 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 | Dense Attention | `src/light_vllm/runtime/execution/dense_attention.py` |
 | 物理分页 KV | `src/light_vllm/runtime/execution/paged_cache.py` |
 | Paged Attention | `src/light_vllm/runtime/execution/paged_attention.py` |
+| Triton Paged Attention | `src/light_vllm/runtime/execution/triton_paged_attention.py` |
 | Engine Core | `src/light_vllm/runtime/engine/core.py` |
 | admission | `src/light_vllm/runtime/engine/admission.py` |
 | EngineClient | `src/light_vllm/runtime/engine/interfaces.py` |
@@ -285,10 +291,11 @@ flowchart LR
     Paged --> Capacity["capacity discovery + admission<br/>完成"]
     Capacity --> Prefix["Prefix cache<br/>完成"]
     Prefix --> Spec["Speculative decoding<br/>完成"]
-    Spec --> Kernel["CUDA/Triton kernel<br/>下一步"]
+    Spec --> Kernel["Triton fused attention<br/>首版完成，GPU 验收待办"]
 ```
 
-当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。
+当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton 节点只表示实现和装配完成，
+当前开发环境没有 CUDA/Triton，因此 GPU 编译、数值与性能验收不包含在这一状态中。
 
 ## 12. 验证要求
 
@@ -310,4 +317,6 @@ prefix 命中/LRU/epoch、投机全接受/部分接受/首个拒绝/短候选、
 [vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/latest/design/prefix_caching/)，简单候选策略参考
 [vLLM N-Gram Speculation](https://docs.vllm.ai/en/latest/features/speculative_decoding/n_gram/) 和
 [SGLang Speculative Decoding](https://github.com/sgl-project/sglang/blob/main/docs_new/docs/advanced_features/speculative_decoding.mdx)。
-本项目保留这些成熟边界，但以可读的 PyTorch correctness 实现先固定行为，再替换优化 kernel。
+Triton kernel 的在线 softmax 组织参考
+[官方 fused attention 教程](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)。本项目保留
+这些成熟边界，但优先选择容易检查和扩展的实现，再逐步增加并行优化。

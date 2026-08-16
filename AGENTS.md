@@ -36,17 +36,17 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   两者替换同一 Handler，不新增模式专用 Worker。
 - 固定页数或 CUDA 空闲显存策略在模型加载后解析成同一个分页容量对象，同时供逻辑 manager 与物理页池使用。
 - 可缓存模型只通过 `AttentionContext` 执行 attention，不内置 dense/paged fallback。reference 与连续缓存使用
-  `TorchDenseAttention`；分页缓存使用逐页读取 K/V、在线 softmax 的 `TorchPagedAttention`，
-  `PagedAttentionBackend` 是 CUDA/Triton 的替换边界。
+  `TorchDenseAttention`；分页缓存默认使用逐页读取 K/V 的 `TorchPagedAttention`，也可装配直接读取 block table、
+  融合 QK/在线 softmax/PV 的 `TritonPagedAttention`。
 - `RequestOutput` 分开表达本轮输入计算量、零到多个确认输出，以及已经写入 KV 的输出前缀。
 - `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
 - FastAPI adapter 只依赖 `EngineClient`，不知道 scheduler、runner、torch 或 KV cache。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
-当前尚未实现生产级 CUDA/Triton Paged Attention kernel、preemption、分布式执行、
-tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorch Paged Attention 是物理分页正确性
-基线，不代表生产吞吐；当前也不宣称支持大多数 Transformers 模型。
+当前尚未实现 preemption、分布式执行、tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。
+PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend 尚未完成 GPU 数值、长上下文性能与跨显卡
+验收，均不代表生产吞吐。当前也不宣称支持大多数 Transformers 模型。
 
 ## 代码地图
 
@@ -71,6 +71,7 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 | `src/light_vllm/runtime/execution/dense_attention.py` | reference/连续缓存共用的 dense attention 上下文 |
 | `src/light_vllm/runtime/execution/paged_cache.py` | 分页 Step Handler 拥有的物理 K/V tensor |
 | `src/light_vllm/runtime/execution/paged_attention.py` | Paged metadata 与 PyTorch correctness backend |
+| `src/light_vllm/runtime/execution/triton_paged_attention.py` | 可选 Triton fused Paged Attention backend |
 | `src/light_vllm/runtime/engine/admission.py` | 确定性请求容量准入 |
 | `src/light_vllm/runtime/engine/core.py` | 请求状态、迭代循环、事件与安全取消 |
 | `src/light_vllm/runtime/engine/in_process.py` | 同步 reference 到异步 Engine 的适配器 |
@@ -170,5 +171,5 @@ git diff --check
 
 ## 下一步
 
-下一阶段在现有 `PagedAttentionBackend` 边界实现生产级 CUDA/Triton kernel；之后继续实现 Scheduler-owned
-preemption。两项能力都不得改变 EngineClient、generation 事件或 HTTP adapter。
+下一阶段先在 CUDA 环境完成 Triton backend 的数值验收，并针对长上下文改成分段计算与归并；之后继续实现
+Scheduler-owned preemption。两项能力都不得改变 EngineClient、generation 事件或 HTTP adapter。

@@ -73,6 +73,7 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `TorchDenseAttention` | 读取连续历史、dense causal attention、暂存本轮 K/V | 模型结构、物理分页 |
 | `PagedAttentionBackend` | 为页池和批次事实创建 `AttentionContext` | 模型分发、调度 |
 | `TorchPagedAttention` | 原位写 K/V、逐页 causal attention、MHA/GQA correctness | 调度、生产级 kernel 优化 |
+| `TritonPagedAttention` | 直接查页表并融合 QK、在线 softmax、PV | 调度、模型结构 |
 | `Sampler` | 从 logits 选择 token | 模型 forward、调度、停止条件 |
 | `ModelRunner` | 当前模型生命周期和固定 `ModelSession` | 请求调度、具体模型/loader 条件分发 |
 | `EngineClient` | serving 到 engine 的异步端口 | HTTP schema、具体运行拓扑 |
@@ -152,7 +153,7 @@ flowchart TB
     Step --> Contiguous["ContiguousKVCache<br/>request-level tensors"]
     Step --> Paged["PagedKVCache<br/>global physical pages"]
     Contiguous --> Dense["AttentionContext<br/>TorchDenseAttention"]
-    Paged --> PagedAttention["AttentionContext<br/>TorchPagedAttention"]
+    Paged --> PagedAttention["AttentionContext<br/>Torch / Triton PagedAttention"]
 ```
 
 当前有两种逻辑 manager：`UnboundedKVCacheManager` 为连续缓存提供无 block、无容量限制的实验基线；
@@ -185,6 +186,8 @@ blocks    → PagedKVCacheManager     → PagedStepHandler
 分页 Step Handler 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
 token 通过 block table 映射到物理 slot；`TorchPagedAttention` 先原位写入本轮 K/V，再用在线 softmax 逐页读取
 有效前缀，不物化完整历史。它是可读性优先的 CPU/PyTorch correctness backend，不是生产级性能 kernel。
+可选 `TritonPagedAttention` 复用同一页池和 metadata：先完成 K/V 写入，再在同一 CUDA stream 启动 fused
+attention。batch metadata 只在 context 创建时转一次 GPU tensor，不在每个模型层重复创建。
 
 非分页 Step Handler 使用 `block_ids=None` 和请求级连续 tensor，不得伪造 block ID。两条路径共享同一个
 `ExecutionBatch → ExecutionOutput` 和模型 forward 契约，因此可以直接做结果对照。
@@ -205,14 +208,14 @@ reference 与连续 Step Handler 创建 `TorchDenseAttention`；分页 Step Hand
 
 - 模型不知道 block size、page layout 或具体 kernel；
 - Worker 不按具体模型 architecture 分支；
-- 后续 CUDA/Triton backend 实现同一个 factory 边界，不修改 Engine、Scheduler 或模型协议；
+- PyTorch 与 Triton backend 实现同一个 factory 边界，不修改 Engine、Scheduler 或模型协议；
 - 分页 Step Handler 在模型加载成功后初始化物理页池，模型 generation 变化时由 Worker 安全地重建。
 
 当前原生 Qwen2 路径也遵守这条边界：模型层负责 embedding、RMSNorm、RoPE、Q/K/V 投影、输出投影和 MLP；
 `AttentionContext` 才负责读取历史 K/V、因果 softmax 和 value 聚合。HF 模型里的 FlashAttention 也是 attention
 backend，不是 Qwen 权重本身的一部分；普通 HF FlashAttention 无法直接理解本项目的 block table 和物理页池。
 CPU reference/连续 KV 路径通过执行层接入可读的 `TorchDenseAttention`，分页路径让同一个模型接入
-`TorchPagedAttention`。模型在两种布局下没有条件分支，未来 CUDA/Triton 实现只替换 backend。
+`TorchPagedAttention` 或 `TritonPagedAttention`。模型在两种布局和两个分页 backend 下都没有条件分支。
 
 ## Qwen 与 checkpoint 来源
 
@@ -289,7 +292,7 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 
 ## 后续演进顺序
 
-1. 在现有 `PagedAttentionBackend` 边界实现 CUDA/Triton kernel。
+1. 在 CUDA 环境完成 Triton 数值验收，并增加长上下文分段并行与归并。
 2. Scheduler-owned preemption。
 3. 普通随机 Sampler。
 4. 进程/分布式 Worker 与生产级 serving。
