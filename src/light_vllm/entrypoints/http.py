@@ -22,7 +22,10 @@ from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
-from light_vllm.runtime.execution.paged_attention import TorchPagedAttentionBackend
+from light_vllm.runtime.execution.paged_attention import (
+    PagedAttentionBackend,
+    TorchPagedAttentionBackend,
+)
 from light_vllm.runtime.execution.paged_cache import (
     CudaMemoryKVCachePlanner,
     PagedKVCacheConfig,
@@ -60,6 +63,7 @@ _DTYPES = {
 }
 RuntimeMode = Literal["reference", "engine"]
 KVReservationMode = Literal["blocks", "unbounded"]
+PagedAttentionBackendName = Literal["torch", "triton"]
 
 
 def _create_paged_cache_planner(
@@ -87,11 +91,31 @@ def _create_paged_cache_planner(
     raise ValueError("CPU paged execution requires an explicit num_kv_blocks")
 
 
+def _create_paged_attention_backend(
+    name: PagedAttentionBackendName,
+    spec: ModelSpec,
+) -> PagedAttentionBackend:
+    if name == "torch":
+        return TorchPagedAttentionBackend()
+    if name != "triton":
+        raise ValueError(f"unsupported paged attention backend: {name}")
+    if torch.device(spec.device).type != "cuda":
+        raise ValueError("Triton paged attention requires a CUDA device")
+
+    # Triton 是可选依赖；默认 PyTorch 路径不会导入它。
+    from light_vllm.runtime.execution.triton_paged_attention import (
+        TritonPagedAttentionBackend,
+    )
+
+    return TritonPagedAttentionBackend()
+
+
 def create_serving_app(
     spec: ModelSpec,
     *,
     runtime: RuntimeMode = "reference",
     kv_reservation: KVReservationMode = "blocks",
+    paged_attention_backend: PagedAttentionBackendName = "torch",
     max_num_sequences: int = 8,
     max_num_scheduled_tokens: int = 256,
     num_kv_blocks: int | None = None,
@@ -119,9 +143,13 @@ def create_serving_app(
     sampler = GreedySampler()
     if type(num_speculative_tokens) is not int or num_speculative_tokens < 0:
         raise ValueError("num_speculative_tokens must be a non-negative integer")
+    if paged_attention_backend not in ("torch", "triton"):
+        raise ValueError(f"unsupported paged attention backend: {paged_attention_backend}")
     if runtime == "reference":
         if num_speculative_tokens:
             raise ValueError("speculative decoding requires the engine runtime")
+        if paged_attention_backend != "torch":
+            raise ValueError("paged attention backend selection requires the engine runtime")
         # 保留原始单请求基线，继续通过轻量 sync-to-async bridge 对外服务。
         executor = LocalTokenExecutor(runner, sampler, device=spec.device)
         service = ReferenceGenerationService(executor)
@@ -144,11 +172,16 @@ def create_serving_app(
             step_factory = partial(
                 PagedStepHandler,
                 cache_planner=cache_planner,
-                attention_backend=TorchPagedAttentionBackend(),
+                attention_backend=_create_paged_attention_backend(
+                    paged_attention_backend,
+                    spec,
+                ),
             )
         elif kv_reservation == "unbounded":
             if enable_prefix_caching:
                 raise ValueError("prefix caching requires paged KV reservation")
+            if paged_attention_backend != "torch":
+                raise ValueError("Triton paged attention requires paged KV reservation")
             # 连续缓存也直接读取模型声明的 KV 形状，这里只指定设备和数据类型。
             logical_cache = UnboundedKVCacheManager()
             step_factory = partial(
@@ -246,6 +279,12 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-block-size", type=int, default=16)
     parser.add_argument("--kv-cache-memory-fraction", type=float, default=0.8)
     parser.add_argument(
+        "--paged-attention-backend",
+        choices=("torch", "triton"),
+        default="torch",
+        help="paged attention implementation used by the engine runtime",
+    )
+    parser.add_argument(
         "--enable-prefix-caching",
         action="store_true",
         help="reuse complete prompt KV blocks across requests",
@@ -278,6 +317,7 @@ def main() -> None:
             spec,
             runtime=args.runtime,
             kv_reservation=args.kv_reservation,
+            paged_attention_backend=args.paged_attention_backend,
             max_num_sequences=args.max_num_sequences,
             max_num_scheduled_tokens=args.max_num_scheduled_tokens,
             num_kv_blocks=args.num_kv_blocks,
