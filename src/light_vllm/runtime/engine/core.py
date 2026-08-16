@@ -195,6 +195,7 @@ class EngineCore:
                 self._scheduler.add(
                     request_id,
                     token_ids=request.input_ids,
+                    max_num_tokens=capacity,
                     cache_epoch=self._executor.capabilities.kv_cache_epoch,
                 )
             except Exception:
@@ -272,6 +273,7 @@ class EngineCore:
                 ExecutionRequest(
                     request_id=item.request_id,
                     input_token_ids=input_token_ids,
+                    context_token_ids=tuple(state.token_ids),
                     num_computed_tokens=item.num_computed_tokens,
                     num_lookahead_tokens=item.num_lookahead_tokens,
                     max_output_tokens=item.max_output_tokens,

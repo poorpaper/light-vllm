@@ -105,6 +105,7 @@ class Scheduler(Protocol):
         request_id: str,
         *,
         token_ids: tuple[int, ...],
+        max_num_tokens: int,
         cache_epoch: int | None = None,
     ) -> None: ...
 

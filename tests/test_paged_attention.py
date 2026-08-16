@@ -295,6 +295,24 @@ def test_paged_attention_rejects_readonly_blocks_beyond_the_computed_prefix() ->
         metadata.validate_block_tables(num_blocks=2, block_size=2)
 
 
+def test_paged_attention_keeps_unused_lookahead_as_an_explicit_reservation() -> None:
+    metadata = PagedAttentionMetadata(
+        block_tables=((0, 1, 2),),
+        num_computed_tokens=(0,),
+        query_lengths=(1,),
+        num_lookahead_tokens=(2,),
+    )
+
+    metadata.validate_block_tables(num_blocks=3, block_size=1)
+    mapping = metadata.slot_mapping(
+        block_size=1,
+        query_width=1,
+        device=torch.device("cpu"),
+    )
+
+    assert mapping.tolist() == [[0]]
+
+
 @pytest.mark.parametrize(
     ("block_tables", "num_computed_tokens"),
     [

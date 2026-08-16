@@ -168,12 +168,16 @@ def _execution_request(
     num_computed_tokens: int,
     block_ids: tuple[int, ...] | None,
     *,
+    context_token_ids: tuple[int, ...] | None = None,
     num_lookahead_tokens: int = 0,
     max_output_tokens: int = 1,
 ) -> ExecutionRequest:
+    if context_token_ids is None:
+        context_token_ids = (0,) * num_computed_tokens + input_token_ids
     return ExecutionRequest(
         request_id=request_id,
         input_token_ids=input_token_ids,
+        context_token_ids=context_token_ids,
         num_computed_tokens=num_computed_tokens,
         num_lookahead_tokens=num_lookahead_tokens,
         max_output_tokens=max_output_tokens,
@@ -266,6 +270,7 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                 ExecutionRequest(
                     request_id="request",
                     input_token_ids=(1, 2),
+                    context_token_ids=(1, 2),
                     num_computed_tokens=0,
                     num_lookahead_tokens=0,
                     max_output_tokens=0,
@@ -280,6 +285,7 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                 ExecutionRequest(
                     request_id="request",
                     input_token_ids=(3,),
+                    context_token_ids=(1, 2, 3),
                     num_computed_tokens=2,
                     num_lookahead_tokens=0,
                     max_output_tokens=1,

@@ -20,18 +20,25 @@ class PagedAttentionMetadata:
     block_tables: tuple[tuple[int, ...], ...]
     num_computed_tokens: tuple[int, ...]
     query_lengths: tuple[int, ...]
+    # Scheduler 预留但本次 forward 没有实际 token 的位置数。
+    num_lookahead_tokens: tuple[int, ...] = ()
     num_readonly_prefix_blocks: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         block_tables = tuple(tuple(table) for table in self.block_tables)
         computed = tuple(self.num_computed_tokens)
         query_lengths = tuple(self.query_lengths)
+        lookahead = tuple(self.num_lookahead_tokens)
         readonly = tuple(self.num_readonly_prefix_blocks)
         num_requests = len(block_tables)
         if num_requests == 0:
             raise ValueError("paged attention metadata must contain at least one request")
         if len(computed) != num_requests or len(query_lengths) != num_requests:
             raise ValueError("paged attention metadata fields must have the same batch size")
+        if not lookahead:
+            lookahead = (0,) * num_requests
+        if len(lookahead) != num_requests:
+            raise ValueError("lookahead counts must have the same batch size")
         if not readonly:
             readonly = (0,) * num_requests
         if len(readonly) != num_requests:
@@ -40,6 +47,8 @@ class PagedAttentionMetadata:
             raise ValueError("computed-token counts must be non-negative integers")
         if any(type(value) is not int or value <= 0 for value in query_lengths):
             raise ValueError("query lengths must be positive integers")
+        if any(type(value) is not int or value < 0 for value in lookahead):
+            raise ValueError("lookahead counts must be non-negative integers")
         if any(type(value) is not int or value < 0 for value in readonly):
             raise ValueError("readonly prefix counts must be non-negative integers")
         if any(
@@ -51,6 +60,7 @@ class PagedAttentionMetadata:
         object.__setattr__(self, "block_tables", block_tables)
         object.__setattr__(self, "num_computed_tokens", computed)
         object.__setattr__(self, "query_lengths", query_lengths)
+        object.__setattr__(self, "num_lookahead_tokens", lookahead)
         object.__setattr__(self, "num_readonly_prefix_blocks", readonly)
 
     @property
@@ -72,17 +82,18 @@ class PagedAttentionMetadata:
             dtype=torch.long,
             device=device,
         )
-        for row, (table, computed, query_length) in enumerate(
+        for row, (table, computed, query_length, lookahead) in enumerate(
             zip(
                 self.block_tables,
                 self.num_computed_tokens,
                 self.query_lengths,
+                self.num_lookahead_tokens,
                 strict=True,
             )
         ):
             if query_length > query_width:
                 raise KVCacheError("query length exceeds the padded query width")
-            total_tokens = computed + query_length
+            total_tokens = computed + query_length + lookahead
             required_blocks = (total_tokens + block_size - 1) // block_size
             if len(table) < required_blocks:
                 raise KVCacheError("block table does not cover all scheduled tokens")
@@ -103,14 +114,15 @@ class PagedAttentionMetadata:
         """校验本轮可能读取的完整 block table 都落在物理页池内。"""
 
         block_owners: dict[int, tuple[int, bool]] = {}
-        for table, computed, query_length, num_readonly in zip(
+        for table, computed, query_length, lookahead, num_readonly in zip(
             self.block_tables,
             self.num_computed_tokens,
             self.query_lengths,
+            self.num_lookahead_tokens,
             self.num_readonly_prefix_blocks,
             strict=True,
         ):
-            required_blocks = (computed + query_length + block_size - 1) // block_size
+            required_blocks = (computed + query_length + lookahead + block_size - 1) // block_size
             if len(table) < required_blocks:
                 raise KVCacheError("block table does not cover all scheduled tokens")
             if len(table) > required_blocks:

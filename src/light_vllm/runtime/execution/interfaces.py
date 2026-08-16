@@ -38,6 +38,8 @@ class ExecutionRequest:
 
     request_id: str
     input_token_ids: tuple[int, ...]
+    # 从 prompt 开始到当前已知末尾的完整 token；proposer 只读，不得在执行中修改。
+    context_token_ids: tuple[int, ...]
     num_computed_tokens: int
     num_lookahead_tokens: int
     max_output_tokens: int
@@ -47,12 +49,17 @@ class ExecutionRequest:
 
     def __post_init__(self) -> None:
         input_token_ids = tuple(self.input_token_ids)
+        context_token_ids = tuple(self.context_token_ids)
         if not self.request_id:
             raise ValueError("request_id must not be empty")
         if not input_token_ids:
             raise ValueError("input_token_ids must not be empty")
         if any(type(token_id) is not int or token_id < 0 for token_id in input_token_ids):
             raise ValueError("input_token_ids must contain non-negative integers")
+        if not context_token_ids or any(
+            type(token_id) is not int or token_id < 0 for token_id in context_token_ids
+        ):
+            raise ValueError("context_token_ids must contain non-negative integers")
         if type(self.num_computed_tokens) is not int or self.num_computed_tokens < 0:
             raise ValueError("num_computed_tokens must be a non-negative integer")
         if type(self.num_lookahead_tokens) is not int or self.num_lookahead_tokens < 0:
@@ -61,7 +68,11 @@ class ExecutionRequest:
             raise ValueError("max_output_tokens must be a non-negative integer")
         if type(self.num_readonly_prefix_blocks) is not int or self.num_readonly_prefix_blocks < 0:
             raise ValueError("num_readonly_prefix_blocks must be a non-negative integer")
+        input_end = self.num_computed_tokens + len(input_token_ids)
+        if tuple(context_token_ids[self.num_computed_tokens : input_end]) != input_token_ids:
+            raise ValueError("input_token_ids must be the scheduled slice of context_token_ids")
         object.__setattr__(self, "input_token_ids", input_token_ids)
+        object.__setattr__(self, "context_token_ids", context_token_ids)
         if self.block_ids is None and self.num_readonly_prefix_blocks:
             raise ValueError("readonly prefix blocks require a block table")
         if self.block_ids is not None:

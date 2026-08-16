@@ -226,6 +226,7 @@ class PagedStepHandler:
             block_tables=tuple(request.block_ids or () for request in batch.requests),
             num_computed_tokens=tuple(request.num_computed_tokens for request in batch.requests),
             query_lengths=tuple(query_lengths),
+            num_lookahead_tokens=tuple(request.num_lookahead_tokens for request in batch.requests),
             num_readonly_prefix_blocks=tuple(
                 request.num_readonly_prefix_blocks for request in batch.requests
             ),
