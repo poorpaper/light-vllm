@@ -28,6 +28,11 @@ from light_vllm.runtime.execution.paged_cache import (
     PagedKVCacheConfig,
     PagedKVCachePlanner,
 )
+from light_vllm.runtime.execution.speculative import (
+    GreedyAcceptanceSampler,
+    NGramSpeculativeDecodeHandler,
+    NGramTokenProposer,
+)
 from light_vllm.runtime.execution.worker import (
     ContiguousStepHandler,
     LocalModelWorker,
@@ -41,6 +46,7 @@ from light_vllm.runtime.kv_cache import (
     UnboundedKVCacheManager,
 )
 from light_vllm.runtime.sampling import GreedySampler
+from light_vllm.runtime.scheduler.interfaces import DecodingBudget
 from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 
 if TYPE_CHECKING:
@@ -92,6 +98,9 @@ def create_serving_app(
     kv_block_size: int = 16,
     kv_cache_memory_fraction: float = 0.8,
     enable_prefix_caching: bool = False,
+    num_speculative_tokens: int = 0,
+    speculative_ngram_min: int = 2,
+    speculative_ngram_max: int = 5,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -108,7 +117,11 @@ def create_serving_app(
     close_engine: Callable[[], Awaitable[None]] | None = None
     initialize_executor: Callable[[], None] | None = None
     sampler = GreedySampler()
+    if type(num_speculative_tokens) is not int or num_speculative_tokens < 0:
+        raise ValueError("num_speculative_tokens must be a non-negative integer")
     if runtime == "reference":
+        if num_speculative_tokens:
+            raise ValueError("speculative decoding requires the engine runtime")
         # 保留原始单请求基线，继续通过轻量 sync-to-async bridge 对外服务。
         executor = LocalTokenExecutor(runner, sampler, device=spec.device)
         service = ReferenceGenerationService(executor)
@@ -147,16 +160,33 @@ def create_serving_app(
             )
         else:
             raise ValueError(f"unsupported KV reservation mode: {kv_reservation}")
+        if num_speculative_tokens:
+            decode_handler = NGramSpeculativeDecodeHandler(
+                NGramTokenProposer(
+                    min_match_length=speculative_ngram_min,
+                    max_match_length=speculative_ngram_max,
+                ),
+                sampler,
+                GreedyAcceptanceSampler(),
+            )
+            decoding_budget = DecodingBudget(
+                num_lookahead_tokens=num_speculative_tokens,
+                max_output_tokens=num_speculative_tokens + 1,
+            )
+        else:
+            decode_handler = StandardDecodeHandler(sampler)
+            decoding_budget = None
         worker = LocalModelWorker(
             runner,
             step_factory,
-            StandardDecodeHandler(sampler),
+            decode_handler,
         )
         model_executor = LocalModelExecutor(worker)
         scheduler = TokenBudgetScheduler(
             logical_cache,
             max_num_sequences=max_num_sequences,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
+            decoding_budget=decoding_budget,
         )
         engine_core = EngineCore(model_executor, scheduler)
         engine = engine_core
@@ -220,6 +250,14 @@ def _create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="reuse complete prompt KV blocks across requests",
     )
+    parser.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=0,
+        help="maximum n-gram draft tokens per engine step",
+    )
+    parser.add_argument("--speculative-ngram-min", type=int, default=2)
+    parser.add_argument("--speculative-ngram-max", type=int, default=5)
     return parser
 
 
@@ -246,6 +284,9 @@ def main() -> None:
             kv_block_size=args.kv_block_size,
             kv_cache_memory_fraction=args.kv_cache_memory_fraction,
             enable_prefix_caching=args.enable_prefix_caching,
+            num_speculative_tokens=args.num_speculative_tokens,
+            speculative_ngram_min=args.speculative_ngram_min,
+            speculative_ngram_max=args.speculative_ngram_max,
         ),
         host=args.host,
         port=args.port,
