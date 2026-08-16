@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
-from light_vllm.runtime.execution.interfaces import AcceptanceResult
+from light_vllm.runtime.execution.interfaces import (
+    AcceptanceResult,
+    AcceptanceSampler,
+    ExecutionBatch,
+    ExecutionError,
+    ExecutionOutput,
+    ExecutionRequest,
+    ModelStepHandler,
+    RequestOutput,
+    TokenProposer,
+)
+from light_vllm.runtime.sampling import Sampler
 
 
 class NGramTokenProposer:
@@ -68,3 +79,111 @@ class GreedyAcceptanceSampler:
             output_token_ids=draft_token_ids + (target_token_ids[-1],),
             num_cached_output_tokens=len(draft_token_ids),
         )
+
+
+class NGramSpeculativeDecodeHandler:
+    """用历史候选扩展本轮输入，再由目标模型一次验证。"""
+
+    def __init__(
+        self,
+        proposer: TokenProposer,
+        target_sampler: Sampler,
+        acceptance_sampler: AcceptanceSampler,
+    ) -> None:
+        self._proposer = proposer
+        self._target_sampler = target_sampler
+        self._acceptance_sampler = acceptance_sampler
+
+    def execute(self, model, batch: ExecutionBatch, step: ModelStepHandler) -> ExecutionOutput:
+        drafts_by_request: list[tuple[int, ...]] = []
+        verification_requests: list[ExecutionRequest] = []
+        for request in batch.requests:
+            max_drafts = min(
+                request.num_lookahead_tokens,
+                max(0, request.max_output_tokens - 1),
+            )
+            drafts = (
+                tuple(
+                    self._proposer.propose(
+                        request.context_token_ids,
+                        max_tokens=max_drafts,
+                    )
+                )
+                if max_drafts
+                else ()
+            )
+            if len(drafts) > max_drafts:
+                raise ExecutionError("token proposer returned more tokens than requested")
+            if any(type(token_id) is not int or token_id < 0 for token_id in drafts):
+                raise ExecutionError("token proposer returned an invalid token ID")
+            drafts_by_request.append(drafts)
+            verification_requests.append(
+                ExecutionRequest(
+                    request_id=request.request_id,
+                    input_token_ids=request.input_token_ids + drafts,
+                    context_token_ids=request.context_token_ids + drafts,
+                    num_computed_tokens=request.num_computed_tokens,
+                    # 候选不足时保留剩余预留事实，分页表仍能做严格校验。
+                    num_lookahead_tokens=request.num_lookahead_tokens - len(drafts),
+                    max_output_tokens=request.max_output_tokens,
+                    block_ids=request.block_ids,
+                    num_readonly_prefix_blocks=request.num_readonly_prefix_blocks,
+                )
+            )
+
+        logits_by_request = step.forward(
+            model,
+            ExecutionBatch(requests=tuple(verification_requests)),
+        )
+        if len(logits_by_request) != len(batch.requests):
+            raise ExecutionError("model step must return one logits tensor per request")
+
+        results: list[RequestOutput] = []
+        for request, verification, drafts, logits in zip(
+            batch.requests,
+            verification_requests,
+            drafts_by_request,
+            logits_by_request,
+            strict=True,
+        ):
+            if logits.ndim != 2 or logits.shape[0] != len(verification.input_token_ids):
+                raise ExecutionError("model step logits must have shape [query, vocabulary]")
+            if not request.max_output_tokens:
+                results.append(
+                    RequestOutput(
+                        request_id=request.request_id,
+                        num_input_tokens_computed=len(request.input_token_ids),
+                    )
+                )
+                continue
+
+            # 原输入最后一行预测第一个候选；随后每行依次预测下一个 token。
+            first_target_row = len(request.input_token_ids) - 1
+            target_logits = logits[first_target_row : first_target_row + len(drafts) + 1]
+            target_token_ids = self._target_sampler.sample(target_logits)
+            if len(target_token_ids) != len(drafts) + 1:
+                raise ExecutionError("target sampler returned the wrong number of tokens")
+            accepted = self._acceptance_sampler.accept(drafts, target_token_ids)
+            if not isinstance(accepted, AcceptanceResult):
+                raise ExecutionError("acceptance sampler must return AcceptanceResult")
+            if len(accepted.output_token_ids) > request.max_output_tokens:
+                raise ExecutionError("acceptance sampler exceeded the output budget")
+            if accepted.num_cached_output_tokens > len(drafts):
+                raise ExecutionError("acceptance sampler cached unverified tokens")
+
+            # 目标 forward 已写入全部候选，只保留真正接受的候选前缀。
+            step.truncate(
+                request.request_id,
+                request.num_computed_tokens
+                + len(request.input_token_ids)
+                + accepted.num_cached_output_tokens,
+            )
+            results.append(
+                RequestOutput(
+                    request_id=request.request_id,
+                    num_input_tokens_computed=len(request.input_token_ids),
+                    output_token_ids=accepted.output_token_ids,
+                    num_cached_output_tokens=accepted.num_cached_output_tokens,
+                )
+            )
+        return ExecutionOutput(requests=tuple(results))

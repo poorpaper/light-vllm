@@ -32,6 +32,7 @@ from light_vllm.runtime.execution.paged_cache import (
 )
 from light_vllm.runtime.execution.speculative import (
     GreedyAcceptanceSampler,
+    NGramSpeculativeDecodeHandler,
     NGramTokenProposer,
 )
 from light_vllm.runtime.execution.worker import LocalModelWorker
@@ -55,6 +56,7 @@ __all__ = [
     "ModelExecutor",
     "ModelStepHandler",
     "ModelWorker",
+    "NGramSpeculativeDecodeHandler",
     "NGramTokenProposer",
     "PagedAttentionBackend",
     "PagedKVCacheConfig",
