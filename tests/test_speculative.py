@@ -34,6 +34,12 @@ def test_ngram_proposer_returns_empty_without_a_repeated_suffix() -> None:
     assert proposer.propose((1, 2, 3, 4), max_tokens=4) == ()
 
 
+def test_ngram_proposer_supports_overlapping_history_matches() -> None:
+    proposer = NGramTokenProposer(min_match_length=2, max_match_length=2)
+
+    assert proposer.propose((1, 2, 1, 2), max_tokens=2) == (1, 2)
+
+
 @pytest.mark.parametrize(
     ("drafts", "targets", "expected_outputs", "expected_cached"),
     [

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
-from light_vllm.modeling.models.interfaces import ForwardBatch
+from light_vllm.modeling.models.interfaces import ForwardBatch, ModelOutput
 from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionCausalLM,
     TinyAttentionConfig,
@@ -15,8 +15,11 @@ from light_vllm.modeling.models.tiny_attention import (
 from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
     DenseAttentionMetadata,
+    GreedyAcceptanceSampler,
     LocalModelExecutor,
     LocalModelWorker,
+    NGramSpeculativeDecodeHandler,
+    NGramTokenProposer,
     PagedKVCacheConfig,
     TorchDenseAttention,
     TorchPagedAttentionBackend,
@@ -39,7 +42,7 @@ from light_vllm.runtime.kv_cache import (
     UnboundedKVCacheManager,
 )
 from light_vllm.runtime.sampling import GreedySampler
-from light_vllm.runtime.scheduler import TokenBudgetScheduler
+from light_vllm.runtime.scheduler import DecodingBudget, TokenBudgetScheduler
 
 
 def _updates(*values: float) -> ContiguousKVCacheState:
@@ -458,6 +461,82 @@ def test_engine_reuses_a_shared_prompt_prefix_without_changing_generation() -> N
 
         assert result.generated_token_ids == (expected,)
         assert forwarder.query_lengths == [(5,), (1,)]
+        assert logical_cache.num_free_blocks == 8
+
+    asyncio.run(run())
+
+
+def test_engine_speculates_after_reusing_a_shared_prompt_prefix() -> None:
+    async def run() -> None:
+        class Forwarder:
+            generation = 1
+            max_model_tokens = None
+            kv_cache_spec = _model_kv_spec()
+
+            def __init__(self) -> None:
+                self.queries: list[tuple[int, ...]] = []
+
+            def forward(self, batch: ForwardBatch) -> ModelOutput:
+                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
+                self.queries.append(
+                    tuple(int(value) for value in batch.input_ids[0, :query_length])
+                )
+                next_ids = (batch.input_ids + 1) % 16
+                logits = torch.full((*batch.input_ids.shape, 16), -1.0)
+                logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
+                keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
+                assert batch.attention is not None
+                batch.attention.forward("attention", keys, keys, keys, scale=1.0)
+                return ModelOutput(logits=logits)
+
+        forwarder = Forwarder()
+
+        class SessionProvider:
+            generation = 1
+
+            def open_session(self):
+                return forwarder
+
+        cache_config = PagedKVCacheConfig(num_blocks=8, block_size=2)
+        logical_cache = PagedKVCacheManager(cache_config, enable_prefix_caching=True)
+        worker = LocalModelWorker(
+            SessionProvider(),
+            partial(
+                PagedStepHandler,
+                cache_planner=cache_config,
+                attention_backend=TorchPagedAttentionBackend(),
+            ),
+            NGramSpeculativeDecodeHandler(
+                NGramTokenProposer(min_match_length=2, max_match_length=4),
+                GreedySampler(),
+                GreedyAcceptanceSampler(),
+            ),
+        )
+        executor = LocalModelExecutor(worker)
+        executor.initialize()
+        engine = EngineCore(
+            executor,
+            TokenBudgetScheduler(
+                logical_cache,
+                max_num_sequences=1,
+                max_num_scheduled_tokens=8,
+                decoding_budget=DecodingBudget(
+                    num_lookahead_tokens=2,
+                    max_output_tokens=3,
+                ),
+            ),
+        )
+        prompt = (1, 2, 3, 4, 1, 2)
+
+        first = await engine.generate(GenerateRequest(input_ids=prompt, max_new_tokens=3))
+        second = await engine.generate(GenerateRequest(input_ids=prompt, max_new_tokens=3))
+        await engine.close()
+
+        assert first.generated_token_ids == second.generated_token_ids == (3, 4, 5)
+        assert forwarder.queries == [
+            (1, 2, 3, 4, 1, 2, 3, 4),
+            (1, 2, 3, 4),
+        ]
         assert logical_cache.num_free_blocks == 8
 
     asyncio.run(run())

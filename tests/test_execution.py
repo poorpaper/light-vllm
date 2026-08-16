@@ -313,7 +313,32 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
 
 
 @pytest.mark.parametrize("paged", [False, True])
-def test_engine_ngram_speculation_matches_target_generation(paged: bool) -> None:
+@pytest.mark.parametrize(
+    ("prompt", "expected_outputs", "expected_queries"),
+    [
+        (
+            (1, 2, 3, 4, 1, 2),
+            (3, 4, 5),
+            ((1, 2, 3, 4, 1, 2, 3, 4),),
+        ),
+        (
+            (1, 2, 3, 1, 2),
+            (3, 4, 5),
+            ((1, 2, 3, 1, 2, 3, 1), (4,)),
+        ),
+        (
+            (1, 3, 5),
+            (6, 7, 8),
+            ((1, 3, 5), (6,), (7,)),
+        ),
+    ],
+)
+def test_engine_ngram_speculation_matches_target_generation(
+    paged: bool,
+    prompt: tuple[int, ...],
+    expected_outputs: tuple[int, ...],
+    expected_queries: tuple[tuple[int, ...], ...],
+) -> None:
     async def run() -> None:
         class RecordingIncrementingForwarder(IncrementingForwarder):
             def __init__(self) -> None:
@@ -360,13 +385,11 @@ def test_engine_ngram_speculation_matches_target_generation(paged: bool) -> None
             ),
         )
 
-        result = await engine.generate(
-            GenerateRequest(input_ids=(1, 2, 3, 4, 1, 2), max_new_tokens=3)
-        )
+        result = await engine.generate(GenerateRequest(input_ids=prompt, max_new_tokens=3))
         await engine.close()
 
-        assert result.generated_token_ids == (3, 4, 5)
-        assert forwarder.queries == [(1, 2, 3, 4, 1, 2, 3, 4)]
+        assert result.generated_token_ids == expected_outputs
+        assert forwarder.queries == list(expected_queries)
 
     asyncio.run(run())
 
