@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 from threading import RLock
@@ -11,6 +13,8 @@ import torch
 from torch import Tensor
 
 from light_vllm.modeling.attention.interfaces import ModelKVCacheSpec
+
+_UNSET_CACHE_EPOCH = object()
 
 
 class KVCacheError(RuntimeError):
@@ -86,8 +90,8 @@ class KVCacheReservation:
     block_ids: tuple[int, ...] | None
     num_committed_tokens: int
     num_reserved_tokens: int
-    # 这些页来自 prefix cache，只能读，不能写入未计算的尾部。
-    num_shared_prefix_blocks: int = 0
+    # 这些页已经完整写入，只能读取；本轮写入必须从后面的页开始。
+    num_readonly_prefix_blocks: int = 0
 
 
 class KVCacheManager(Protocol):
@@ -144,9 +148,18 @@ class FixedKVBlockCapacity:
             raise ValueError("block_size must be a positive integer")
 
 
+@dataclass(frozen=True, slots=True)
+class _PrefixBlockKey:
+    parent_digest: bytes
+    token_ids: tuple[int, ...]
+    digest: bytes
+
+
 @dataclass(slots=True)
 class _LogicalAllocation:
     block_ids: list[int]
+    prompt_block_keys: tuple[_PrefixBlockKey, ...] = ()
+    num_readonly_prefix_blocks: int = 0
     num_committed_tokens: int = 0
     num_reserved_tokens: int = 0
 
@@ -226,10 +239,21 @@ class PagedKVCacheManager:
     分页执行 Handler 使用这里生成的 block table 访问实际物理页。
     """
 
-    def __init__(self, capacity: KVBlockCapacity) -> None:
+    def __init__(
+        self,
+        capacity: KVBlockCapacity,
+        *,
+        enable_prefix_caching: bool = False,
+    ) -> None:
         self._capacity = capacity
+        self._enable_prefix_caching = enable_prefix_caching
         self._num_blocks: int | None = None
         self._free_blocks: list[int] = []
+        self._block_ref_counts: list[int] = []
+        self._cached_blocks: dict[_PrefixBlockKey, int] = {}
+        self._block_keys: dict[int, _PrefixBlockKey] = {}
+        self._evictable_blocks: OrderedDict[int, None] = OrderedDict()
+        self._cache_epoch: object = _UNSET_CACHE_EPOCH
         self._allocations: dict[str, _LogicalAllocation] = {}
 
     @property
@@ -239,7 +263,7 @@ class PagedKVCacheManager:
     @property
     def num_free_blocks(self) -> int:
         self._sync_capacity()
-        return len(self._free_blocks)
+        return len(self._free_blocks) + len(self._evictable_blocks)
 
     def add_request(
         self,
@@ -253,10 +277,34 @@ class PagedKVCacheManager:
             raise ValueError("request_id must not be empty")
         if not token_ids:
             raise ValueError("token_ids must not be empty")
+        if any(type(token_id) is not int or token_id < 0 for token_id in token_ids):
+            raise ValueError("token_ids must contain non-negative integers")
         if request_id in self._allocations:
             raise KVCacheError(f"KV cache for request {request_id!r} already exists")
-        self._allocations[request_id] = _LogicalAllocation(block_ids=[])
-        return KVCacheMatch()
+        if self._enable_prefix_caching and (type(cache_epoch) is not int or cache_epoch < 0):
+            raise ValueError("prefix caching requires a non-negative cache epoch")
+        self._ensure_cache_epoch(cache_epoch)
+
+        prompt_block_keys = self._prompt_block_keys(token_ids, cache_epoch)
+        matched_blocks: list[int] = []
+        if self._enable_prefix_caching:
+            for block_key in prompt_block_keys:
+                block_id = self._cached_blocks.get(block_key)
+                if block_id is None:
+                    break
+                matched_blocks.append(block_id)
+
+        # 找齐完整前缀后再统一增加引用，避免中途异常留下半注册状态。
+        for block_id in matched_blocks:
+            self._acquire_block(block_id)
+        num_cached_tokens = len(matched_blocks) * self.block_size
+        self._allocations[request_id] = _LogicalAllocation(
+            block_ids=matched_blocks,
+            prompt_block_keys=prompt_block_keys,
+            num_readonly_prefix_blocks=len(matched_blocks),
+            num_committed_tokens=num_cached_tokens,
+        )
+        return KVCacheMatch(num_cached_tokens=num_cached_tokens)
 
     def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation:
         """原子地预留本轮 token 可能占用的新 block。"""
@@ -271,18 +319,19 @@ class PagedKVCacheManager:
         target_tokens = allocation.num_committed_tokens + num_tokens
         target_blocks = self._blocks_for(target_tokens)
         new_block_count = target_blocks - len(allocation.block_ids)
-        if new_block_count > len(self._free_blocks):
+        if new_block_count > self.num_free_blocks:
             raise KVCacheCapacityError(
                 f"request {request_id!r} needs {new_block_count} new KV blocks, "
-                f"but only {len(self._free_blocks)} are free"
+                f"but only {self.num_free_blocks} are free"
             )
 
-        allocation.block_ids.extend(heappop(self._free_blocks) for _ in range(new_block_count))
+        allocation.block_ids.extend(self._allocate_block() for _ in range(new_block_count))
         allocation.num_reserved_tokens = num_tokens
         return KVCacheReservation(
             block_ids=tuple(allocation.block_ids),
             num_committed_tokens=allocation.num_committed_tokens,
             num_reserved_tokens=num_tokens,
+            num_readonly_prefix_blocks=allocation.num_readonly_prefix_blocks,
         )
 
     def commit(self, request_id: str, num_tokens: int) -> None:
@@ -294,6 +343,7 @@ class PagedKVCacheManager:
 
         allocation.num_committed_tokens += num_tokens
         allocation.num_reserved_tokens = 0
+        self._publish_prompt_blocks(allocation)
         self._trim_blocks(allocation)
 
     def free(self, request_id: str) -> bool:
@@ -301,7 +351,7 @@ class PagedKVCacheManager:
         if allocation is None:
             return False
         for block_id in allocation.block_ids:
-            heappush(self._free_blocks, block_id)
+            self._release_block(block_id)
         return True
 
     def _trim_blocks(self, allocation: _LogicalAllocation) -> None:
@@ -309,7 +359,7 @@ class PagedKVCacheManager:
         released = allocation.block_ids[keep:]
         del allocation.block_ids[keep:]
         for block_id in released:
-            heappush(self._free_blocks, block_id)
+            self._release_block(block_id)
 
     def _blocks_for(self, num_tokens: int) -> int:
         return (num_tokens + self.block_size - 1) // self.block_size
@@ -323,8 +373,99 @@ class PagedKVCacheManager:
         if self._allocations:
             raise KVCacheError("cannot change paged KV capacity with active requests")
         self._num_blocks = num_blocks
+        self._reset_block_pool(num_blocks)
+        self._cache_epoch = _UNSET_CACHE_EPOCH
+
+    def _ensure_cache_epoch(self, cache_epoch: int | None) -> None:
+        if not self._enable_prefix_caching:
+            return
+        if self._cache_epoch == cache_epoch:
+            return
+        if self._allocations:
+            raise KVCacheError("cannot change prefix cache epoch with active requests")
+        if self._num_blocks is None:
+            raise KVCacheError("paged KV capacity is not initialized")
+        # Worker 换代后物理 tensor 会重建，旧 page ID 即使相同也没有旧 K/V。
+        self._reset_block_pool(self._num_blocks)
+        self._cache_epoch = cache_epoch
+
+    def _prompt_block_keys(
+        self,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None,
+    ) -> tuple[_PrefixBlockKey, ...]:
+        if not self._enable_prefix_caching:
+            return ()
+        # Prefix cache 只保存完整页，并至少留一个 token 重新得到下一 token 的 logits。
+        num_cacheable_tokens = ((len(token_ids) - 1) // self.block_size) * self.block_size
+        parent_hash = hashlib.sha256(f"light-vllm:{cache_epoch!r}".encode()).digest()
+        block_keys: list[_PrefixBlockKey] = []
+        for start in range(0, num_cacheable_tokens, self.block_size):
+            block_tokens = token_ids[start : start + self.block_size]
+            digest = hashlib.sha256(parent_hash + repr(block_tokens).encode()).digest()
+            block_keys.append(
+                _PrefixBlockKey(
+                    parent_digest=parent_hash,
+                    token_ids=block_tokens,
+                    digest=digest,
+                )
+            )
+            parent_hash = digest
+        return tuple(block_keys)
+
+    def _publish_prompt_blocks(self, allocation: _LogicalAllocation) -> None:
+        num_full_prompt_blocks = min(
+            allocation.num_committed_tokens // self.block_size,
+            len(allocation.prompt_block_keys),
+        )
+        for index in range(allocation.num_readonly_prefix_blocks, num_full_prompt_blocks):
+            block_key = allocation.prompt_block_keys[index]
+            block_id = allocation.block_ids[index]
+            if block_key not in self._cached_blocks:
+                self._cached_blocks[block_key] = block_id
+                self._block_keys[block_id] = block_key
+        allocation.num_readonly_prefix_blocks = num_full_prompt_blocks
+
+    def _allocate_block(self) -> int:
+        if self._free_blocks:
+            block_id = heappop(self._free_blocks)
+        else:
+            try:
+                block_id, _ = self._evictable_blocks.popitem(last=False)
+            except KeyError as exc:
+                raise KVCacheCapacityError("no paged KV block is available") from exc
+            block_key = self._block_keys.pop(block_id)
+            if self._cached_blocks.get(block_key) == block_id:
+                del self._cached_blocks[block_key]
+        self._block_ref_counts[block_id] = 1
+        return block_id
+
+    def _acquire_block(self, block_id: int) -> None:
+        if self._block_ref_counts[block_id] == 0:
+            self._evictable_blocks.pop(block_id, None)
+        self._block_ref_counts[block_id] += 1
+
+    def _release_block(self, block_id: int) -> None:
+        ref_count = self._block_ref_counts[block_id]
+        if ref_count <= 0:
+            raise KVCacheError("paged KV block reference count is already zero")
+        ref_count -= 1
+        self._block_ref_counts[block_id] = ref_count
+        if ref_count:
+            return
+        if block_id in self._block_keys:
+            # 仍在缓存索引中的页进入 LRU；需要空间时才真正清掉摘要。
+            self._evictable_blocks[block_id] = None
+        else:
+            heappush(self._free_blocks, block_id)
+
+    def _reset_block_pool(self, num_blocks: int) -> None:
         self._free_blocks = list(range(num_blocks))
         heapify(self._free_blocks)
+        self._block_ref_counts = [0] * num_blocks
+        self._cached_blocks.clear()
+        self._block_keys.clear()
+        self._evictable_blocks.clear()
 
     def _get(self, request_id: str) -> _LogicalAllocation:
         try:

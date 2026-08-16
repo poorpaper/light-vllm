@@ -2,6 +2,7 @@ import pytest
 
 from light_vllm.runtime.kv_cache import (
     FixedKVBlockCapacity,
+    KVCacheMatch,
     PagedKVCacheManager,
     UnboundedKVCacheManager,
 )
@@ -104,3 +105,34 @@ def test_scheduler_reserves_lookahead_without_a_decode_mode() -> None:
     second = scheduler.schedule().requests[0]
     assert second.num_computed_tokens == 2
     assert second.num_scheduled_tokens == 1
+
+
+def test_scheduler_releases_an_invalid_prefix_match() -> None:
+    class InvalidMatchCache:
+        def __init__(self) -> None:
+            self.freed: list[str] = []
+
+        def add_request(self, request_id, *, token_ids, cache_epoch):
+            return KVCacheMatch(num_cached_tokens=len(token_ids))
+
+        def reserve(self, request_id, num_tokens):
+            raise AssertionError("invalid prefix must fail before reservation")
+
+        def commit(self, request_id, num_tokens):
+            raise AssertionError("invalid prefix must fail before commit")
+
+        def free(self, request_id):
+            self.freed.append(request_id)
+            return True
+
+    cache = InvalidMatchCache()
+    scheduler = TokenBudgetScheduler(
+        cache,
+        max_num_sequences=1,
+        max_num_scheduled_tokens=2,
+    )
+    scheduler.add("request", token_ids=(1, 2))
+
+    with pytest.raises(SchedulerError, match="leave at least one token"):
+        scheduler.schedule()
+    assert cache.freed == ["request"]

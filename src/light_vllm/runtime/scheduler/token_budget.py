@@ -18,7 +18,10 @@ from light_vllm.runtime.scheduler.interfaces import (
 @dataclass(slots=True)
 class _RequestState:
     num_tokens: int
+    prompt_token_ids: tuple[int, ...]
+    cache_epoch: int | None
     num_computed_tokens: int = 0
+    kv_attached: bool = False
 
 
 class TokenBudgetScheduler:
@@ -77,17 +80,10 @@ class TokenBudgetScheduler:
         if request_id in self._states:
             raise SchedulerError(f"request {request_id!r} is already scheduled")
 
-        match = self._kv_cache.add_request(
-            request_id,
-            token_ids=token_ids,
-            cache_epoch=cache_epoch,
-        )
-        if not 0 <= match.num_cached_tokens < len(token_ids):
-            self._kv_cache.free(request_id)
-            raise SchedulerError("cached prefix must leave at least one token to compute")
         self._states[request_id] = _RequestState(
             num_tokens=len(token_ids),
-            num_computed_tokens=match.num_cached_tokens,
+            prompt_token_ids=token_ids,
+            cache_epoch=cache_epoch,
         )
         self._waiting.append(request_id)
 
@@ -98,7 +94,8 @@ class TokenBudgetScheduler:
         self._running.pop(request_id, None)
         with suppress(ValueError):
             self._waiting.remove(request_id)
-        self._kv_cache.free(request_id)
+        if state.kv_attached:
+            self._kv_cache.free(request_id)
         return True
 
     def schedule(self) -> SchedulerOutput:
@@ -179,4 +176,15 @@ class TokenBudgetScheduler:
     def _fill_open_slots(self) -> None:
         while self._waiting and len(self._running) < self._max_num_sequences:
             request_id = self._waiting.popleft()
-            self._running[request_id] = self._states[request_id]
+            state = self._states[request_id]
+            match = self._kv_cache.add_request(
+                request_id,
+                token_ids=state.prompt_token_ids,
+                cache_epoch=state.cache_epoch,
+            )
+            if not 0 <= match.num_cached_tokens < len(state.prompt_token_ids):
+                self._kv_cache.free(request_id)
+                raise SchedulerError("cached prefix must leave at least one token to compute")
+            state.num_computed_tokens = match.num_cached_tokens
+            state.kv_attached = True
+            self._running[request_id] = state
