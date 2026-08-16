@@ -30,11 +30,13 @@ flowchart LR
     Plan --> Core
     Core --> Batch["ExecutionBatch<br/>本轮 token 切片"]
     Batch --> Executor["LocalModelExecutor"]
-    Executor --> Runner["ModelRunner"]
-    Runner --> Model["Active Model"]
-    Model --> Executor
-    Executor --> Sampler["Sampler"]
-    Executor --> Output["ExecutionOutput<br/>0..N 个确认 token"]
+    Executor --> Worker["LocalModelWorker<br/>固定模型版本"]
+    Worker --> Step["ModelStepHandler<br/>contiguous 或 paged"]
+    Worker --> Decode["DecodeHandler<br/>ordinary 或 speculative"]
+    Worker --> Session["ModelSession<br/>fixed generation"]
+    Session --> Model["Pinned Model"]
+    Decode --> Sampler["Sampler"]
+    Worker --> Output["RequestOutput<br/>input computed · 0..N output<br/>cached output prefix"]
     Output --> Core
     Core --> Events["TokenGenerated · Finished"]
 ```
@@ -44,21 +46,34 @@ flowchart LR
 - prompt 和生成 token 都是“尚未计算的 token”；
 - chunked prefill 只是本轮预算不足以覆盖全部 pending token；
 - greedy/top-k/top-p 是 Sampler 差异；
-- 连续或分页 K/V 是物理执行后端差异；
+- 连续或分页 K/V 是 Step Handler 的物理存储与 attention 后端差异；
 - 本地、CUDA、多进程才是合理的 Executor 拓扑差异。
+
+`LocalModelExecutor` 与 `ModelWorker` 看起来薄，是有意保留的两层：Executor 表达 Engine 可替换的执行拓扑，
+Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；KV 和 attention 交给 Step Handler。未来多进程或多 rank Executor 可以管理多个 Worker，
+不会迫使单机 Worker 契约进入 Engine。
 
 ## 模块边界
 
 | 组件 | 负责 | 不负责 |
 | --- | --- | --- |
 | `EngineCore` | 请求状态、事件、停止条件、迭代与取消 | tensor、调度策略、HTTP |
+| `CapacityAdmission` | 根据 capabilities 拒绝空闲引擎也不可能完成的请求 | 排队、公平性、preemption |
 | `TokenBudgetScheduler` | FCFS、并发槽、token budget、逻辑 KV 分配 | 模型 forward、采样、事件 |
 | `UnboundedKVCacheManager` | 无容量限制的 reservation、提交与回滚基线 | block、K/V tensor |
 | `PagedKVCacheManager` | 逻辑 block 预留、提交、回滚、释放 | K/V tensor、attention kernel |
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
-| `LocalModelExecutor` | 本地模型输入、连续 K/V、输出校验、调用 Sampler | 谁能运行、block 分配策略 |
+| `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
+| `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
+| `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
+| `PagedStepHandler` | padded batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
+| `StandardDecodeHandler` | 普通 prefill/单 token decode 的结果转换与采样 | KV 布局、调度 |
+| `PagedKVCachePlanner` | 模型加载后把固定页数或空闲显存预算解析为容量 | 请求调度、page ownership |
+| `TorchDenseAttention` | 读取连续历史、dense causal attention、暂存本轮 K/V | 模型结构、物理分页 |
+| `PagedAttentionBackend` | 为页池和批次事实创建 `AttentionContext` | 模型分发、调度 |
+| `TorchPagedAttention` | 原位写 K/V、逐页 causal attention、MHA/GQA correctness | 调度、生产级 kernel 优化 |
 | `Sampler` | 从 logits 选择 token | 模型 forward、调度、停止条件 |
-| `ModelRunner` | 当前模型生命周期和统一 forward | 具体模型/loader 条件分发 |
+| `ModelRunner` | 当前模型生命周期和固定 `ModelSession` | 请求调度、具体模型/loader 条件分发 |
 | `EngineClient` | serving 到 engine 的异步端口 | HTTP schema、具体运行拓扑 |
 | HTTP adapter | JSON/SSE 与 generation 契约转换 | runner、torch、scheduler |
 
@@ -71,21 +86,24 @@ ScheduledRequest
 ├── request_id
 ├── num_computed_tokens
 ├── num_scheduled_tokens
+├── num_lookahead_tokens
+├── max_output_tokens
 ├── block_ids: tuple[int, ...] | None
-└── sampling_required
 ```
 
 假设 prompt 有 5 个 token，本轮总预算为 2：
 
 ```text
-第 1 轮：computed=0, scheduled=2, sampling=false
-第 2 轮：computed=2, scheduled=2, sampling=false
-第 3 轮：computed=4, scheduled=1, sampling=true
-第 4 轮：computed=5, scheduled=1, sampling=true
+第 1 轮：computed=0, scheduled=2, max_output=0
+第 2 轮：computed=2, scheduled=2, max_output=0
+第 3 轮：computed=4, scheduled=1, max_output=1
+第 4 轮：computed=5, scheduled=1, max_output=1
 ```
 
-前三轮自然完成 chunked prefill；第三轮在追上所有已知 token 后采样第一个输出。Engine 将该输出追加到
-请求状态，于是第四轮又出现一个 pending token。无需在 Engine/Executor 中维护 prefill/decode 状态机。
+前三轮自然完成 chunked prefill；第三轮在追上所有已知 token 的 frontier 后允许产生输出。普通执行预算为
+`lookahead=0, max_output=1`；投机执行可以预留 lookahead 并允许返回多个输出。Engine 将未缓存输出留作下一轮
+pending input。无需在 Engine/Executor 中维护 prefill/decode 状态机，但可由这些事实看出本轮是否位于输出
+frontier。
 
 ## 执行输入与输出
 
@@ -96,8 +114,9 @@ ExecutionRequest
 ├── request_id
 ├── input_token_ids
 ├── num_computed_tokens
+├── num_lookahead_tokens
+├── max_output_tokens
 ├── block_ids: tuple[int, ...] | None
-└── sampling_required
 ```
 
 Executor 返回：
@@ -105,45 +124,114 @@ Executor 返回：
 ```text
 RequestOutput
 ├── request_id
-├── num_computed_tokens
-└── token_ids: tuple[int, ...]
+├── num_input_tokens_computed
+├── output_token_ids: tuple[int, ...]
+└── num_cached_output_tokens
 ```
 
-`token_ids` 可以为空或包含多个值：
+`output_token_ids` 可以为空或包含多个值：
 
 - chunked prefill：0 个；
 - 普通 decode：1 个；
-- 未来投机解码：一次确认多个。
+- 投机验证：一次确认多个，其中连续前缀可能已在本轮写入 KV。
 
-Engine 对确认 token 逐个应用 EOS 与 `max_new_tokens`，只把真正可见的前缀提交到请求状态和事件流。
+`num_cached_output_tokens` 只描述 `output_token_ids` 的连续前缀，避免为普通 decode、投机接受和 bonus token
+增加模式枚举。Engine 对输出逐个应用 EOS 与 `max_new_tokens`，提交“已算输入 + 可见的已缓存输出前缀”；其余
+可见输出下一轮作为输入计算。
 
 ## KV cache 的双重所有权
 
 ```mermaid
 flowchart TB
-    Scheduler["Scheduler / Engine Core"] --> Logical["KVCacheManager<br/>reservation 与可选 block"]
-    Output["SchedulerOutput.block_ids<br/>optional"] --> Executor["ModelExecutor / Worker"]
-    Executor --> Physical["ContiguousKVCache<br/>当前物理 tensor 基线"]
-    Physical -.future.-> Paged["Paged K/V + Paged Attention"]
+    Scheduler["Scheduler / Engine Core"] --> Logical["KVCacheManager<br/>reservation 与 logical block IDs"]
+    Output["SchedulerOutput.block_ids<br/>optional"] --> Worker["LocalModelWorker"]
+    Worker --> Step["ModelStepHandler"]
+    Step --> Contiguous["ContiguousKVCache<br/>request-level tensors"]
+    Step --> Paged["PagedKVCache<br/>global physical pages"]
+    Contiguous --> Dense["AttentionContext<br/>TorchDenseAttention"]
+    Paged --> PagedAttention["AttentionContext<br/>TorchPagedAttention"]
 ```
 
 当前有两种逻辑 manager：`UnboundedKVCacheManager` 为连续缓存提供无 block、无容量限制的实验基线；
 `PagedKVCacheManager` 实现以下逻辑分页管理：
 
-二者只在 composition root 通过 `kv_reservation=unbounded|blocks` 选择；Scheduler、Engine 和 Executor
-不按该模式分支。`unbounded` 仅用于实验，不提供生产容量保护。
+二者只在 composition root 通过 `kv_reservation=unbounded|blocks` 与对应 Step Handler 成对选择：
+
+```text
+unbounded → UnboundedKVCacheManager → ContiguousStepHandler
+blocks    → PagedKVCacheManager     → PagedStepHandler
+```
+
+两种组合都注入同一个 `LocalModelWorker`。Scheduler、Engine、Executor 和 Worker 不按该模式分支。
+`unbounded` 仅用于测试和正确性对照，不提供生产
+容量保护。
+
+分页组合只创建一个 `PagedKVCachePlanner`：固定页数用于 CPU correctness 和确定性测试；CUDA 模式在模型权重
+加载后读取空闲显存，并按 `memory_fraction` 计算预算。每个 block 的字节数只由
+`ModelKVCacheSpec × block_size × dtype` 推导。逻辑 manager 与物理 Step Handler 共享同一个 planner，因此不存在两份
+`num_blocks`。planner 解析完成后，Executor 通过 capabilities 报告实际 KV token 容量。
 
 1. `reserve(K)` 为本轮最坏情况预留 block；容量不足时该请求不能执行。
 2. 模型成功后 `commit(M)`，其中 `M <= K`。
 3. 未提交的尾部自动回滚并归还多余 block。
 4. 完成、失败或取消时释放请求全部逻辑 block。
+5. 交给 Worker 的 block table 精确覆盖已提交 token、本轮 query 和显式 lookahead reservation，不包含未预留尾页。
+6. 当前活动物理页保持请求独占；prefix sharing 落地时必须显式表达只读共享与可写尾页 ownership。
 
-物理执行仍使用请求级连续 tensor，因此当前没有冒充已经实现 Paged Attention。分页 manager 产生的
-`block_ids` 已经穿过稳定调度/执行边界；非分页后端使用 `None`，不得伪造 block ID。下一阶段只需让
-分页执行侧真正按 block table 读写 K/V。
+连续与分页 Step Handler 都根据模型的同一个 `ModelKVCacheSpec` 创建物理缓存；装配层不再重复填写 layer/head 形状。
+分页 Step Handler 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
+token 通过 block table 映射到物理 slot；`TorchPagedAttention` 先原位写入本轮 K/V，再用在线 softmax 逐页读取
+有效前缀，不物化完整历史。它是可读性优先的 CPU/PyTorch correctness backend，不是生产级性能 kernel。
 
-执行前 Engine 取得物理缓存 lease。执行期间取消会立刻删除请求和逻辑 block，但连续 tensor 等同步模型
-步骤退出 lease 后才真正销毁；本轮输出因 request ID 已不存在而被丢弃。
+非分页 Step Handler 使用 `block_ids=None` 和请求级连续 tensor，不得伪造 block ID。两条路径共享同一个
+`ExecutionBatch → ExecutionOutput` 和模型 forward 契约，因此可以直接做结果对照。
+
+执行前 Engine 取得执行 lease。执行期间取消会立刻删除请求并使其退出后续调度；连续 tensor 延迟到 lease
+退出后销毁。分页页池本身是进程级全局资源，其 lease 当前为幂等空操作；真正防止页被过早复用的是
+Scheduler 将逻辑 block ID 延迟到该安全边界之后归还。本轮输出因 request ID 已不存在而被丢弃。
+
+## 模型与 attention 后端边界
+
+`ForwardBatch` 的 `input_ids`、`positions` 都是 `[batch, padded_sequence]`；`positions` 是请求内绝对位置，
+不能由模型根据 prefill/decode 模式猜测。`sequence_lengths` 标识每行有效 query 长度。
+
+可缓存模型声明 `ModelKVCacheSpec`，每层用稳定 `layer_id` 描述 query heads、KV heads 和 head size。模型的
+attention 层只调用 `AttentionContext.forward(layer_id, query, key, value, scale)`，不得自己实现 dense fallback。
+reference 与连续 Step Handler 创建 `TorchDenseAttention`；分页 Step Handler 通过
+`PagedAttentionBackend.create(cache, metadata)` 创建分页上下文。因此：
+
+- 模型不知道 block size、page layout 或具体 kernel；
+- Worker 不按具体模型 architecture 分支；
+- 后续 CUDA/Triton backend 实现同一个 factory 边界，不修改 Engine、Scheduler 或模型协议；
+- 分页 Step Handler 在模型加载成功后初始化物理页池，模型 generation 变化时由 Worker 安全地重建。
+
+当前原生 Qwen2 路径也遵守这条边界：模型层负责 embedding、RMSNorm、RoPE、Q/K/V 投影、输出投影和 MLP；
+`AttentionContext` 才负责读取历史 K/V、因果 softmax 和 value 聚合。HF 模型里的 FlashAttention 也是 attention
+backend，不是 Qwen 权重本身的一部分；普通 HF FlashAttention 无法直接理解本项目的 block table 和物理页池。
+CPU reference/连续 KV 路径通过执行层接入可读的 `TorchDenseAttention`，分页路径让同一个模型接入
+`TorchPagedAttention`。模型在两种布局下没有条件分支，未来 CUDA/Triton 实现只替换 backend。
+
+## Qwen 与 checkpoint 来源
+
+`qwen2` 注册项当前覆盖 Qwen2/Qwen2.5 的 full-attention、default-RoPE 配置，包括 GQA、tied embedding 和
+分片 safetensors。sliding-window、rope scaling、量化权重和 tokenizer 尚未实现，遇到这些配置会明确拒绝，
+不会回退到近似计算。
+
+Hugging Face 和 ModelScope 只负责把模型快照下载到本地。两边常见的 `config.json + model*.safetensors +
+model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`；loader 解析配置、逐分片复制权重并检查
+重复、缺失、多余和形状错误。`ModelRunner` 仍然只按 Catalog 解析 `qwen2 + safetensors`，不知道快照来自哪个
+网站。Transformers 只作为可选测试 oracle，对照相同权重的 logits，不进入生产执行路径。
+
+## Capabilities、admission 与 preemption
+
+容量事实从拥有它的实体向上汇总：模型声明 `max_model_tokens`，Step Handler 通过 Worker 报告
+`max_kv_cache_tokens`，Scheduler
+报告并发槽和单轮 token budget。`EngineCapabilities.max_request_tokens` 取模型与单请求可用 KV 上限的较小值。
+HTTP 通过 `/capabilities` 展示这些事实，不再硬编码 prompt 长度。
+
+`CapacityAdmission` 只拒绝“即使引擎空闲也不可能完成”的请求。当前是否有空闲 block、谁等待、是否抢占和抢占
+后如何重算都属于 Scheduler 的动态策略。这个分界避免 admission 误判瞬时负载，也避免 Executor 反向管理队列。
+当前尚未实现 preemption；未来重算式或 swap 式 preemption 仍在 Scheduler 边界内落地。
 
 ## Sampler
 
@@ -158,8 +246,8 @@ class Sampler(Protocol):
 argmax；以后增加 temperature、top-k 或 top-p 时，不修改 Engine、Scheduler、ModelRunner 或 Executor
 接口。
 
-投机解码的 acceptance sampling 与普通 Sampler 是不同职责。未来在 Executor 内组合 proposer、target
-verify 与 acceptance sampler，仍返回同一个 `ExecutionOutput`，不增加 `SpeculativeExecutor`。
+投机解码的 acceptance sampling 与普通 Sampler 是不同职责。未来在执行实现中组合 proposer、target verify 与
+acceptance sampler，仍返回同一个事实型 `RequestOutput`，不增加 prefill/decode 模式枚举。
 
 ## Reference 与 serving 边界
 
@@ -171,14 +259,17 @@ flowchart LR
     Bridge --> Reference["ReferenceGenerationService"]
     Reference --> TokenExecutor["LocalTokenExecutor"]
     Core --> ModelExecutor["LocalModelExecutor"]
+    ModelExecutor --> Worker["ModelWorker"]
     TokenExecutor --> Runner["ModelRunner"]
-    ModelExecutor --> Runner
+    Worker --> Runner
 ```
 
-Reference 路径保留同步、全序列重算和逐 token 语义，用于教学与正确性对照；生产演进发生在 Engine Core
-路径。两者共享 generation 请求/事件、ModelRunner 和 Sampler，但不通过兼容 facade 强行共享执行契约。
+Reference 路径保留同步、全序列重算和逐 token 语义，用于教学与正确性对照；`LocalTokenExecutor` 为每轮完整
+序列创建无历史的 `TorchDenseAttention`。生产演进发生在 Engine Core 路径。两者共享 generation 请求/事件、
+ModelRunner 和 Sampler，但不通过兼容 facade 强行共享执行契约。
 
-HTTP 的 JSON、SSE、状态码和输入上限都留在 adapter。进程拆分时可以新增 `ProcessEngineClient`，但不得
+HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClient.capabilities`，而不是 transport 常量。
+进程拆分时可以新增 `ProcessEngineClient`，但不得
 改变 `EngineClient`、generation 事件或 HTTP adapter。
 
 ## 模型加载不变量
@@ -187,12 +278,15 @@ HTTP 的 JSON、SSE、状态码和输入上限都留在 adapter。进程拆分�
 2. loader 在当前模型外构造、加载、迁移并 `eval()` 候选模型。
 3. 候选完整可用后，`ModelRunner` 才在锁内替换引用并递增 generation。
 4. 加载失败时当前模型和 generation 不变。
-5. `forward` 在锁内只复制模型引用，实际模型计算不持有生命周期锁。
+5. `open_session()` 在锁内复制模型引用和 generation，返回对旧模型的强引用；实际模型计算不持有生命周期锁。
+6. Reference 请求和 Worker 都在请求开始前固定 session，一个请求绝不跨 generation。
+7. 可缓存模型的 KV 规格由 session 中的模型声明；Worker 只能在模型加载完成且无活动请求时初始化或重建 Step Handler。
+8. reload 后旧请求继续使用旧 session；Worker 暂停新准入，活动请求清空后才按新 generation 重新初始化。
 
 ## 后续演进顺序
 
-1. 执行侧分页 K/V 与 Paged Attention。
-2. prefix caching、显存预算和 preemption。
+1. 在现有 `PagedAttentionBackend` 边界实现 CUDA/Triton kernel。
+2. prefix caching 和 Scheduler-owned preemption。
 3. 普通随机 Sampler。
 4. `TokenProposer + target verify + AcceptanceSampler` 投机解码。
 5. 进程/分布式 Worker 与生产级 serving。

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>light-vllm KV cache 容量与所有权</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --paper:#f5f5f5; --ink:#2d3142; --muted:#4f5d75; --soft:#7a8399;
+      --accent:#eb6c36; --link:#2e5aa8; --rule:rgba(45,49,66,.12);
+      --sans:'Geist','Noto Sans SC','Microsoft YaHei',sans-serif;
+      --serif:'Instrument Serif','Noto Serif SC',serif;
+      --mono:'Geist Mono','Noto Sans Mono CJK SC',monospace;
+    }
+    body { min-height:100vh; padding:48px 32px; background:var(--paper); color:var(--ink); font-family:var(--sans); display:flex; justify-content:center; }
+    .frame { width:100%; max-width:1280px; }
+    .eyebrow { margin-bottom:8px; color:var(--muted); font:500 8px/1 var(--mono); letter-spacing:.18em; text-transform:uppercase; }
+    h1 { margin-bottom:8px; font:400 28px/1.15 var(--serif); letter-spacing:-.02em; }
+    .subtitle { max-width:1040px; margin-bottom:24px; color:var(--muted); font:400 12px/1.6 var(--sans); }
+    svg { width:100%; min-width:1080px; display:block; }
+    .notes { display:grid; grid-template-columns:1.15fr .85fr; gap:24px; margin-top:24px; }
+    .card { padding:20px; background:#fff; border:1px solid var(--rule); border-radius:6px; }
+    .card h2 { margin-bottom:8px; font:600 12px/1.4 var(--sans); }
+    .card p { color:var(--muted); font:400 12px/1.65 var(--sans); }
+    code { font-family:var(--mono); font-size:11px; color:var(--ink); }
+  </style>
+</head>
+<body>
+  <main class="frame">
+    <p class="eyebrow">Architecture · capacity source · ownership boundary · engineer</p>
+    <h1>KV cache：同一份容量，两个责任边界</h1>
+    <p class="subtitle">初始化阶段先根据模型真实 KV 形状确定页数；运行阶段 Scheduler 只分配 page ID，PagedStepHandler 只读写对应的 K/V 张量。当前实现中 block ID 直接等于物理 page ID，但两侧保存的状态和负责的生命周期不同。</p>
+
+    <svg viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="light-vllm-kv-ownership-title light-vllm-kv-ownership-desc">
+      <title id="light-vllm-kv-ownership-title">light-vllm KV cache 容量与所有权</title>
+      <desc id="light-vllm-kv-ownership-desc">展示模型 KV 形状和显存预算如何生成唯一分页配置，以及 Scheduler 的逻辑 page ID 分配如何通过执行批次交给 PagedStepHandler，最终访问物理 K/V 张量并在执行后提交或回收页。</desc>
+      <defs>
+        <marker id="lvkv-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f5d75"/></marker>
+        <marker id="lvkv-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#eb6c36"/></marker>
+        <marker id="lvkv-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#2e5aa8"/></marker>
+      </defs>
+      <rect width="1280" height="760" fill="#f5f5f5"/>
+
+      <!-- Stage containers -->
+      <rect x="40" y="40" width="1200" height="152" rx="8" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="56" y="64" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">01 · INITIALIZE ONCE PER MODEL VERSION</text>
+      <rect x="40" y="224" width="1200" height="288" rx="8" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <line x1="464" y1="224" x2="464" y2="512" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <line x1="848" y1="224" x2="848" y2="512" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="56" y="248" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">LOGICAL ALLOCATION · SCHEDULER SIDE</text>
+      <text x="480" y="248" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">HANDOFF · PLAIN DATA</text>
+      <text x="864" y="248" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">PHYSICAL STORAGE · WORKER SIDE</text>
+      <rect x="40" y="544" width="1200" height="136" rx="8" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="56" y="568" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">03 · AFTER EXECUTION</text>
+
+      <!-- Connectors: initialization -->
+      <line x1="264" y1="112" x2="336" y2="112" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvkv-arrow)"/>
+      <rect x="280" y="92" width="40" height="12" rx="2" fill="#f5f5f5"/><text x="300" y="100" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">SHAPE</text>
+      <line x1="576" y1="112" x2="672" y2="112" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvkv-arrow)"/>
+      <rect x="596" y="92" width="56" height="12" rx="2" fill="#f5f5f5"/><text x="624" y="100" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">CALCULATE</text>
+      <line x1="912" y1="112" x2="1008" y2="112" stroke="#2e5aa8" stroke-width="1" marker-end="url(#lvkv-arrow-link)"/>
+      <rect x="932" y="92" width="56" height="12" rx="2" fill="#f5f5f5"/><text x="960" y="100" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">REPORT</text>
+
+      <!-- The same resolved capacity feeds both sides -->
+      <path d="M744 160 V192 Q744 200 736 200 H364 Q356 200 356 208 V272" fill="none" stroke="#2e5aa8" stroke-width="1" marker-end="url(#lvkv-arrow-link)"/>
+      <rect x="508" y="180" width="88" height="12" rx="2" fill="#f5f5f5"/><text x="552" y="188" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">N PAGES · B TOKENS</text>
+      <path d="M840 160 V208 Q840 216 848 216 H1156 Q1164 216 1164 224 V272" fill="none" stroke="#2e5aa8" stroke-width="1" marker-end="url(#lvkv-arrow-link)"/>
+      <rect x="956" y="196" width="80" height="12" rx="2" fill="#f5f5f5"/><text x="996" y="204" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">SAME CONFIG</text>
+
+      <!-- Per-iteration handoff -->
+      <line x1="224" y1="352" x2="256" y2="352" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvkv-arrow)"/>
+      <line x1="456" y1="352" x2="488" y2="352" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvkv-arrow)"/>
+      <line x1="648" y1="352" x2="680" y2="352" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvkv-arrow)"/>
+      <line x1="840" y1="352" x2="872" y2="352" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvkv-arrow)"/>
+      <line x1="1032" y1="352" x2="1064" y2="352" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lvkv-arrow-accent)"/>
+
+      <!-- Nodes: initialization -->
+      <g>
+        <rect x="64" y="72" width="200" height="80" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="164" y="96" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">ModelKVCacheSpec</text>
+        <text x="164" y="116" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">layers · kv_heads · head_size</text>
+        <text x="164" y="132" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">唯一的 KV 形状来源</text>
+      </g>
+      <g>
+        <rect x="336" y="64" width="240" height="96" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="456" y="88" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">PagedKVCachePlanner</text>
+        <text x="456" y="108" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">bytes/page = B × Σ(2 × Hkv × D) × dtype_bytes</text>
+        <text x="456" y="124" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">N = floor(free_bytes × fraction / bytes/page)</text>
+        <text x="456" y="140" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">CUDA 在模型权重加载后读取剩余显存</text>
+      </g>
+      <g>
+        <rect x="672" y="64" width="240" height="96" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+        <text x="792" y="88" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">PagedKVCacheConfig</text>
+        <text x="792" y="108" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">num_blocks=N · block_size=B</text>
+        <text x="792" y="124" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">dtype · device</text>
+        <text x="792" y="140" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">一份规划结果同时约束逻辑分配和物理页池</text>
+      </g>
+      <g>
+        <rect x="1008" y="72" width="208" height="80" rx="6" fill="rgba(46,90,168,.06)" stroke="#2e5aa8" stroke-width="1"/>
+        <text x="1112" y="96" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Capabilities / Admission</text>
+        <text x="1112" y="116" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">max_kv_cache_tokens = N × B</text>
+        <text x="1112" y="132" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">只拒绝独占引擎也装不下的请求</text>
+      </g>
+
+      <!-- Nodes: runtime -->
+      <g>
+        <rect x="64" y="300" width="160" height="104" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="144" y="328" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">TokenBudgetScheduler</text>
+        <text x="144" y="348" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">选择请求与 token 数</text>
+        <text x="144" y="364" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">scheduled + lookahead</text>
+        <text x="144" y="380" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">不保存 K/V 张量</text>
+      </g>
+      <g>
+        <rect x="256" y="272" width="200" height="160" rx="6" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width="1"/>
+        <text x="356" y="300" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">PagedKVCacheManager</text>
+        <line x1="272" y1="316" x2="440" y2="316" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+        <text x="276" y="336" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">free_blocks: min-heap[page_id]</text>
+        <text x="276" y="356" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">request → block_ids[]</text>
+        <text x="276" y="376" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">committed_tokens · reserved_tokens</text>
+        <text x="276" y="400" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">reserve · commit/trim · free</text>
+        <text x="276" y="416" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">只管 page ID 生命周期</text>
+      </g>
+      <g>
+        <rect x="488" y="300" width="160" height="104" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="568" y="328" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">ScheduledRequest</text>
+        <text x="568" y="348" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">computed · scheduled</text>
+        <text x="568" y="364" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">lookahead · max_output</text>
+        <text x="568" y="380" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">block_ids = complete table</text>
+      </g>
+      <g>
+        <rect x="680" y="300" width="160" height="104" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="760" y="328" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">EngineCore</text>
+        <text x="760" y="348" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">按位置切出真实 token IDs</text>
+        <text x="760" y="364" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">构造 ExecutionRequest</text>
+        <text x="760" y="380" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">不解释 page 布局</text>
+      </g>
+      <g>
+        <rect x="872" y="272" width="160" height="160" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="952" y="300" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">PagedStepHandler</text>
+        <line x1="888" y1="316" x2="1016" y2="316" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+        <text x="892" y="336" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">positions · query_lengths</text>
+        <text x="892" y="356" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">PagedAttentionMetadata</text>
+        <text x="892" y="376" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">block table consumer</text>
+        <text x="892" y="400" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">准备输入并管理物理页池</text>
+        <text x="892" y="416" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">不决定 page ID 分给谁</text>
+      </g>
+      <g>
+        <rect x="1064" y="272" width="160" height="160" rx="6" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width="1"/>
+        <text x="1144" y="300" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">PagedKVCache</text>
+        <line x1="1080" y1="316" x2="1208" y2="316" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+        <text x="1084" y="336" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">layer_id → keys / values</text>
+        <text x="1084" y="356" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">shape [N, B, Hkv, D]</text>
+        <text x="1084" y="376" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">slot = page_id × B + offset</text>
+        <text x="1084" y="400" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">保存真正的 K/V 张量</text>
+        <text x="1084" y="416" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace">当前 block_id == page_id</text>
+      </g>
+
+      <!-- Post-execution explanations -->
+      <g>
+        <rect x="64" y="584" width="336" height="72" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="80" y="608" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif">1 · 成功后只提交实际完成量</text>
+        <text x="80" y="628" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">commit = input_done + cached_visible_outputs</text>
+        <text x="80" y="644" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">多留但没有使用的尾页立即 trim 并归还</text>
+      </g>
+      <g>
+        <rect x="472" y="584" width="336" height="72" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="488" y="608" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif">2 · 失败时不推进请求状态</text>
+        <text x="488" y="628" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">output validation fails → remove request</text>
+        <text x="488" y="644" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">本轮 token 不计为 computed，预留 page 释放</text>
+      </g>
+      <g>
+        <rect x="880" y="584" width="336" height="72" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="896" y="608" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif">3 · 取消不能提前复用正在执行的页</text>
+        <text x="896" y="628" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">Engine 先隐藏请求；in-flight block table 继续保留</text>
+        <text x="896" y="644" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace">模型计算结束后 Scheduler 才真正归还 page ID</text>
+      </g>
+
+      <!-- Legend -->
+      <line x1="40" y1="712" x2="1240" y2="712" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="40" y="736" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">READING KEY</text>
+      <rect x="160" y="724" width="16" height="12" rx="2" fill="rgba(45,49,66,.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="184" y="736" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">state/store</text>
+      <line x1="320" y1="728" x2="360" y2="728" stroke="#2e5aa8" stroke-width="1" marker-end="url(#lvkv-arrow-link)"/>
+      <text x="372" y="736" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">shared capacity</text>
+      <line x1="544" y1="728" x2="584" y2="728" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lvkv-arrow-accent)"/>
+      <text x="596" y="736" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">current page lookup</text>
+      <text x="824" y="736" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">职责分开 ≠ 两份容量配置</text>
+    </svg>
+
+    <section class="notes" aria-label="KV cache 图解说明">
+      <article class="card">
+        <h2>为什么要分成“逻辑分配”和“物理存储”</h2>
+        <p>Scheduler 需要知道页够不够、某个请求占了哪些页、失败后归还哪些页；它不需要接触张量。PagedStepHandler 需要把 K/V 写到正确地址并运行 attention；它不应该自行决定把空闲页分给哪个请求。这样未来加入 prefix sharing 或 preemption 时，主要改变分配策略，不必改模型计算接口。</p>
+      </article>
+      <article class="card">
+        <h2>当前实现最容易误解的地方</h2>
+        <p><code>block_id</code> 现在直接索引物理 page，因此数值是一一对应的；“逻辑/物理”描述的是责任和状态所有权，不是说当前已经存在第二层地址翻译。以后需要共享或远程 KV 时，可以在中间增加映射。</p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

@@ -11,7 +11,12 @@ from light_vllm import (
 from light_vllm.runtime.execution import ExecutionError, ExecutionNotReadyError
 
 
-class IncrementingExecutor:
+class _SelfSessionExecutor:
+    def open_session(self):
+        return self
+
+
+class IncrementingExecutor(_SelfSessionExecutor):
     ready = True
 
     def __init__(self, vocab_size: int = 8) -> None:
@@ -21,14 +26,14 @@ class IncrementingExecutor:
         return (token_ids[-1] + 1) % self.vocab_size
 
 
-class UnreadyExecutor:
+class UnreadyExecutor(_SelfSessionExecutor):
     ready = False
 
     def next_token(self, token_ids: tuple[int, ...]) -> int:
         raise ExecutionNotReadyError("not ready")
 
 
-class FailingExecutor:
+class FailingExecutor(_SelfSessionExecutor):
     ready = True
 
     def next_token(self, token_ids: tuple[int, ...]) -> int:

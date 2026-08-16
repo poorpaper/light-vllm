@@ -1,27 +1,56 @@
+from functools import partial
+
 import pytest
 import torch
 
+from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
 from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
-    KVCacheState,
-    LayerKeyValues,
     ModelNotLoadedError,
     ModelOutput,
 )
+from light_vllm.modeling.models.tiny_attention import (
+    TinyAttentionCausalLM,
+    TinyAttentionConfig,
+)
 from light_vllm.runtime.execution import (
+    DenseAttentionMetadata,
     ExecutionBatch,
+    ExecutionCapabilities,
     ExecutionError,
     ExecutionNotReadyError,
+    ExecutionOutput,
     ExecutionRequest,
     LocalModelExecutor,
+    LocalModelWorker,
     LocalTokenExecutor,
+    PagedKVCacheConfig,
+    RequestOutput,
+    TorchDenseAttention,
+    TorchPagedAttentionBackend,
 )
-from light_vllm.runtime.kv_cache import ContiguousKVCache, KVCacheSpec
+from light_vllm.runtime.execution.worker import (
+    ContiguousStepHandler,
+    PagedStepHandler,
+    StandardDecodeHandler,
+)
+from light_vllm.runtime.kv_cache import ContiguousKVCacheConfig
 from light_vllm.runtime.sampling import GreedySampler
 
 
 class IncrementingForwarder:
     generation = 1
+    max_model_tokens = None
+    kv_cache_spec = ModelKVCacheSpec(
+        layers=(
+            AttentionLayerSpec(
+                layer_id="attention",
+                num_query_heads=1,
+                num_kv_heads=1,
+                head_size=1,
+            ),
+        )
+    )
 
     def __init__(self, vocab_size: int = 8) -> None:
         self.vocab_size = vocab_size
@@ -30,19 +59,21 @@ class IncrementingForwarder:
         next_ids = (batch.input_ids + 1) % self.vocab_size
         logits = torch.full((*batch.input_ids.shape, self.vocab_size), -1.0)
         logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
-        updates = KVCacheState(
-            layers=(
-                LayerKeyValues(
-                    keys=batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1),
-                    values=batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1),
-                ),
+        if batch.attention is not None:
+            keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
+            batch.attention.forward(
+                "attention",
+                keys,
+                keys,
+                keys,
+                scale=1.0,
             )
-        )
-        return ModelOutput(logits=logits, kv_cache_updates=updates)
+        return ModelOutput(logits=logits)
 
 
 class UnloadedForwarder:
     generation = 0
+    max_model_tokens = None
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
         raise ModelNotLoadedError("not loaded")
@@ -50,6 +81,8 @@ class UnloadedForwarder:
 
 class InvalidOutputForwarder:
     generation = 1
+    kv_cache_spec = None
+    max_model_tokens = None
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
         return ModelOutput(logits=torch.zeros(1, 8))
@@ -60,30 +93,171 @@ class FixedSampler:
         return (7,) * logits.shape[0]
 
 
-def test_reference_executor_delegates_token_choice_to_sampler() -> None:
-    executor = LocalTokenExecutor(IncrementingForwarder(), FixedSampler())
+class CountingAttentionForwarder:
+    generation = 1
+    max_model_tokens = None
 
-    assert executor.next_token((1, 2)) == 7
+    def __init__(self) -> None:
+        self.model = TinyAttentionCausalLM(
+            TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
+        ).eval()
+        self.calls = 0
+        self.position_batches: list[torch.Tensor] = []
+
+    @property
+    def kv_cache_spec(self):
+        return self.model.kv_cache_spec
+
+    def forward(self, batch: ForwardBatch) -> ModelOutput:
+        self.calls += 1
+        assert batch.positions is not None
+        self.position_batches.append(batch.positions.clone())
+        return self.model(batch)
+
+
+class StaticSessionProvider:
+    def __init__(self, session) -> None:
+        self.session = session
+        self.generation = session.generation
+
+    def open_session(self):
+        return self.session
+
+
+class UnloadedSessionProvider:
+    generation = 0
+
+    def open_session(self):
+        raise ModelNotLoadedError("not loaded")
+
+
+class MutableSessionProvider:
+    def __init__(self, session) -> None:
+        self.session = session
+
+    @property
+    def generation(self) -> int:
+        return self.session.generation
+
+    def open_session(self):
+        return self.session
+
+
+class ReloadingDuringForward(CountingAttentionForwarder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.provider: StaticSessionProvider | None = None
+
+    def forward(self, batch: ForwardBatch) -> ModelOutput:
+        output = super().forward(batch)
+        assert self.provider is not None
+        self.provider.generation += 1
+        return output
+
+
+class ReloadingSessionProvider(StaticSessionProvider):
+    def open_session(self):
+        session = super().open_session()
+        self.generation += 1
+        return session
+
+
+def _execution_request(
+    request_id: str,
+    input_token_ids: tuple[int, ...],
+    num_computed_tokens: int,
+    block_ids: tuple[int, ...] | None,
+    *,
+    num_lookahead_tokens: int = 0,
+    max_output_tokens: int = 1,
+) -> ExecutionRequest:
+    return ExecutionRequest(
+        request_id=request_id,
+        input_token_ids=input_token_ids,
+        num_computed_tokens=num_computed_tokens,
+        num_lookahead_tokens=num_lookahead_tokens,
+        max_output_tokens=max_output_tokens,
+        block_ids=block_ids,
+    )
+
+
+def _contiguous_worker(provider, decode_handler=None) -> LocalModelWorker:
+    return LocalModelWorker(
+        provider,
+        partial(
+            ContiguousStepHandler,
+            cache_config=ContiguousKVCacheConfig(),
+        ),
+        decode_handler or StandardDecodeHandler(GreedySampler()),
+    )
+
+
+def _paged_worker(
+    provider,
+    *,
+    num_blocks: int = 8,
+    block_size: int = 2,
+    decode_handler=None,
+) -> LocalModelWorker:
+    return LocalModelWorker(
+        provider,
+        partial(
+            PagedStepHandler,
+            cache_planner=PagedKVCacheConfig(
+                num_blocks=num_blocks,
+                block_size=block_size,
+            ),
+            attention_backend=TorchPagedAttentionBackend(),
+        ),
+        decode_handler or StandardDecodeHandler(GreedySampler()),
+    )
+
+
+def _dense_tiny_logits(model, token_ids: tuple[int, ...]) -> torch.Tensor:
+    input_ids = torch.tensor([token_ids])
+    positions = torch.arange(len(token_ids)).unsqueeze(0)
+    attention = TorchDenseAttention(
+        model.kv_cache_spec,
+        DenseAttentionMetadata(
+            positions=positions,
+            query_lengths=(len(token_ids),),
+        ),
+    )
+    return model(
+        ForwardBatch(
+            input_ids=input_ids,
+            positions=positions,
+            attention=attention,
+        )
+    ).logits
+
+
+def test_reference_executor_delegates_token_choice_to_sampler() -> None:
+    executor = LocalTokenExecutor(StaticSessionProvider(IncrementingForwarder()), FixedSampler())
+
+    assert executor.open_session().next_token((1, 2)) == 7
 
 
 def test_reference_executor_exposes_an_unloaded_model_as_not_ready() -> None:
-    executor = LocalTokenExecutor(UnloadedForwarder(), GreedySampler())
+    executor = LocalTokenExecutor(UnloadedSessionProvider(), GreedySampler())
 
     assert not executor.ready
     with pytest.raises(ExecutionNotReadyError):
-        executor.next_token((1,))
+        executor.open_session()
 
 
 def test_reference_executor_checks_model_output_shape() -> None:
-    executor = LocalTokenExecutor(InvalidOutputForwarder(), GreedySampler())
+    executor = LocalTokenExecutor(StaticSessionProvider(InvalidOutputForwarder()), GreedySampler())
 
     with pytest.raises(ExecutionError, match="model logits"):
-        executor.next_token((1,))
+        executor.open_session().next_token((1,))
 
 
 def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
-    cache = ContiguousKVCache(KVCacheSpec(num_layers=1, num_kv_heads=1, head_size=1))
-    executor = LocalModelExecutor(IncrementingForwarder(), cache, GreedySampler())
+    executor = LocalModelExecutor(
+        _contiguous_worker(StaticSessionProvider(IncrementingForwarder()))
+    )
+    executor.initialize()
     executor.add_request("request", capacity=3)
 
     prefill = executor.execute(
@@ -93,8 +267,9 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                     request_id="request",
                     input_token_ids=(1, 2),
                     num_computed_tokens=0,
+                    num_lookahead_tokens=0,
+                    max_output_tokens=0,
                     block_ids=None,
-                    sampling_required=False,
                 ),
             )
         )
@@ -106,14 +281,340 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                     request_id="request",
                     input_token_ids=(3,),
                     num_computed_tokens=2,
+                    num_lookahead_tokens=0,
+                    max_output_tokens=1,
                     block_ids=None,
-                    sampling_required=True,
                 ),
             )
         )
     ).requests[0]
 
-    assert prefill.num_computed_tokens == 2
-    assert prefill.token_ids == ()
-    assert decode.token_ids == (4,)
-    assert cache.cached_tokens("request") == 3
+    assert prefill.num_input_tokens_computed == 2
+    assert prefill.output_token_ids == ()
+    assert decode.output_token_ids == (4,)
+
+
+def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> None:
+    torch.manual_seed(23)
+    forwarder = CountingAttentionForwarder()
+    executor = LocalModelExecutor(_paged_worker(StaticSessionProvider(forwarder)))
+    executor.initialize()
+    executor.add_request("a", capacity=5)
+    executor.add_request("b", capacity=4)
+
+    prefill = executor.execute(
+        ExecutionBatch(
+            requests=(
+                _execution_request("a", (1, 2, 3), 0, (4, 1)),
+                _execution_request("b", (5, 6), 0, (2,)),
+            )
+        )
+    )
+
+    expected_prefill = tuple(
+        int(_dense_tiny_logits(forwarder.model, tokens)[0, -1].argmax().item())
+        for tokens in ((1, 2, 3), (5, 6))
+    )
+    assert tuple(result.output_token_ids[0] for result in prefill.requests) == expected_prefill
+    assert forwarder.calls == 1
+    torch.testing.assert_close(
+        forwarder.position_batches[0],
+        torch.tensor([[0, 1, 2], [0, 1, 0]]),
+    )
+
+    decode = executor.execute(
+        ExecutionBatch(
+            requests=(
+                _execution_request("a", (expected_prefill[0],), 3, (4, 1)),
+                _execution_request("b", (expected_prefill[1],), 2, (2, 3)),
+            )
+        )
+    )
+    expected_decode = tuple(
+        int(_dense_tiny_logits(forwarder.model, tokens + (generated,))[0, -1].argmax().item())
+        for tokens, generated in zip(
+            ((1, 2, 3), (5, 6)),
+            expected_prefill,
+            strict=True,
+        )
+    )
+
+    assert tuple(result.output_token_ids[0] for result in decode.requests) == expected_decode
+    assert forwarder.calls == 2
+    torch.testing.assert_close(forwarder.position_batches[1], torch.tensor([[3], [2]]))
+
+
+def test_paged_step_rejects_execution_without_block_tables() -> None:
+    forwarder = CountingAttentionForwarder()
+    executor = LocalModelExecutor(_paged_worker(StaticSessionProvider(forwarder), num_blocks=2))
+    executor.initialize()
+    executor.add_request("request", capacity=2)
+
+    with pytest.raises(ExecutionError, match="requires a block table"):
+        executor.execute(ExecutionBatch(requests=(_execution_request("request", (1,), 0, None),)))
+
+
+def test_worker_rejects_a_model_change_during_step_initialization() -> None:
+    executor = LocalModelExecutor(
+        _paged_worker(ReloadingSessionProvider(CountingAttentionForwarder()), num_blocks=2)
+    )
+
+    with pytest.raises(ExecutionError, match="model changed while initializing"):
+        executor.initialize()
+
+
+def test_worker_finishes_with_its_session_after_runner_reload() -> None:
+    forwarder = ReloadingDuringForward()
+    provider = StaticSessionProvider(forwarder)
+    forwarder.provider = provider
+    executor = LocalModelExecutor(_paged_worker(provider, num_blocks=2))
+    executor.initialize()
+    executor.add_request("request", capacity=2)
+
+    output = executor.execute(
+        ExecutionBatch(requests=(_execution_request("request", (1,), 0, (0,)),))
+    )
+
+    assert len(output.requests[0].output_token_ids) == 1
+    assert not executor.ready
+    with pytest.raises(ExecutionError, match="active requests"):
+        executor.initialize()
+    with pytest.raises(ExecutionNotReadyError):
+        executor.add_request("new", capacity=2)
+
+
+def test_worker_rebuilds_its_step_after_old_requests_finish() -> None:
+    old_model = IncrementingForwarder()
+    new_model = IncrementingForwarder()
+    new_model.generation = 2
+    provider = MutableSessionProvider(old_model)
+    worker = _contiguous_worker(provider)
+    worker.initialize()
+    worker.add_request("old", capacity=1)
+
+    provider.session = new_model
+
+    assert not worker.ready
+    assert worker.execute(
+        ExecutionBatch(requests=(_execution_request("old", (1,), 0, None),))
+    ).requests[0].output_token_ids == (2,)
+    assert worker.free_request("old")
+
+    worker.initialize()
+    worker.add_request("new", capacity=1)
+
+    assert worker.ready
+    assert worker.execute(
+        ExecutionBatch(requests=(_execution_request("new", (2,), 0, None),))
+    ).requests[0].output_token_ids == (3,)
+
+
+def test_worker_capabilities_come_from_the_selected_step_handler() -> None:
+    contiguous = _contiguous_worker(StaticSessionProvider(IncrementingForwarder()))
+    paged = _paged_worker(
+        StaticSessionProvider(CountingAttentionForwarder()),
+        num_blocks=3,
+        block_size=2,
+    )
+
+    contiguous.initialize()
+    paged.initialize()
+
+    assert contiguous.capabilities.max_kv_cache_tokens is None
+    assert paged.capabilities.max_kv_cache_tokens == 6
+
+
+def test_contiguous_step_rejects_a_block_table() -> None:
+    executor = LocalModelExecutor(
+        _contiguous_worker(StaticSessionProvider(IncrementingForwarder()))
+    )
+    executor.initialize()
+    executor.add_request("request", capacity=2)
+
+    with pytest.raises(ExecutionError, match="does not accept a block table"):
+        executor.execute(ExecutionBatch(requests=(_execution_request("request", (1,), 0, (0,)),)))
+
+
+def test_contiguous_step_can_resume_after_a_speculative_suffix_is_rejected() -> None:
+    model = IncrementingForwarder()
+    step = ContiguousStepHandler(model, ContiguousKVCacheConfig())
+    step.add_request("request", capacity=3)
+    step.forward(
+        model,
+        ExecutionBatch(
+            requests=(_execution_request("request", (1, 2), 0, None, max_output_tokens=0),)
+        ),
+    )
+
+    step.truncate("request", 1)
+    logits = step.forward(
+        model,
+        ExecutionBatch(
+            requests=(_execution_request("request", (3,), 1, None, max_output_tokens=0),)
+        ),
+    )
+
+    assert logits[0].shape == (1, model.vocab_size)
+
+
+@pytest.mark.parametrize(
+    "worker",
+    [
+        _contiguous_worker(StaticSessionProvider(IncrementingForwarder())),
+        _paged_worker(
+            StaticSessionProvider(CountingAttentionForwarder()),
+            num_blocks=2,
+        ),
+    ],
+    ids=("contiguous", "paged"),
+)
+def test_standard_decode_rejects_lookahead_for_every_step(worker) -> None:
+    worker.initialize()
+    worker.add_request("request", capacity=2)
+    block_ids = None if worker.capabilities.max_kv_cache_tokens is None else (0,)
+
+    with pytest.raises(ExecutionError, match="does not consume lookahead"):
+        worker.execute(
+            ExecutionBatch(
+                requests=(
+                    _execution_request(
+                        "request",
+                        (1,),
+                        0,
+                        block_ids,
+                        num_lookahead_tokens=1,
+                        max_output_tokens=2,
+                    ),
+                )
+            )
+        )
+
+
+def test_worker_composes_step_and_decode_handlers_without_mode_branches() -> None:
+    class Lease:
+        def release(self) -> None:
+            return
+
+    class RecordingStep:
+        max_kv_cache_tokens = 17
+
+        def __init__(self) -> None:
+            self.added: list[tuple[str, int]] = []
+            self.freed: list[str] = []
+
+        def add_request(self, request_id: str, *, capacity: int) -> None:
+            self.added.append((request_id, capacity))
+
+        def free_request(self, request_id: str) -> None:
+            self.freed.append(request_id)
+
+        def acquire(self, request_ids: tuple[str, ...]):
+            return Lease()
+
+        def forward(self, model, batch):
+            raise AssertionError("decode handler controls when a model step runs")
+
+        def truncate(self, request_id: str, num_cached_tokens: int) -> None:
+            return
+
+    class MultiTokenDecode:
+        def __init__(self) -> None:
+            self.call = None
+
+        def execute(self, model, batch, step):
+            self.call = (model, batch, step)
+            return ExecutionOutput(
+                requests=(
+                    RequestOutput(
+                        request_id=batch.requests[0].request_id,
+                        num_input_tokens_computed=1,
+                        output_token_ids=(2, 3, 4),
+                        num_cached_output_tokens=2,
+                    ),
+                )
+            )
+
+    model = IncrementingForwarder()
+    step = RecordingStep()
+    decode = MultiTokenDecode()
+    worker = LocalModelWorker(
+        StaticSessionProvider(model),
+        lambda _model: step,
+        decode,
+    )
+    worker.initialize()
+    worker.add_request("request", capacity=5)
+    batch = ExecutionBatch(
+        requests=(
+            _execution_request(
+                "request",
+                (1,),
+                0,
+                None,
+                num_lookahead_tokens=2,
+                max_output_tokens=3,
+            ),
+        )
+    )
+
+    output = worker.execute(batch)
+
+    assert worker.capabilities == ExecutionCapabilities(None, 17)
+    assert step.added == [("request", 5)]
+    assert decode.call == (model, batch, step)
+    assert output.requests[0].output_token_ids == (2, 3, 4)
+    assert output.requests[0].num_cached_output_tokens == 2
+    assert worker.free_request("request")
+    assert step.freed == ["request"]
+
+
+def test_local_model_executor_delegates_without_changing_values() -> None:
+    class Lease:
+        def release(self) -> None:
+            return
+
+    class Worker:
+        ready = True
+        capabilities = ExecutionCapabilities(23, 19)
+
+        def __init__(self) -> None:
+            self.calls: list[tuple] = []
+            self.lease = Lease()
+            self.output = ExecutionOutput(requests=(RequestOutput("request", 1, (2,)),))
+
+        def initialize(self) -> None:
+            self.calls.append(("initialize",))
+
+        def add_request(self, request_id: str, *, capacity: int) -> None:
+            self.calls.append(("add", request_id, capacity))
+
+        def free_request(self, request_id: str) -> bool:
+            self.calls.append(("free", request_id))
+            return True
+
+        def acquire(self, request_ids: tuple[str, ...]):
+            self.calls.append(("acquire", request_ids))
+            return self.lease
+
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            self.calls.append(("execute", batch))
+            return self.output
+
+    worker = Worker()
+    executor = LocalModelExecutor(worker)
+    batch = ExecutionBatch(requests=(_execution_request("request", (1,), 0, None),))
+
+    assert executor.ready
+    assert executor.capabilities is worker.capabilities
+    executor.initialize()
+    executor.add_request("request", capacity=3)
+    assert executor.acquire(("request",)) is worker.lease
+    assert executor.execute(batch) is worker.output
+    assert executor.free_request("request")
+    assert worker.calls == [
+        ("initialize",),
+        ("add", "request", 3),
+        ("acquire", ("request",)),
+        ("execute", batch),
+        ("free", "request"),
+    ]

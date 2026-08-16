@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 authors = [{ name = "poorpaper" }]
 dependencies = [
   "numpy>=1.26",
+  "safetensors>=0.4.3",
   "torch>=2.2",
 ]
 
@@ -24,6 +25,9 @@ dev = [
   "httpx2>=2.0",
   "pytest>=8.0",
   "ruff>=0.9",
+]
+validation = [
+  "transformers>=4.43,<5",
 ]
 
 [project.scripts]

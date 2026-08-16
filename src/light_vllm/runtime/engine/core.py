@@ -8,6 +8,8 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from itertools import count
 
+from light_vllm.runtime.engine.admission import CapacityAdmission
+from light_vllm.runtime.engine.interfaces import EngineCapabilities, RequestAdmission
 from light_vllm.runtime.execution.interfaces import (
     ExecutionBatch,
     ExecutionError,
@@ -56,6 +58,8 @@ def _execution_error(exc: Exception) -> GenerationError:
 
 
 def _validated_output(batch: ExecutionBatch, output: ExecutionOutput) -> dict[str, RequestOutput]:
+    """先检查执行结果是否与本轮输入和预算一致，再更新请求状态。"""
+
     if not isinstance(output, ExecutionOutput):
         raise ExecutionError("model executor must return ExecutionOutput")
     by_request_id = {result.request_id: result for result in output.requests}
@@ -63,14 +67,20 @@ def _validated_output(batch: ExecutionBatch, output: ExecutionOutput) -> dict[st
         raise ExecutionError("model executor must return one result for every request")
     for request in batch.requests:
         result = by_request_id[request.request_id]
-        if result.num_computed_tokens != len(request.input_token_ids):
+        if result.num_input_tokens_computed != len(request.input_token_ids):
             raise ExecutionError("executor computed-token count does not match its input")
-        if bool(result.token_ids) != request.sampling_required:
+        if len(result.output_token_ids) > request.max_output_tokens:
+            raise ExecutionError("executor returned more tokens than the execution budget")
+        if bool(result.output_token_ids) != bool(request.max_output_tokens):
             raise ExecutionError("executor returned tokens at the wrong scheduling boundary")
+        if result.num_cached_output_tokens > request.num_lookahead_tokens:
+            raise ExecutionError("executor cached more output tokens than reserved lookahead")
     return by_request_id
 
 
 async def _await_safe_boundary(task: asyncio.Task[None]) -> None:
+    """即使调用方取消，也要等清理任务结束，避免缓存仍在使用时被释放。"""
+
     try:
         await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -82,14 +92,23 @@ async def _await_safe_boundary(task: asyncio.Task[None]) -> None:
 class EngineCore:
     """按 ``schedule → execute → update`` 驱动所有活动请求。
 
-    Engine 拥有请求和事件；Scheduler 拥有策略与逻辑 KV 分配；Executor
-    拥有 tensor 和模型计算。三个阶段只通过不可变值传递状态。
+    Engine 保存请求和输出事件；Scheduler 决定哪些请求本轮运行并分配 KV；
+    Executor 负责张量和模型计算。三者只交换本轮输入和结果，不直接修改
+    对方内部状态。
     """
 
-    def __init__(self, executor: ModelExecutor, scheduler: Scheduler) -> None:
+    def __init__(
+        self,
+        executor: ModelExecutor,
+        scheduler: Scheduler,
+        admission: RequestAdmission | None = None,
+    ) -> None:
         self._executor = executor
         self._scheduler = scheduler
+        self._admission = admission or CapacityAdmission()
         self._states: dict[str, _RequestState] = {}
+        self._executing_request_ids: set[str] = set()
+        self._pending_scheduler_removals: set[str] = set()
         self._request_ids = count(1)
         self._lock = asyncio.Lock()
         self._driver_task: asyncio.Task[None] | None = None
@@ -98,6 +117,16 @@ class EngineCore:
     @property
     def ready(self) -> bool:
         return not self._closed and self._executor.ready
+
+    @property
+    def capabilities(self) -> EngineCapabilities:
+        execution = self._executor.capabilities
+        return EngineCapabilities(
+            max_model_tokens=execution.max_model_tokens,
+            max_kv_cache_tokens=execution.max_kv_cache_tokens,
+            max_num_sequences=self._scheduler.max_num_sequences,
+            max_num_scheduled_tokens=self._scheduler.max_num_scheduled_tokens,
+        )
 
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         generated_token_ids: list[int] = []
@@ -154,6 +183,8 @@ class EngineCore:
                 raise GenerationError("generation engine is closed")
             if not self._executor.ready:
                 raise GenerationNotReadyError("load a model before generating")
+            # 请求即使独占引擎也装不下时立即拒绝；暂时没资源则进入调度等待。
+            self._admission.validate(request, self.capabilities)
 
             request_id = f"request-{next(self._request_ids)}"
             state = _RequestState(request_id, request, list(request.input_ids))
@@ -193,16 +224,24 @@ class EngineCore:
                     scheduled = self._scheduler.schedule()
                     batch = self._build_execution_batch_locked(scheduled)
                     lease = self._executor.acquire(batch.request_ids)
+                    self._executing_request_ids.update(batch.request_ids)
 
+                # 锁内只生成计划并保留缓存；耗时的模型计算在线程和锁外执行。
                 try:
                     raw_output = await asyncio.to_thread(self._executor.execute, batch)
+                    # 结果完整通过检查前，不更新请求进度，也不提交 KV cache。
                     output = _validated_output(batch, raw_output)
                 except Exception as exc:
                     async with self._lock:
                         self._fail_batch_locked(scheduled.request_ids, exc)
                     continue
                 finally:
-                    lease.release()
+                    try:
+                        # 等模型不再使用缓存后，调度器才可以回收对应 block。
+                        lease.release()
+                    finally:
+                        async with self._lock:
+                            self._finish_execution_locked(batch.request_ids)
 
                 async with self._lock:
                     self._apply_output_locked(scheduled, output)
@@ -221,6 +260,7 @@ class EngineCore:
         for item in scheduled.requests:
             state = self._states[item.request_id]
             end = item.num_computed_tokens + item.num_scheduled_tokens
+            # Scheduler 只给位置和数量，真实 token ID 由 Engine 请求状态切出。
             input_token_ids = tuple(state.token_ids[item.num_computed_tokens : end])
             if len(input_token_ids) != item.num_scheduled_tokens:
                 raise SchedulerError("scheduler selected tokens outside the request state")
@@ -229,8 +269,9 @@ class EngineCore:
                     request_id=item.request_id,
                     input_token_ids=input_token_ids,
                     num_computed_tokens=item.num_computed_tokens,
+                    num_lookahead_tokens=item.num_lookahead_tokens,
+                    max_output_tokens=item.max_output_tokens,
                     block_ids=item.block_ids,
-                    sampling_required=item.sampling_required,
                 )
             )
         return ExecutionBatch(requests=tuple(requests))
@@ -245,12 +286,18 @@ class EngineCore:
             if state is None:
                 continue
             result = output[item.request_id]
-            visible_tokens, finish_reason = self._visible_tokens(state, result.token_ids)
+            # 一次返回多个 token 时，遇到 EOS 或长度上限就截断后面的结果。
+            visible_tokens, finish_reason = self._visible_tokens(state, result.output_token_ids)
+            num_cached_visible_tokens = min(
+                result.num_cached_output_tokens,
+                len(visible_tokens),
+            )
             self._scheduler.complete(
                 item.request_id,
-                num_computed_tokens=result.num_computed_tokens,
+                num_committed_tokens=(result.num_input_tokens_computed + num_cached_visible_tokens),
                 num_new_tokens=len(visible_tokens),
             )
+            # 已确认但尚未写入 KV cache 的 token，会在下一轮作为输入再计算一次。
             for token_id in visible_tokens:
                 position = state.generated_count
                 state.token_ids.append(token_id)
@@ -280,9 +327,21 @@ class EngineCore:
     def _remove_request_locked(self, request_id: str) -> _RequestState | None:
         state = self._states.pop(request_id, None)
         if state is not None:
-            self._scheduler.remove(request_id)
+            # 取消立即让请求离开 Engine 和 Worker，但执行中的 block table 必须
+            # 保留到当前同步模型步骤结束，避免物理页被过早复用。
+            if request_id in self._executing_request_ids:
+                self._pending_scheduler_removals.add(request_id)
+            else:
+                self._scheduler.remove(request_id)
             self._executor.free_request(request_id)
         return state
+
+    def _finish_execution_locked(self, request_ids: tuple[str, ...]) -> None:
+        for request_id in request_ids:
+            self._executing_request_ids.discard(request_id)
+            if request_id in self._pending_scheduler_removals:
+                self._pending_scheduler_removals.remove(request_id)
+                self._scheduler.remove(request_id)
 
     def _fail_batch_locked(self, request_ids: tuple[str, ...], exc: Exception) -> None:
         for request_id in request_ids:

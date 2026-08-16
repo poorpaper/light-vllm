@@ -8,6 +8,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import suppress
 from typing import TypeVar
 
+from light_vllm.runtime.engine.interfaces import EngineCapabilities
 from light_vllm.runtime.generation.interfaces import (
     GenerateRequest,
     GenerateResult,
@@ -56,14 +57,23 @@ async def _run_sync_step(
 class InProcessEngineClient:
     """在当前进程内，把同步生成服务包装成异步接口。"""
 
-    def __init__(self, service: GenerationService) -> None:
+    def __init__(
+        self,
+        service: GenerationService,
+        capabilities: EngineCapabilities | None = None,
+    ) -> None:
         self._service = service
+        self._capabilities = capabilities or EngineCapabilities()
         # 让并发请求先在事件循环中排队，等待时不占用工作线程。
         self._admission_lock = asyncio.Lock()
 
     @property
     def ready(self) -> bool:
         return self._service.ready
+
+    @property
+    def capabilities(self) -> EngineCapabilities:
+        return self._capabilities
 
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         """读取完整事件流，并整理成生成结果。"""

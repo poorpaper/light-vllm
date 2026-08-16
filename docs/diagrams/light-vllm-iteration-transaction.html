@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>light-vllm 普通解码与投机解码的共同执行契约</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+    :root {
+      --paper:#f5f5f5; --ink:#2d3142; --muted:#4f5d75; --soft:#7a8399;
+      --accent:#eb6c36; --link:#2e5aa8; --rule:rgba(45,49,66,.12);
+      --sans:'Geist','Noto Sans SC','Microsoft YaHei',sans-serif;
+      --serif:'Instrument Serif','Noto Serif SC',serif;
+      --mono:'Geist Mono','Noto Sans Mono CJK SC',monospace;
+    }
+    body { min-height:100vh; padding:48px 32px; background:var(--paper); color:var(--ink); font-family:var(--sans); display:flex; justify-content:center; }
+    .frame { width:100%; max-width:1280px; }
+    .eyebrow { margin-bottom:8px; color:var(--muted); font:500 8px/1 var(--mono); letter-spacing:.18em; text-transform:uppercase; }
+    h1 { margin-bottom:8px; font:400 28px/1.15 var(--serif); letter-spacing:-.02em; }
+    .subtitle { max-width:1080px; margin-bottom:24px; color:var(--muted); font:400 12px/1.6 var(--sans); }
+    svg { width:100%; min-width:1080px; display:block; }
+    .notes { display:grid; grid-template-columns:1.1fr .9fr; gap:24px; margin-top:24px; }
+    .card { padding:20px; background:#fff; border:1px solid var(--rule); border-radius:6px; }
+    .card h2 { margin-bottom:8px; font:600 12px/1.4 var(--sans); }
+    .card p { color:var(--muted); font:400 12px/1.65 var(--sans); }
+    code { font-family:var(--mono); font-size:11px; color:var(--ink); }
+  </style>
+</head>
+<body>
+  <main class="frame">
+    <p class="eyebrow">Sequence · ordinary vs speculative · reservation and commit · engineer</p>
+    <h1>普通解码与投机解码，如何共用同一条执行路径</h1>
+    <p class="subtitle">Scheduler 不给请求贴 prefill/decode 模式标签，只报告本轮已知输入、投机预留和最大输出数。同一个 LocalModelWorker 注入不同 DecodeHandler；Engine 最终只接收“算完多少输入、确认哪些 token、其中多少已经写入 KV cache”。</p>
+
+    <svg viewBox="0 0 1280 920" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="light-vllm-iteration-transaction-title light-vllm-iteration-transaction-desc">
+      <title id="light-vllm-iteration-transaction-title">light-vllm 普通解码与投机解码的共同执行契约</title>
+      <desc id="light-vllm-iteration-transaction-desc">展示 Engine、Scheduler、Executor、解码策略和事件流之间的单轮时序，并对比当前普通解码和未来投机解码如何使用相同的 ExecutionRequest 与 RequestOutput，最后按实际缓存前缀提交 KV。</desc>
+      <defs>
+        <marker id="lvtx-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f5d75"/></marker>
+        <marker id="lvtx-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#eb6c36"/></marker>
+        <marker id="lvtx-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#2e5aa8"/></marker>
+      </defs>
+      <rect width="1280" height="920" fill="#f5f5f5"/>
+
+      <!-- Lifelines -->
+      <g stroke="rgba(45,49,66,.20)" stroke-width="1" stroke-dasharray="3,3">
+        <line x1="120" y1="96" x2="120" y2="744"/>
+        <line x1="360" y1="96" x2="360" y2="744"/>
+        <line x1="640" y1="96" x2="640" y2="744"/>
+        <line x1="920" y1="96" x2="920" y2="744"/>
+        <line x1="1160" y1="96" x2="1160" y2="744"/>
+      </g>
+
+      <!-- ALT fragment -->
+      <rect x="604" y="288" width="352" height="256" rx="4" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.22)" stroke-width="1"/>
+      <rect x="604" y="288" width="40" height="16" rx="2" fill="#f5f5f5" stroke="rgba(45,49,66,.22)" stroke-width="1"/>
+      <text x="624" y="300" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing=".12em">ALT</text>
+      <text x="620" y="320" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">[当前实现：StandardDecodeHandler，lookahead = 0]</text>
+      <line x1="612" y1="400" x2="948" y2="400" stroke="rgba(45,49,66,.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="620" y="432" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace">[扩展边界已就绪：投机 DecodeHandler 尚未实现]</text>
+
+      <!-- Messages, all drawn before actors -->
+      <line x1="120" y1="136" x2="360" y2="136" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <rect x="204" y="116" width="72" height="12" rx="2" fill="#f5f5f5"/><text x="240" y="124" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">schedule()</text>
+
+      <path d="M360 168 H408 V200 H360" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <rect x="388" y="172" width="240" height="12" rx="2" fill="#f5f5f5"/><text x="508" y="180" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">pending = known − computed；reserve input + lookahead</text>
+
+      <line x1="360" y1="224" x2="120" y2="224" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#lvtx-arrow)"/>
+      <rect x="116" y="204" width="248" height="12" rx="2" fill="#f5f5f5"/><text x="240" y="212" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">computed · scheduled · lookahead · max_output · blocks</text>
+
+      <line x1="120" y1="264" x2="640" y2="264" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#lvtx-arrow-link)"/>
+      <rect x="284" y="244" width="192" height="12" rx="2" fill="#f5f5f5"/><text x="380" y="252" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">ExecutionRequest：真实 input IDs + budgets</text>
+
+      <!-- Ordinary branch -->
+      <line x1="640" y1="344" x2="920" y2="344" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <rect x="716" y="324" width="128" height="12" rx="2" fill="#f5f5f5"/><text x="780" y="332" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">step.forward + sample</text>
+      <line x1="920" y1="376" x2="640" y2="376" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#lvtx-arrow)"/>
+      <rect x="724" y="356" width="112" height="12" rx="2" fill="#f5f5f5"/><text x="780" y="364" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">outputs=[t] · cached=0</text>
+
+      <!-- Speculative branch -->
+      <line x1="640" y1="456" x2="920" y2="456" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <rect x="716" y="436" width="128" height="12" rx="2" fill="#f5f5f5"/><text x="780" y="444" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">propose up to L candidates</text>
+      <path d="M920 480 H968 V512 H920" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <rect x="980" y="484" width="176" height="12" rx="2" fill="#f5f5f5"/><text x="1068" y="492" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">target verify + acceptance sampling</text>
+      <line x1="920" y1="528" x2="640" y2="528" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#lvtx-arrow)"/>
+      <rect x="696" y="508" width="168" height="12" rx="2" fill="#f5f5f5"/><text x="780" y="516" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">N confirmed · first C cached · C ≤ L</text>
+
+      <!-- Common result path -->
+      <line x1="640" y1="576" x2="120" y2="576" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#lvtx-arrow)"/>
+      <rect x="264" y="556" width="232" height="12" rx="2" fill="#f5f5f5"/><text x="380" y="564" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">RequestOutput(input_done, output_ids, cached_count)</text>
+
+      <path d="M120 600 H168 V632 H120" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <rect x="180" y="604" width="168" height="12" rx="2" fill="#f5f5f5"/><text x="264" y="612" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">validate；遇到 EOS / length 截断</text>
+
+      <line x1="120" y1="648" x2="360" y2="648" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <rect x="120" y="628" width="240" height="12" rx="2" fill="#f5f5f5"/><text x="240" y="636" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">complete(input_done + cached_visible, visible_count)</text>
+
+      <path d="M360 672 H408 V704 H360" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <rect x="404" y="676" width="184" height="12" rx="2" fill="#f5f5f5"/><text x="496" y="684" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">commit cached prefix；trim unused pages</text>
+
+      <line x1="120" y1="720" x2="1160" y2="720" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lvtx-arrow-accent)"/>
+      <rect x="560" y="700" width="160" height="12" rx="2" fill="#f5f5f5"/><text x="640" y="708" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">逐个 emit visible token / finished</text>
+
+      <!-- Activation bars -->
+      <rect x="116" y="132" width="8" height="596" fill="rgba(45,49,66,.06)" stroke="#4f5d75" stroke-width=".8"/>
+      <rect x="356" y="132" width="8" height="580" fill="rgba(45,49,66,.06)" stroke="#4f5d75" stroke-width=".8"/>
+      <rect x="636" y="260" width="8" height="324" fill="rgba(45,49,66,.06)" stroke="#4f5d75" stroke-width=".8"/>
+      <rect x="916" y="340" width="8" height="196" fill="rgba(45,49,66,.06)" stroke="#4f5d75" stroke-width=".8"/>
+
+      <!-- Actors -->
+      <g>
+        <rect x="52" y="44" width="136" height="52" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="120" y="64" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">EngineCore</text>
+        <text x="120" y="84" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">request state · events</text>
+      </g>
+      <g>
+        <rect x="276" y="44" width="168" height="52" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="360" y="64" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Scheduler + Logical KV</text>
+        <text x="360" y="84" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">budget · reserve · commit</text>
+      </g>
+      <g>
+        <rect x="556" y="44" width="168" height="52" rx="6" fill="#fff" stroke="#2d3142" stroke-width="1"/>
+        <text x="640" y="64" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">LocalModelWorker</text>
+        <text x="640" y="84" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">via executor · fixed model</text>
+      </g>
+      <g>
+        <rect x="836" y="44" width="168" height="52" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+        <text x="920" y="64" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Decode + Step Handlers</text>
+        <text x="920" y="84" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">ordinary now · speculative future</text>
+      </g>
+      <g>
+        <rect x="1080" y="44" width="160" height="52" rx="6" fill="rgba(46,90,168,.06)" stroke="#2e5aa8" stroke-width="1"/>
+        <text x="1160" y="64" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Event stream</text>
+        <text x="1160" y="84" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">token · finished</text>
+      </g>
+
+      <!-- Mode facts -->
+      <rect x="40" y="768" width="1200" height="96" rx="8" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="56" y="792" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">NO PREFILL / DECODE ENUM · BEHAVIOR COMES FROM COUNTS</text>
+      <line x1="440" y1="800" x2="440" y2="852" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <line x1="840" y1="800" x2="840" y2="852" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="64" y="820" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif">Chunked input / prefill</text>
+      <text x="64" y="840" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">scheduled &lt; pending → max_output=0 → 只推进已知输入</text>
+      <text x="464" y="820" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif">普通输出步骤 · 当前已实现</text>
+      <text x="464" y="840" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">scheduled == pending · lookahead=0 · max_output=1</text>
+      <text x="864" y="820" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif">投机输出步骤 · 仅契约兼容</text>
+      <text x="864" y="840" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">scheduled == pending · lookahead=L&gt;0 · max_output&gt;1</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="888" x2="1240" y2="888" stroke="rgba(45,49,66,.12)" stroke-width=".8"/>
+      <text x="40" y="912" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">READING KEY</text>
+      <line x1="160" y1="904" x2="200" y2="904" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
+      <text x="212" y="908" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">call</text>
+      <line x1="288" y1="904" x2="328" y2="904" stroke="#4f5d75" stroke-width="1" stroke-dasharray="5,4" marker-end="url(#lvtx-arrow)"/>
+      <text x="340" y="908" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">return</text>
+      <rect x="432" y="896" width="16" height="12" rx="2" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1"/>
+      <text x="456" y="908" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">current/future boundary</text>
+      <text x="680" y="908" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">commit = input_done + min(cached_count, visible_count)</text>
+    </svg>
+
+    <section class="notes" aria-label="投机解码契约说明">
+      <article class="card">
+        <h2>为什么 <code>RequestOutput</code> 需要两个计数维度</h2>
+        <p><code>output_token_ids</code> 表示已经确认、可以对用户可见的 token；<code>num_cached_output_tokens</code> 表示其中有多少已经随 target verify 写入 KV cache。前者决定事件流，后者决定本轮能提交多少 KV。</p>
+      </article>
+      <article class="card">
+        <h2>尚未写入缓存的确认 token 去哪里</h2>
+        <p>Engine 仍把它追加到请求 token 列表，但 Scheduler 不把它计为 computed。下一轮它自然成为普通输入再计算一次。投机解码常见的 bonus 或 replacement token 可以使用这条路径，不需要新增专用 Engine。</p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

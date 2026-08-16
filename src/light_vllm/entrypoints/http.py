@@ -10,6 +10,7 @@ import argparse
 import json
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -21,11 +22,21 @@ from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
+from light_vllm.runtime.execution.paged_attention import TorchPagedAttentionBackend
+from light_vllm.runtime.execution.paged_cache import (
+    CudaMemoryKVCachePlanner,
+    PagedKVCacheConfig,
+    PagedKVCachePlanner,
+)
+from light_vllm.runtime.execution.worker import (
+    ContiguousStepHandler,
+    LocalModelWorker,
+    PagedStepHandler,
+    StandardDecodeHandler,
+)
 from light_vllm.runtime.generation.reference import ReferenceGenerationService
 from light_vllm.runtime.kv_cache import (
-    ContiguousKVCache,
-    KVCacheManager,
-    KVCacheSpec,
+    ContiguousKVCacheConfig,
     PagedKVCacheManager,
     UnboundedKVCacheManager,
 )
@@ -45,19 +56,29 @@ RuntimeMode = Literal["reference", "engine"]
 KVReservationMode = Literal["blocks", "unbounded"]
 
 
-def _create_kv_manager(
-    mode: KVReservationMode,
+def _create_paged_cache_planner(
+    spec: ModelSpec,
     *,
-    num_blocks: int,
+    num_blocks: int | None,
     block_size: int,
-) -> KVCacheManager:
-    # 选择只在装配层发生，Scheduler 和 Engine 不感知具体缓存策略。
-    if mode == "blocks":
-        return PagedKVCacheManager(num_blocks=num_blocks, block_size=block_size)
-    if mode == "unbounded":
-        # 无 block 模式忽略分页参数，仅用于对比实验。
-        return UnboundedKVCacheManager()
-    raise ValueError(f"unsupported KV reservation mode: {mode}")
+    memory_fraction: float,
+) -> PagedKVCachePlanner:
+    if num_blocks is not None:
+        # CPU 无法发现显存容量，因此测试时直接指定固定页数。
+        return PagedKVCacheConfig(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            dtype=spec.dtype,
+            device=spec.device,
+        )
+    if torch.device(spec.device).type == "cuda":
+        return CudaMemoryKVCachePlanner(
+            block_size=block_size,
+            dtype=spec.dtype,
+            device=spec.device,
+            memory_fraction=memory_fraction,
+        )
+    raise ValueError("CPU paged execution requires an explicit num_kv_blocks")
 
 
 def create_serving_app(
@@ -67,11 +88,9 @@ def create_serving_app(
     kv_reservation: KVReservationMode = "blocks",
     max_num_sequences: int = 8,
     max_num_scheduled_tokens: int = 256,
-    num_kv_blocks: int = 256,
+    num_kv_blocks: int | None = None,
     kv_block_size: int = 16,
-    kv_num_layers: int = 1,
-    kv_num_heads: int = 1,
-    kv_head_size: int = 64,
+    kv_cache_memory_fraction: float = 0.8,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -86,6 +105,7 @@ def create_serving_app(
     # reference client 没有常驻 driver；只有批量 Engine 需要在 lifespan
     # 结束时显式等待当前模型迭代完成。
     close_engine: Callable[[], Awaitable[None]] | None = None
+    initialize_executor: Callable[[], None] | None = None
     sampler = GreedySampler()
     if runtime == "reference":
         # 保留原始单请求基线，继续通过轻量 sync-to-async bridge 对外服务。
@@ -95,26 +115,38 @@ def create_serving_app(
     else:
         if runtime != "engine":
             raise ValueError(f"unsupported runtime mode: {runtime}")
-        tensor_cache = ContiguousKVCache(
-            KVCacheSpec(
-                num_layers=kv_num_layers,
-                num_kv_heads=kv_num_heads,
-                head_size=kv_head_size,
-                dtype=spec.dtype,
-                device=spec.device,
+        if kv_reservation == "blocks":
+            cache_planner = _create_paged_cache_planner(
+                spec,
+                num_blocks=num_kv_blocks,
+                block_size=kv_block_size,
+                memory_fraction=kv_cache_memory_fraction,
             )
-        )
-        logical_cache = _create_kv_manager(
-            kv_reservation,
-            num_blocks=num_kv_blocks,
-            block_size=kv_block_size,
-        )
-        model_executor = LocalModelExecutor(
+            # 同一容量对象同时交给逻辑分配和物理页池，避免两份配置漂移。
+            logical_cache = PagedKVCacheManager(cache_planner)
+            step_factory = partial(
+                PagedStepHandler,
+                cache_planner=cache_planner,
+                attention_backend=TorchPagedAttentionBackend(),
+            )
+        elif kv_reservation == "unbounded":
+            # 连续缓存也直接读取模型声明的 KV 形状，这里只指定设备和数据类型。
+            logical_cache = UnboundedKVCacheManager()
+            step_factory = partial(
+                ContiguousStepHandler,
+                cache_config=ContiguousKVCacheConfig(
+                    dtype=spec.dtype,
+                    device=spec.device,
+                ),
+            )
+        else:
+            raise ValueError(f"unsupported KV reservation mode: {kv_reservation}")
+        worker = LocalModelWorker(
             runner,
-            tensor_cache,
-            sampler,
-            device=spec.device,
+            step_factory,
+            StandardDecodeHandler(sampler),
         )
+        model_executor = LocalModelExecutor(worker)
         scheduler = TokenBudgetScheduler(
             logical_cache,
             max_num_sequences=max_num_sequences,
@@ -123,11 +155,14 @@ def create_serving_app(
         engine_core = EngineCore(model_executor, scheduler)
         engine = engine_core
         close_engine = engine_core.close
+        initialize_executor = model_executor.initialize
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # 模型加载成功后服务才会就绪；加载失败就停止启动。
         runner.load(spec)
+        if initialize_executor is not None:
+            initialize_executor()
         try:
             yield
         finally:
@@ -163,15 +198,17 @@ def _create_parser() -> argparse.ArgumentParser:
         "--kv-reservation",
         choices=("blocks", "unbounded"),
         default="blocks",
-        help="use logical KV blocks or an unbounded no-block experiment baseline",
+        help="use physical paged KV or a contiguous unbounded experiment baseline",
     )
     parser.add_argument("--max-num-sequences", type=int, default=8)
     parser.add_argument("--max-num-scheduled-tokens", type=int, default=256)
-    parser.add_argument("--num-kv-blocks", type=int, default=256)
+    parser.add_argument(
+        "--num-kv-blocks",
+        type=int,
+        help="fixed paged-KV capacity; required for CPU correctness mode",
+    )
     parser.add_argument("--kv-block-size", type=int, default=16)
-    parser.add_argument("--kv-num-layers", type=int, default=1)
-    parser.add_argument("--kv-num-heads", type=int, default=1)
-    parser.add_argument("--kv-head-size", type=int, default=64)
+    parser.add_argument("--kv-cache-memory-fraction", type=float, default=0.8)
     return parser
 
 
@@ -196,9 +233,7 @@ def main() -> None:
             max_num_scheduled_tokens=args.max_num_scheduled_tokens,
             num_kv_blocks=args.num_kv_blocks,
             kv_block_size=args.kv_block_size,
-            kv_num_layers=args.kv_num_layers,
-            kv_num_heads=args.kv_num_heads,
-            kv_head_size=args.kv_head_size,
+            kv_cache_memory_fraction=args.kv_cache_memory_fraction,
         ),
         host=args.host,
         port=args.port,

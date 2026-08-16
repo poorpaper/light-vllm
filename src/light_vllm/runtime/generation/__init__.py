@@ -6,6 +6,7 @@ from light_vllm.runtime.generation.interfaces import (
     GenerationEvent,
     GenerationFinished,
     GenerationNotReadyError,
+    GenerationRejectedError,
     GenerationService,
     TokenGenerated,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "GenerationEvent",
     "GenerationFinished",
     "GenerationNotReadyError",
+    "GenerationRejectedError",
     "GenerationService",
     "ReferenceGenerationService",
     "TokenGenerated",

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LocalModelWorker 的固定模型版本生命周期</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --paper: #f5f5f5; --ink: #2d3142; --muted: #4f5d75; --soft: #7a8399;
+      --accent: #eb6c36; --link: #2e5aa8;
+      --sans: 'Geist', 'Noto Sans SC', 'Microsoft YaHei', sans-serif;
+      --serif: 'Instrument Serif', 'Noto Serif SC', serif;
+      --mono: 'Geist Mono', 'Noto Sans Mono CJK SC', monospace;
+    }
+    body { min-height: 100vh; padding: 48px 32px; background: var(--paper); color: var(--ink); font-family: var(--sans); display: flex; justify-content: center; }
+    .frame { width: 100%; max-width: 960px; }
+    .eyebrow { margin-bottom: 8px; color: var(--muted); font: 500 8px/1 var(--mono); letter-spacing: 0.18em; text-transform: uppercase; }
+    h1 { margin-bottom: 8px; color: var(--ink); font: 400 28px/1.15 var(--serif); letter-spacing: -0.02em; }
+    .subtitle { margin-bottom: 24px; color: var(--muted); font: 400 12px/1.6 var(--sans); }
+    svg { width: 100%; min-width: 760px; display: block; }
+  </style>
+</head>
+<body>
+  <main class="frame">
+    <p class="eyebrow">State machine · model session · reload boundary</p>
+    <h1>reload 不切断旧请求，也不让新请求混入旧页池</h1>
+    <p class="subtitle">LocalModelWorker 固定一个 ModelSession 和对应 StepHandler。generation 变化后进入 draining：旧请求继续，新请求暂缓，清空后再构造新 Handler。</p>
+
+    <svg viewBox="0 0 960 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="lvstate-title lvstate-desc">
+      <title id="lvstate-title">LocalModelWorker 的固定模型版本生命周期</title>
+      <desc id="lvstate-desc">展示 LocalModelWorker 固定 generation N 的模型会话和 StepHandler，reload 后继续完成旧请求、拒绝新准入，并在活动请求清空后为 generation N+1 构造新 Handler。</desc>
+      <defs>
+        <marker id="lvstate-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="lvstate-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="lvstate-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+      <rect width="960" height="560" fill="#f5f5f5"/>
+
+      <!-- Transitions first -->
+      <line x1="44" y1="156" x2="64" y2="156" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#lvstate-arrow)"/>
+      <line x1="208" y1="156" x2="256" y2="156" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#lvstate-arrow)"/>
+      <rect x="212" y="128" width="40" height="16" rx="2" fill="#f5f5f5"/><text x="232" y="140" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">initialize</text>
+      <line x1="416" y1="156" x2="480" y2="156" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#lvstate-arrow-link)"/>
+      <rect x="420" y="128" width="56" height="16" rx="2" fill="#f5f5f5"/><text x="448" y="140" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">add request</text>
+      <line x1="640" y1="156" x2="720" y2="156" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lvstate-arrow-accent)"/>
+      <rect x="648" y="128" width="64" height="16" rx="2" fill="#f5f5f5"/><text x="680" y="140" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">runner reload</text>
+
+      <path d="M560 192 V232 Q560 240 552 240 H344 Q336 240 336 232 V192" fill="none" stroke="#4f5d75" stroke-width="1.1" marker-end="url(#lvstate-arrow)"/>
+      <rect x="412" y="208" width="72" height="16" rx="2" fill="#f5f5f5"/><text x="448" y="220" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">active = 0</text>
+      <path d="M760 120 V88 Q760 80 768 80 H856 Q864 80 864 88 V120" fill="none" stroke="#eb6c36" stroke-width="1.1" marker-end="url(#lvstate-arrow-accent)"/>
+      <rect x="772" y="52" width="80" height="16" rx="2" fill="#f5f5f5"/><text x="812" y="64" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">old session only</text>
+      <line x1="808" y1="192" x2="808" y2="304" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#lvstate-arrow)"/>
+      <rect x="820" y="232" width="72" height="16" rx="2" fill="#f5f5f5"/><text x="856" y="244" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">active = 0</text>
+      <line x1="720" y1="340" x2="640" y2="340" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#lvstate-arrow)"/>
+      <rect x="648" y="312" width="64" height="16" rx="2" fill="#f5f5f5"/><text x="680" y="324" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">plan capacity</text>
+      <line x1="480" y1="340" x2="416" y2="340" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#lvstate-arrow-link)"/>
+      <rect x="420" y="312" width="56" height="16" rx="2" fill="#f5f5f5"/><text x="448" y="324" fill="#2e5aa8" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">add request</text>
+
+      <!-- States -->
+      <circle cx="32" cy="156" r="8" fill="#2d3142"/>
+      <g>
+        <rect x="64" y="120" width="144" height="72" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="136" y="152" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Uninitialized</text>
+        <text x="136" y="168" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">no model session · no pages</text>
+      </g>
+      <g>
+        <rect x="256" y="120" width="160" height="72" rx="8" fill="#ffffff" stroke="#2e5aa8" stroke-width="1.1"/>
+        <text x="336" y="152" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Ready · generation N</text>
+        <text x="336" y="168" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">session N · matching step handler</text>
+      </g>
+      <g>
+        <rect x="480" y="120" width="160" height="72" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="560" y="152" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Serving · session N</text>
+        <text x="560" y="168" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">execute · apply · safe release</text>
+      </g>
+      <g>
+        <rect x="720" y="120" width="176" height="72" rx="8" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+        <rect x="732" y="132" width="56" height="16" rx="2" fill="transparent" stroke="rgba(235,108,54,0.55)" stroke-width="0.8"/>
+        <text x="760" y="144" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">NOT READY</text>
+        <text x="808" y="164" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Draining · session N</text>
+        <text x="808" y="180" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">finish old · reject new</text>
+      </g>
+      <g>
+        <rect x="720" y="304" width="176" height="72" rx="8" fill="rgba(45,49,66,0.04)" stroke="#4f5d75" stroke-width="1"/>
+        <text x="808" y="336" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Reinitialize N+1</text>
+        <text x="808" y="352" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">new spec · step factory · cache</text>
+      </g>
+      <g>
+        <rect x="480" y="304" width="160" height="72" rx="8" fill="#ffffff" stroke="#2e5aa8" stroke-width="1.1"/>
+        <text x="560" y="336" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Ready · generation N+1</text>
+        <text x="560" y="352" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">new session · new step handler</text>
+      </g>
+      <g>
+        <rect x="256" y="304" width="160" height="72" rx="8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="336" y="336" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Serving · session N+1</text>
+        <text x="336" y="352" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">no request crossed generations</text>
+      </g>
+
+      <line x1="64" y1="436" x2="896" y2="436" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+      <text x="64" y="464" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" letter-spacing="0.12em">INVARIANTS</text>
+      <text x="176" y="464" fill="#2d3142" font-size="12" font-family="'Geist',sans-serif">旧请求固定旧模型 · reload 后新请求不准入 · active=0 才重建</text>
+      <text x="64" y="496" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">cancel only removes visibility immediately; in-flight block IDs remain owned until the execution safe boundary</text>
+    </svg>
+  </main>
+</body>
+</html>

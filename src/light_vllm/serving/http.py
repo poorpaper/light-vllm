@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.sse import EventSourceResponse, format_sse_event
 from pydantic import BaseModel, ConfigDict, Field
 
-from light_vllm.runtime.engine.interfaces import EngineClient
+from light_vllm.runtime.engine.interfaces import EngineCapabilities, EngineClient
 from light_vllm.runtime.generation.interfaces import (
     GenerateRequest,
     GenerateResult,
@@ -23,21 +23,19 @@ from light_vllm.runtime.generation.interfaces import (
     GenerationEvent,
     GenerationFinished,
     GenerationNotReadyError,
+    GenerationRejectedError,
     TokenGenerated,
 )
 
 TokenId = Annotated[int, Field(strict=True, ge=0)]
 Lifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
-MAX_PROMPT_TOKENS = 4096
 
 
 class GenerateHttpRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # 这是为了保护参考服务而设置的最大值，不代表模型真正支持的上下文长度。
-    # 以后可以由引擎提供更准确的限制。
-    input_ids: list[TokenId] = Field(min_length=1, max_length=MAX_PROMPT_TOKENS)
-    max_new_tokens: Annotated[int, Field(strict=True, ge=1, le=4096)] = 16
+    input_ids: list[TokenId] = Field(min_length=1)
+    max_new_tokens: Annotated[int, Field(strict=True, ge=1)] = 16
     eos_token_id: TokenId | None = None
 
     def to_contract(self) -> GenerateRequest:
@@ -68,6 +66,24 @@ class StatusResponse(BaseModel):
     status: Literal["ok", "ready"]
 
 
+class CapabilitiesResponse(BaseModel):
+    max_model_tokens: int | None
+    max_kv_cache_tokens: int | None
+    max_request_tokens: int | None
+    max_num_sequences: int
+    max_num_scheduled_tokens: int | None
+
+    @classmethod
+    def from_contract(cls, capabilities: EngineCapabilities) -> CapabilitiesResponse:
+        return cls(
+            max_model_tokens=capabilities.max_model_tokens,
+            max_kv_cache_tokens=capabilities.max_kv_cache_tokens,
+            max_request_tokens=capabilities.max_request_tokens,
+            max_num_sequences=capabilities.max_num_sequences,
+            max_num_scheduled_tokens=capabilities.max_num_scheduled_tokens,
+        )
+
+
 class TokenEventData(BaseModel):
     token_id: int
     position: int
@@ -78,7 +94,7 @@ class FinishedEventData(BaseModel):
 
 
 class ErrorEventData(BaseModel):
-    code: Literal["not_ready", "generation_failed"]
+    code: Literal["not_ready", "request_rejected", "generation_failed"]
     detail: str
 
 
@@ -89,6 +105,11 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="generation service is not ready",
+        )
+    if isinstance(exc, GenerationRejectedError):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
         )
     return HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -118,6 +139,8 @@ def _encode_event(event: GenerationEvent) -> bytes:
 def _stream_error_event(exc: Exception) -> bytes:
     if isinstance(exc, GenerationNotReadyError):
         data = ErrorEventData(code="not_ready", detail="generation service is not ready")
+    elif isinstance(exc, GenerationRejectedError):
+        data = ErrorEventData(code="request_rejected", detail=str(exc))
     else:
         data = ErrorEventData(code="generation_failed", detail="generation failed")
     return format_sse_event(event="error", data_str=data.model_dump_json())
@@ -198,6 +221,10 @@ def create_http_app(
                 detail="generation service is not ready",
             )
         return StatusResponse(status="ready")
+
+    @app.get("/capabilities", response_model=CapabilitiesResponse)
+    def capabilities() -> CapabilitiesResponse:
+        return CapabilitiesResponse.from_contract(engine.capabilities)
 
     @app.post(
         "/generate",

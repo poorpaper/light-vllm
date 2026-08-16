@@ -1,12 +1,16 @@
 import pytest
 
-from light_vllm.runtime.kv_cache import PagedKVCacheManager, UnboundedKVCacheManager
-from light_vllm.runtime.scheduler import SchedulerError, TokenBudgetScheduler
+from light_vllm.runtime.kv_cache import (
+    FixedKVBlockCapacity,
+    PagedKVCacheManager,
+    UnboundedKVCacheManager,
+)
+from light_vllm.runtime.scheduler import DecodingBudget, SchedulerError, TokenBudgetScheduler
 
 
 def _scheduler(*, token_budget: int = 4, num_blocks: int = 8) -> TokenBudgetScheduler:
     return TokenBudgetScheduler(
-        PagedKVCacheManager(num_blocks=num_blocks, block_size=2),
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=num_blocks, block_size=2)),
         max_num_sequences=2,
         max_num_scheduled_tokens=token_budget,
     )
@@ -19,19 +23,19 @@ def test_scheduler_chunks_long_prompts_with_one_token_budget() -> None:
     first = scheduler.schedule().requests[0]
     assert first.num_computed_tokens == 0
     assert first.num_scheduled_tokens == 2
-    assert not first.sampling_required
-    scheduler.complete("request", num_computed_tokens=2, num_new_tokens=0)
+    assert first.max_output_tokens == 0
+    scheduler.complete("request", num_committed_tokens=2, num_new_tokens=0)
 
     second = scheduler.schedule().requests[0]
     assert second.num_computed_tokens == 2
     assert second.num_scheduled_tokens == 2
-    assert not second.sampling_required
-    scheduler.complete("request", num_computed_tokens=2, num_new_tokens=0)
+    assert second.max_output_tokens == 0
+    scheduler.complete("request", num_committed_tokens=2, num_new_tokens=0)
 
     last = scheduler.schedule().requests[0]
     assert last.num_computed_tokens == 4
     assert last.num_scheduled_tokens == 1
-    assert last.sampling_required
+    assert last.max_output_tokens == 1
 
 
 def test_scheduler_uses_one_budget_across_requests_and_refills_open_slots() -> None:
@@ -45,7 +49,7 @@ def test_scheduler_uses_one_budget_across_requests_and_refills_open_slots() -> N
         ("a", 2),
         ("b", 1),
     ]
-    scheduler.complete("b", num_computed_tokens=1, num_new_tokens=0)
+    scheduler.complete("b", num_committed_tokens=1, num_new_tokens=0)
     assert scheduler.remove("a")
 
     output = scheduler.schedule()
@@ -71,8 +75,32 @@ def test_scheduler_supports_reservations_without_block_placement() -> None:
     first = scheduler.schedule().requests[0]
     assert first.block_ids is None
     assert first.num_scheduled_tokens == 2
-    scheduler.complete("request", num_computed_tokens=2, num_new_tokens=0)
+    scheduler.complete("request", num_committed_tokens=2, num_new_tokens=0)
 
     second = scheduler.schedule().requests[0]
     assert second.block_ids is None
     assert second.num_computed_tokens == 2
+
+
+def test_scheduler_reserves_lookahead_without_a_decode_mode() -> None:
+    scheduler = TokenBudgetScheduler(
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1)),
+        max_num_sequences=1,
+        max_num_scheduled_tokens=2,
+        decoding_budget=DecodingBudget(
+            num_lookahead_tokens=1,
+            max_output_tokens=2,
+        ),
+    )
+    scheduler.add("request", num_tokens=1)
+
+    first = scheduler.schedule().requests[0]
+    assert first.num_scheduled_tokens == 1
+    assert first.num_lookahead_tokens == 1
+    assert first.max_output_tokens == 2
+
+    # 一个输入和一个已接受输出已经写入 KV，bonus token 留到下一轮计算。
+    scheduler.complete("request", num_committed_tokens=2, num_new_tokens=2)
+    second = scheduler.schedule().requests[0]
+    assert second.num_computed_tokens == 2
+    assert second.num_scheduled_tokens == 1
