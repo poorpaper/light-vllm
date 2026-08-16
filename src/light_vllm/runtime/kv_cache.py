@@ -68,6 +68,13 @@ class ContiguousKVCacheState:
 
 
 @dataclass(frozen=True, slots=True)
+class KVCacheMatch:
+    """新请求可以直接复用的已计算 prompt 前缀。"""
+
+    num_cached_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class KVCacheReservation:
     """Scheduler 为一次模型计算提前留出的 KV cache 空间。
 
@@ -79,6 +86,8 @@ class KVCacheReservation:
     block_ids: tuple[int, ...] | None
     num_committed_tokens: int
     num_reserved_tokens: int
+    # 这些页来自 prefix cache，只能读，不能写入未计算的尾部。
+    num_shared_prefix_blocks: int = 0
 
 
 class KVCacheManager(Protocol):
@@ -87,7 +96,13 @@ class KVCacheManager(Protocol):
     实现可以返回 block table，也可以只记录 token 数；两者都必须支持提交和释放。
     """
 
-    def add_request(self, request_id: str) -> None: ...
+    def add_request(
+        self,
+        request_id: str,
+        *,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None,
+    ) -> KVCacheMatch: ...
 
     def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation:
         """预留本轮 token 的空间；空间不足时抛错。"""
@@ -151,12 +166,21 @@ class UnboundedKVCacheManager:
     def __init__(self) -> None:
         self._allocations: dict[str, _UnboundedAllocation] = {}
 
-    def add_request(self, request_id: str) -> None:
+    def add_request(
+        self,
+        request_id: str,
+        *,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None,
+    ) -> KVCacheMatch:
         if not request_id:
             raise ValueError("request_id must not be empty")
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
         if request_id in self._allocations:
             raise KVCacheError(f"KV cache for request {request_id!r} already exists")
         self._allocations[request_id] = _UnboundedAllocation()
+        return KVCacheMatch()
 
     def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation:
         # 即使不分 block，也要记录预留，防止同一请求被重复调度。
@@ -217,13 +241,22 @@ class PagedKVCacheManager:
         self._sync_capacity()
         return len(self._free_blocks)
 
-    def add_request(self, request_id: str) -> None:
+    def add_request(
+        self,
+        request_id: str,
+        *,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None,
+    ) -> KVCacheMatch:
         self._sync_capacity()
         if not request_id:
             raise ValueError("request_id must not be empty")
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
         if request_id in self._allocations:
             raise KVCacheError(f"KV cache for request {request_id!r} already exists")
         self._allocations[request_id] = _LogicalAllocation(block_ids=[])
+        return KVCacheMatch()
 
     def reserve(self, request_id: str, num_tokens: int) -> KVCacheReservation:
         """原子地预留本轮 token 可能占用的新 block。"""

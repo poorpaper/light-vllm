@@ -92,7 +92,13 @@ class Scheduler(Protocol):
     @property
     def max_num_scheduled_tokens(self) -> int: ...
 
-    def add(self, request_id: str, *, num_tokens: int) -> None: ...
+    def add(
+        self,
+        request_id: str,
+        *,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None = None,
+    ) -> None: ...
 
     def remove(self, request_id: str) -> bool: ...
 

@@ -84,7 +84,7 @@ def _tiny_dense_forward(model, token_ids: tuple[int, ...], *, past=None):
 
 def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
     manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=3, block_size=2))
-    manager.add_request("request")
+    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
 
     first = manager.reserve("request", 3)
     assert first.block_ids == (0, 1)
@@ -105,7 +105,7 @@ def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
 
 def test_logical_reservation_is_atomic_when_capacity_is_insufficient() -> None:
     manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=1, block_size=2))
-    manager.add_request("request")
+    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
 
     with pytest.raises(KVCacheCapacityError):
         manager.reserve("request", 3)
@@ -114,7 +114,7 @@ def test_logical_reservation_is_atomic_when_capacity_is_insufficient() -> None:
 
 def test_unbounded_manager_tracks_reservations_without_block_placement() -> None:
     manager = UnboundedKVCacheManager()
-    manager.add_request("request")
+    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
 
     first = manager.reserve("request", 3)
     assert first.block_ids is None

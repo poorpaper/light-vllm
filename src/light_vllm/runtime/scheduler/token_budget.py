@@ -60,16 +60,35 @@ class TokenBudgetScheduler:
     def max_num_scheduled_tokens(self) -> int:
         return self._max_num_scheduled_tokens
 
-    def add(self, request_id: str, *, num_tokens: int) -> None:
+    def add(
+        self,
+        request_id: str,
+        *,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None = None,
+    ) -> None:
         if not request_id:
             raise ValueError("request_id must not be empty")
-        if type(num_tokens) is not int or num_tokens <= 0:
-            raise ValueError("num_tokens must be a positive integer")
+        token_ids = tuple(token_ids)
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
+        if any(type(token_id) is not int or token_id < 0 for token_id in token_ids):
+            raise ValueError("token_ids must contain non-negative integers")
         if request_id in self._states:
             raise SchedulerError(f"request {request_id!r} is already scheduled")
 
-        self._kv_cache.add_request(request_id)
-        self._states[request_id] = _RequestState(num_tokens=num_tokens)
+        match = self._kv_cache.add_request(
+            request_id,
+            token_ids=token_ids,
+            cache_epoch=cache_epoch,
+        )
+        if not 0 <= match.num_cached_tokens < len(token_ids):
+            self._kv_cache.free(request_id)
+            raise SchedulerError("cached prefix must leave at least one token to compute")
+        self._states[request_id] = _RequestState(
+            num_tokens=len(token_ids),
+            num_computed_tokens=match.num_cached_tokens,
+        )
         self._waiting.append(request_id)
 
     def remove(self, request_id: str) -> bool:

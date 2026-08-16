@@ -192,7 +192,11 @@ class EngineCore:
             capacity = len(request.input_ids) + request.max_new_tokens
             try:
                 self._executor.add_request(request_id, capacity=capacity)
-                self._scheduler.add(request_id, num_tokens=len(request.input_ids))
+                self._scheduler.add(
+                    request_id,
+                    token_ids=request.input_ids,
+                    cache_epoch=self._executor.capabilities.kv_cache_epoch,
+                )
             except Exception:
                 self._executor.free_request(request_id)
                 self._scheduler.remove(request_id)

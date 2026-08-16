@@ -340,6 +340,7 @@ class LocalModelWorker:
             return ExecutionCapabilities(
                 max_model_tokens=model.max_model_tokens,
                 max_kv_cache_tokens=step.max_kv_cache_tokens,
+                kv_cache_epoch=model.generation,
             )
 
     def initialize(self) -> None:

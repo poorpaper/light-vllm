@@ -559,7 +559,7 @@ def test_worker_composes_step_and_decode_handlers_without_mode_branches() -> Non
 
     output = worker.execute(batch)
 
-    assert worker.capabilities == ExecutionCapabilities(None, 17)
+    assert worker.capabilities == ExecutionCapabilities(None, 17, model.generation)
     assert step.added == [("request", 5)]
     assert decode.call == (model, batch, step)
     assert output.requests[0].output_token_ids == (2, 3, 4)

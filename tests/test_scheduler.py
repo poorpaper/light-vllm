@@ -18,7 +18,7 @@ def _scheduler(*, token_budget: int = 4, num_blocks: int = 8) -> TokenBudgetSche
 
 def test_scheduler_chunks_long_prompts_with_one_token_budget() -> None:
     scheduler = _scheduler(token_budget=2)
-    scheduler.add("request", num_tokens=5)
+    scheduler.add("request", token_ids=(1, 2, 3, 4, 5))
 
     first = scheduler.schedule().requests[0]
     assert first.num_computed_tokens == 0
@@ -40,9 +40,9 @@ def test_scheduler_chunks_long_prompts_with_one_token_budget() -> None:
 
 def test_scheduler_uses_one_budget_across_requests_and_refills_open_slots() -> None:
     scheduler = _scheduler(token_budget=3)
-    scheduler.add("a", num_tokens=2)
-    scheduler.add("b", num_tokens=2)
-    scheduler.add("c", num_tokens=1)
+    scheduler.add("a", token_ids=(1, 2))
+    scheduler.add("b", token_ids=(3, 4))
+    scheduler.add("c", token_ids=(5,))
 
     output = scheduler.schedule()
     assert [(item.request_id, item.num_scheduled_tokens) for item in output.requests] == [
@@ -58,10 +58,10 @@ def test_scheduler_uses_one_budget_across_requests_and_refills_open_slots() -> N
 
 def test_scheduler_rejects_duplicate_request_ids() -> None:
     scheduler = _scheduler()
-    scheduler.add("request", num_tokens=1)
+    scheduler.add("request", token_ids=(1,))
 
     with pytest.raises(SchedulerError, match="already scheduled"):
-        scheduler.add("request", num_tokens=1)
+        scheduler.add("request", token_ids=(1,))
 
 
 def test_scheduler_supports_reservations_without_block_placement() -> None:
@@ -70,7 +70,7 @@ def test_scheduler_supports_reservations_without_block_placement() -> None:
         max_num_sequences=1,
         max_num_scheduled_tokens=2,
     )
-    scheduler.add("request", num_tokens=3)
+    scheduler.add("request", token_ids=(1, 2, 3))
 
     first = scheduler.schedule().requests[0]
     assert first.block_ids is None
@@ -92,7 +92,7 @@ def test_scheduler_reserves_lookahead_without_a_decode_mode() -> None:
             max_output_tokens=2,
         ),
     )
-    scheduler.add("request", num_tokens=1)
+    scheduler.add("request", token_ids=(1,))
 
     first = scheduler.schedule().requests[0]
     assert first.num_scheduled_tokens == 1
