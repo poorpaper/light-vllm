@@ -29,6 +29,10 @@ dev = [
 validation = [
   "transformers>=4.43,<5",
 ]
+triton = [
+  "torch>=2.6; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "triton>=3.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [project.scripts]
 light-vllm-serve = "light_vllm.entrypoints.http:main"

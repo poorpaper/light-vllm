@@ -3,6 +3,8 @@ from light_vllm.runtime.execution.dense_attention import (
     TorchDenseAttention,
 )
 from light_vllm.runtime.execution.interfaces import (
+    AcceptanceResult,
+    AcceptanceSampler,
     DecodeHandler,
     ExecutionBatch,
     ExecutionCapabilities,
@@ -16,6 +18,7 @@ from light_vllm.runtime.execution.interfaces import (
     RequestOutput,
     TokenExecutionSession,
     TokenExecutor,
+    TokenProposer,
 )
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
 from light_vllm.runtime.execution.paged_attention import (
@@ -27,9 +30,16 @@ from light_vllm.runtime.execution.paged_cache import (
     PagedKVCacheConfig,
     PagedKVCachePlanner,
 )
+from light_vllm.runtime.execution.speculative import (
+    GreedyAcceptanceSampler,
+    NGramSpeculativeDecodeHandler,
+    NGramTokenProposer,
+)
 from light_vllm.runtime.execution.worker import LocalModelWorker
 
 __all__ = [
+    "AcceptanceResult",
+    "AcceptanceSampler",
     "CudaMemoryKVCachePlanner",
     "DenseAttentionMetadata",
     "DecodeHandler",
@@ -39,18 +49,22 @@ __all__ = [
     "ExecutionNotReadyError",
     "ExecutionOutput",
     "ExecutionRequest",
+    "GreedyAcceptanceSampler",
     "LocalModelExecutor",
     "LocalModelWorker",
     "LocalTokenExecutor",
     "ModelExecutor",
     "ModelStepHandler",
     "ModelWorker",
+    "NGramSpeculativeDecodeHandler",
+    "NGramTokenProposer",
     "PagedAttentionBackend",
     "PagedKVCacheConfig",
     "PagedKVCachePlanner",
     "RequestOutput",
     "TokenExecutionSession",
     "TokenExecutor",
+    "TokenProposer",
     "TorchDenseAttention",
     "TorchPagedAttentionBackend",
 ]

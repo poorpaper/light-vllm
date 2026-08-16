@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
-from light_vllm.modeling.models.interfaces import ForwardBatch
+from light_vllm.modeling.models.interfaces import ForwardBatch, ModelOutput
 from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionCausalLM,
     TinyAttentionConfig,
@@ -15,8 +15,11 @@ from light_vllm.modeling.models.tiny_attention import (
 from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
     DenseAttentionMetadata,
+    GreedyAcceptanceSampler,
     LocalModelExecutor,
     LocalModelWorker,
+    NGramSpeculativeDecodeHandler,
+    NGramTokenProposer,
     PagedKVCacheConfig,
     TorchDenseAttention,
     TorchPagedAttentionBackend,
@@ -39,7 +42,7 @@ from light_vllm.runtime.kv_cache import (
     UnboundedKVCacheManager,
 )
 from light_vllm.runtime.sampling import GreedySampler
-from light_vllm.runtime.scheduler import TokenBudgetScheduler
+from light_vllm.runtime.scheduler import DecodingBudget, TokenBudgetScheduler
 
 
 def _updates(*values: float) -> ContiguousKVCacheState:
@@ -84,7 +87,7 @@ def _tiny_dense_forward(model, token_ids: tuple[int, ...], *, past=None):
 
 def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
     manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=3, block_size=2))
-    manager.add_request("request")
+    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
 
     first = manager.reserve("request", 3)
     assert first.block_ids == (0, 1)
@@ -105,7 +108,7 @@ def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
 
 def test_logical_reservation_is_atomic_when_capacity_is_insufficient() -> None:
     manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=1, block_size=2))
-    manager.add_request("request")
+    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
 
     with pytest.raises(KVCacheCapacityError):
         manager.reserve("request", 3)
@@ -114,7 +117,7 @@ def test_logical_reservation_is_atomic_when_capacity_is_insufficient() -> None:
 
 def test_unbounded_manager_tracks_reservations_without_block_placement() -> None:
     manager = UnboundedKVCacheManager()
-    manager.add_request("request")
+    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
 
     first = manager.reserve("request", 3)
     assert first.block_ids is None
@@ -129,6 +132,125 @@ def test_unbounded_manager_tracks_reservations_without_block_placement() -> None
 
     assert manager.free("request")
     assert not manager.free("request")
+
+
+def test_prefix_cache_reuses_only_committed_full_prompt_blocks() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=4, block_size=2),
+        enable_prefix_caching=True,
+    )
+    tokens = (1, 2, 3, 4, 5)
+    assert manager.add_request("warm", token_ids=tokens, cache_epoch=1).num_cached_tokens == 0
+    warm = manager.reserve("warm", len(tokens))
+    manager.commit("warm", len(tokens))
+    assert warm.block_ids == (0, 1, 2)
+    assert manager.free("warm")
+
+    match = manager.add_request(
+        "hit",
+        token_ids=(1, 2, 3, 4, 9),
+        cache_epoch=1,
+    )
+    assert match.num_cached_tokens == 4
+    reservation = manager.reserve("hit", 1)
+    assert reservation.block_ids[:2] == (0, 1)
+    assert reservation.num_readonly_prefix_blocks == 2
+    assert manager.free("hit")
+
+
+def test_prefix_cache_leaves_the_last_full_prompt_block_for_logits() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=3, block_size=2),
+        enable_prefix_caching=True,
+    )
+    tokens = (1, 2, 3, 4)
+    manager.add_request("warm", token_ids=tokens, cache_epoch=1)
+    manager.reserve("warm", len(tokens))
+    manager.commit("warm", len(tokens))
+    manager.free("warm")
+
+    match = manager.add_request("hit", token_ids=tokens, cache_epoch=1)
+    assert match.num_cached_tokens == 2
+    manager.free("hit")
+
+
+def test_prefix_cache_does_not_publish_reserved_or_partial_blocks() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=3, block_size=2),
+        enable_prefix_caching=True,
+    )
+    tokens = (1, 2, 3)
+    manager.add_request("partial", token_ids=tokens, cache_epoch=1)
+    manager.reserve("partial", len(tokens))
+    manager.commit("partial", 1)
+    manager.free("partial")
+
+    match = manager.add_request("miss", token_ids=tokens, cache_epoch=1)
+    assert match.num_cached_tokens == 0
+    manager.free("miss")
+
+
+def test_prefix_cache_is_invalidated_when_the_worker_epoch_changes() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=2, block_size=2),
+        enable_prefix_caching=True,
+    )
+    tokens = (1, 2, 3)
+    manager.add_request("old", token_ids=tokens, cache_epoch=1)
+    manager.reserve("old", len(tokens))
+    manager.commit("old", len(tokens))
+    manager.free("old")
+
+    match = manager.add_request("new", token_ids=tokens, cache_epoch=2)
+    assert match.num_cached_tokens == 0
+    assert manager.num_free_blocks == 2
+    manager.free("new")
+
+
+def test_prefix_cache_evicts_the_least_recently_used_unreferenced_block() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=3, block_size=1),
+        enable_prefix_caching=True,
+    )
+    for request_id, tokens in (("a", (1, 9)), ("b", (2, 9))):
+        manager.add_request(request_id, token_ids=tokens, cache_epoch=1)
+        manager.reserve(request_id, len(tokens))
+        manager.commit(request_id, len(tokens))
+        manager.free(request_id)
+
+    assert manager.add_request("touch-a", token_ids=(1, 8), cache_epoch=1).num_cached_tokens == 1
+    manager.free("touch-a")
+    manager.add_request("other", token_ids=(7, 9), cache_epoch=1)
+    manager.reserve("other", 2)
+    manager.commit("other", 2)
+    manager.free("other")
+
+    assert manager.add_request("miss-b", token_ids=(2, 8), cache_epoch=1).num_cached_tokens == 0
+    manager.free("miss-b")
+    assert manager.add_request("hit-a", token_ids=(1, 8), cache_epoch=1).num_cached_tokens == 1
+    manager.free("hit-a")
+
+
+def test_prefix_cache_never_evicts_a_block_used_by_an_active_request() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=2, block_size=1),
+        enable_prefix_caching=True,
+    )
+    manager.add_request("warm", token_ids=(1, 9), cache_epoch=1)
+    manager.reserve("warm", 2)
+    manager.commit("warm", 2)
+    manager.free("warm")
+
+    assert manager.add_request("hit", token_ids=(1, 8), cache_epoch=1).num_cached_tokens == 1
+    manager.add_request("blocked", token_ids=(2, 9), cache_epoch=1)
+    with pytest.raises(KVCacheCapacityError):
+        manager.reserve("blocked", 2)
+    manager.free("blocked")
+
+    reservation = manager.reserve("hit", 1)
+    assert reservation.block_ids == (0, 1)
+    manager.commit("hit", 1)
+    manager.free("hit")
 
 
 def test_contiguous_cache_appends_valid_prefix_and_checks_capacity() -> None:
@@ -273,6 +395,148 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
         await engine.close()
 
         assert result.generated_token_ids == tuple(expected)
+        assert logical_cache.num_free_blocks == 8
+
+    asyncio.run(run())
+
+
+def test_engine_reuses_a_shared_prompt_prefix_without_changing_generation() -> None:
+    async def run() -> None:
+        torch.manual_seed(31)
+        model = TinyAttentionCausalLM(
+            TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
+        ).eval()
+
+        class Forwarder:
+            generation = 1
+            kv_cache_spec = model.kv_cache_spec
+            max_model_tokens = None
+
+            def __init__(self) -> None:
+                self.query_lengths: list[tuple[int, ...]] = []
+
+            def forward(self, batch: ForwardBatch):
+                lengths = batch.sequence_lengths or (batch.input_ids.shape[1],)
+                self.query_lengths.append(lengths)
+                return model(batch)
+
+        forwarder = Forwarder()
+
+        class SessionProvider:
+            generation = 1
+
+            def open_session(self):
+                return forwarder
+
+        cache_config = PagedKVCacheConfig(num_blocks=8, block_size=2)
+        logical_cache = PagedKVCacheManager(
+            cache_config,
+            enable_prefix_caching=True,
+        )
+        worker = LocalModelWorker(
+            SessionProvider(),
+            partial(
+                PagedStepHandler,
+                cache_planner=cache_config,
+                attention_backend=TorchPagedAttentionBackend(),
+            ),
+            StandardDecodeHandler(GreedySampler()),
+        )
+        executor = LocalModelExecutor(worker)
+        executor.initialize()
+        engine = EngineCore(
+            executor,
+            TokenBudgetScheduler(
+                logical_cache,
+                max_num_sequences=1,
+                max_num_scheduled_tokens=8,
+            ),
+        )
+
+        await engine.generate(GenerateRequest(input_ids=(1, 2, 3, 4, 5), max_new_tokens=1))
+        second_prompt = (1, 2, 3, 4, 6)
+        result = await engine.generate(GenerateRequest(input_ids=second_prompt, max_new_tokens=1))
+        expected = int(_tiny_dense_forward(model, second_prompt)[0].logits[0, -1].argmax())
+        await engine.close()
+
+        assert result.generated_token_ids == (expected,)
+        assert forwarder.query_lengths == [(5,), (1,)]
+        assert logical_cache.num_free_blocks == 8
+
+    asyncio.run(run())
+
+
+def test_engine_speculates_after_reusing_a_shared_prompt_prefix() -> None:
+    async def run() -> None:
+        class Forwarder:
+            generation = 1
+            max_model_tokens = None
+            kv_cache_spec = _model_kv_spec()
+
+            def __init__(self) -> None:
+                self.queries: list[tuple[int, ...]] = []
+
+            def forward(self, batch: ForwardBatch) -> ModelOutput:
+                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
+                self.queries.append(
+                    tuple(int(value) for value in batch.input_ids[0, :query_length])
+                )
+                next_ids = (batch.input_ids + 1) % 16
+                logits = torch.full((*batch.input_ids.shape, 16), -1.0)
+                logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
+                keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
+                assert batch.attention is not None
+                batch.attention.forward("attention", keys, keys, keys, scale=1.0)
+                return ModelOutput(logits=logits)
+
+        forwarder = Forwarder()
+
+        class SessionProvider:
+            generation = 1
+
+            def open_session(self):
+                return forwarder
+
+        cache_config = PagedKVCacheConfig(num_blocks=8, block_size=2)
+        logical_cache = PagedKVCacheManager(cache_config, enable_prefix_caching=True)
+        worker = LocalModelWorker(
+            SessionProvider(),
+            partial(
+                PagedStepHandler,
+                cache_planner=cache_config,
+                attention_backend=TorchPagedAttentionBackend(),
+            ),
+            NGramSpeculativeDecodeHandler(
+                NGramTokenProposer(min_match_length=2, max_match_length=4),
+                GreedySampler(),
+                GreedyAcceptanceSampler(),
+            ),
+        )
+        executor = LocalModelExecutor(worker)
+        executor.initialize()
+        engine = EngineCore(
+            executor,
+            TokenBudgetScheduler(
+                logical_cache,
+                max_num_sequences=1,
+                max_num_scheduled_tokens=8,
+                decoding_budget=DecodingBudget(
+                    num_lookahead_tokens=2,
+                    max_output_tokens=3,
+                ),
+            ),
+        )
+        prompt = (1, 2, 3, 4, 1, 2)
+
+        first = await engine.generate(GenerateRequest(input_ids=prompt, max_new_tokens=3))
+        second = await engine.generate(GenerateRequest(input_ids=prompt, max_new_tokens=3))
+        await engine.close()
+
+        assert first.generated_token_ids == second.generated_token_ids == (3, 4, 5)
+        assert forwarder.queries == [
+            (1, 2, 3, 4, 1, 2, 3, 4),
+            (1, 2, 3, 4),
+        ]
         assert logical_cache.num_free_blocks == 8
 
     asyncio.run(run())

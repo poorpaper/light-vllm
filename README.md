@@ -51,9 +51,10 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `PagedKVCacheManager`：管理逻辑 block 的预留、提交、回滚和释放。
 - `LocalModelExecutor` / `LocalModelWorker`：把本地执行拓扑、模型版本和具体计算能力分开。
 - `LocalModelWorker`：固定当前模型版本和请求生命周期，并组合 Step / Decode Handler。
-- `PagedStepHandler`：消费 block table，使用全局物理页与 PyTorch Paged Attention。
+- `PagedStepHandler`：消费 block table，使用全局物理页与可替换的 PyTorch/Triton Paged Attention。
 - `ContiguousStepHandler`：保留请求级连续 K/V 的无分页正确性基线。
-- `StandardDecodeHandler`：处理普通 prefill 和单 token decode；未来投机解码替换 Handler，不新增 Worker。
+- `StandardDecodeHandler`：处理普通 prefill 和单 token decode。
+- `NGramSpeculativeDecodeHandler`：从当前请求历史提出候选，由同一个目标模型一次验证，不新增 Worker。
 - `GreedySampler`：独立于 Executor 的贪心采样策略。
 - FastAPI adapter：协议外层的 JSON/SSE 接口，只依赖 `EngineClient`。
 
@@ -139,8 +140,34 @@ Engine 路径不区分 prefill/decode 模式：Scheduler 只返回每请求本�
 chunk；追上全部已知 token 后才采样输出。
 
 `--kv-reservation blocks` 装配逻辑 block manager 与物理 `PagedStepHandler`。模型声明自己的 K/V layer/head
-规格，Handler 以 `[block, offset, kv_head, head_size]` 布局创建页池；当前 PyTorch backend 直接逐页完成
-attention，适合 CPU correctness 与后续优化 kernel 的行为基线。
+规格，Handler 以 `[block, offset, kv_head, head_size]` 布局创建页池。默认 PyTorch backend 直接逐页完成
+attention，适合 CPU correctness；可选 Triton backend 直接按 block table 读取分页 K/V，在一个 kernel 内完成
+QK、在线 softmax 和 PV。
+
+CUDA Linux/WSL 环境可安装可选依赖并显式启用 Triton；该 extra 使用 Torch 2.6 或更高版本：
+
+```bash
+python -m pip install -e ".[serve,triton]"
+light-vllm-serve \
+  --architecture tiny-attention-causal-lm \
+  --runtime engine \
+  --device cuda \
+  --dtype float16 \
+  --paged-attention-backend triton \
+  --model-args '{"vocab_size": 128, "hidden_size": 32, "num_heads": 4}'
+```
+
+首版 Triton kernel 支持 FP16/BF16、MHA/GQA、padded batch 和不超过 256 的 head size。K/V 写入与 attention
+读取分成同一 CUDA stream 上的两个顺序步骤，避免 prefill 读取尚未写完的数据。RTX 5090 上的 FP16/BF16
+prefill、decode、共享 prefix 和投机多 query 数值对照已经通过；长上下文性能和跨显卡调优仍待验收，默认
+backend 因此保持为 `torch`。
+
+增加 `--enable-prefix-caching` 后，Engine 会按 token 内容复用已经算完的完整 prompt 页。共享页只读，
+每个请求继续使用自己的可写尾页；模型重新加载后 cache epoch 改变，旧页索引会自动清空。
+
+增加 `--num-speculative-tokens 3` 后，Engine 会从当前请求的重复 token 片段提出最多 3 个候选，再用目标模型
+一次验证。`--speculative-ngram-min` 和 `--speculative-ngram-max` 控制匹配长度；找不到重复片段时自动退化为
+普通单 token 解码。该能力同时支持连续和分页 KV。
 
 `--kv-reservation unbounded` 装配无 block manager 与 `ContiguousStepHandler`，不限制逻辑 KV 容量。它保留
 无 Paged Attention 的请求级连续 tensor 路径，主要用于测试和结果对照，不是生产容量保护机制。两种 Handler
@@ -185,6 +212,7 @@ catalog.loaders.register("my-format", my_loader)
 ## 当前非目标
 
 当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback、独立 Greedy
-Sampler、原生 Qwen2 子集和可读性优先的物理 Paged Attention correctness backend。Tokenizer、文本 prompt、随机
-sampling、生产级 CUDA/Triton attention kernel、prefix caching、preemption、投机解码、分布式执行和
-OpenAI-compatible API 仍是后续能力。多进程实现将新增 `EngineClient` / Worker 拓扑，而不改 HTTP。
+Sampler、原生 Qwen2 子集、整页 prefix cache、简单 n-gram 投机解码、PyTorch Paged Attention correctness backend
+和可选的首版 Triton fused attention。Tokenizer、文本 prompt、随机 sampling、经过长上下文调优和跨显卡验收的
+生产级 attention kernel、preemption、分布式执行和 OpenAI-compatible API 仍是后续能力。多进程实现将新增
+`EngineClient` / Worker 拓扑，而不改 HTTP。

@@ -61,17 +61,19 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `CapacityAdmission` | 根据 capabilities 拒绝空闲引擎也不可能完成的请求 | 排队、公平性、preemption |
 | `TokenBudgetScheduler` | FCFS、并发槽、token budget、逻辑 KV 分配 | 模型 forward、采样、事件 |
 | `UnboundedKVCacheManager` | 无容量限制的 reservation、提交与回滚基线 | block、K/V tensor |
-| `PagedKVCacheManager` | 逻辑 block 预留、提交、回滚、释放 | K/V tensor、attention kernel |
+| `PagedKVCacheManager` | 逻辑 block、prefix 索引、引用计数、LRU 与回滚 | K/V tensor、attention kernel |
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
 | `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
 | `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
 | `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
 | `PagedStepHandler` | padded batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
 | `StandardDecodeHandler` | 普通 prefill/单 token decode 的结果转换与采样 | KV 布局、调度 |
+| `NGramSpeculativeDecodeHandler` | 历史候选、目标验证、验收与拒绝尾部截断 | KV 布局、调度 |
 | `PagedKVCachePlanner` | 模型加载后把固定页数或空闲显存预算解析为容量 | 请求调度、page ownership |
 | `TorchDenseAttention` | 读取连续历史、dense causal attention、暂存本轮 K/V | 模型结构、物理分页 |
 | `PagedAttentionBackend` | 为页池和批次事实创建 `AttentionContext` | 模型分发、调度 |
 | `TorchPagedAttention` | 原位写 K/V、逐页 causal attention、MHA/GQA correctness | 调度、生产级 kernel 优化 |
+| `TritonPagedAttention` | 直接查页表并融合 QK、在线 softmax、PV | 调度、模型结构 |
 | `Sampler` | 从 logits 选择 token | 模型 forward、调度、停止条件 |
 | `ModelRunner` | 当前模型生命周期和固定 `ModelSession` | 请求调度、具体模型/loader 条件分发 |
 | `EngineClient` | serving 到 engine 的异步端口 | HTTP schema、具体运行拓扑 |
@@ -113,10 +115,12 @@ frontier。
 ExecutionRequest
 ├── request_id
 ├── input_token_ids
+├── context_token_ids
 ├── num_computed_tokens
 ├── num_lookahead_tokens
 ├── max_output_tokens
 ├── block_ids: tuple[int, ...] | None
+└── num_readonly_prefix_blocks
 ```
 
 Executor 返回：
@@ -149,7 +153,7 @@ flowchart TB
     Step --> Contiguous["ContiguousKVCache<br/>request-level tensors"]
     Step --> Paged["PagedKVCache<br/>global physical pages"]
     Contiguous --> Dense["AttentionContext<br/>TorchDenseAttention"]
-    Paged --> PagedAttention["AttentionContext<br/>TorchPagedAttention"]
+    Paged --> PagedAttention["AttentionContext<br/>Torch / Triton PagedAttention"]
 ```
 
 当前有两种逻辑 manager：`UnboundedKVCacheManager` 为连续缓存提供无 block、无容量限制的实验基线；
@@ -176,12 +180,14 @@ blocks    → PagedKVCacheManager     → PagedStepHandler
 3. 未提交的尾部自动回滚并归还多余 block。
 4. 完成、失败或取消时释放请求全部逻辑 block。
 5. 交给 Worker 的 block table 精确覆盖已提交 token、本轮 query 和显式 lookahead reservation，不包含未预留尾页。
-6. 当前活动物理页保持请求独占；prefix sharing 落地时必须显式表达只读共享与可写尾页 ownership。
+6. Prefix cache 只复用已经提交的完整 prompt 页；共享页必须在相同逻辑位置且双方都声明只读，可写尾页保持独占。
 
 连续与分页 Step Handler 都根据模型的同一个 `ModelKVCacheSpec` 创建物理缓存；装配层不再重复填写 layer/head 形状。
 分页 Step Handler 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
 token 通过 block table 映射到物理 slot；`TorchPagedAttention` 先原位写入本轮 K/V，再用在线 softmax 逐页读取
 有效前缀，不物化完整历史。它是可读性优先的 CPU/PyTorch correctness backend，不是生产级性能 kernel。
+可选 `TritonPagedAttention` 复用同一页池和 metadata：先完成 K/V 写入，再在同一 CUDA stream 启动 fused
+attention。batch metadata 只在 context 创建时转一次 GPU tensor，不在每个模型层重复创建。
 
 非分页 Step Handler 使用 `block_ids=None` 和请求级连续 tensor，不得伪造 block ID。两条路径共享同一个
 `ExecutionBatch → ExecutionOutput` 和模型 forward 契约，因此可以直接做结果对照。
@@ -202,14 +208,14 @@ reference 与连续 Step Handler 创建 `TorchDenseAttention`；分页 Step Hand
 
 - 模型不知道 block size、page layout 或具体 kernel；
 - Worker 不按具体模型 architecture 分支；
-- 后续 CUDA/Triton backend 实现同一个 factory 边界，不修改 Engine、Scheduler 或模型协议；
+- PyTorch 与 Triton backend 实现同一个 factory 边界，不修改 Engine、Scheduler 或模型协议；
 - 分页 Step Handler 在模型加载成功后初始化物理页池，模型 generation 变化时由 Worker 安全地重建。
 
 当前原生 Qwen2 路径也遵守这条边界：模型层负责 embedding、RMSNorm、RoPE、Q/K/V 投影、输出投影和 MLP；
 `AttentionContext` 才负责读取历史 K/V、因果 softmax 和 value 聚合。HF 模型里的 FlashAttention 也是 attention
 backend，不是 Qwen 权重本身的一部分；普通 HF FlashAttention 无法直接理解本项目的 block table 和物理页池。
 CPU reference/连续 KV 路径通过执行层接入可读的 `TorchDenseAttention`，分页路径让同一个模型接入
-`TorchPagedAttention`。模型在两种布局下没有条件分支，未来 CUDA/Triton 实现只替换 backend。
+`TorchPagedAttention` 或 `TritonPagedAttention`。模型在两种布局和两个分页 backend 下都没有条件分支。
 
 ## Qwen 与 checkpoint 来源
 
@@ -246,8 +252,9 @@ class Sampler(Protocol):
 argmax；以后增加 temperature、top-k 或 top-p 时，不修改 Engine、Scheduler、ModelRunner 或 Executor
 接口。
 
-投机解码的 acceptance sampling 与普通 Sampler 是不同职责。未来在执行实现中组合 proposer、target verify 与
-acceptance sampler，仍返回同一个事实型 `RequestOutput`，不增加 prefill/decode 模式枚举。
+投机解码的 acceptance sampling 与普通 Sampler 是不同职责。当前 n-gram 实现只读单请求完整 token 历史，
+优先续写最长且最近的重复后缀；目标模型一次验证实际候选，验收器返回同一个事实型 `RequestOutput`。候选不足
+lookahead 时，剩余预留仍显式留在分页 metadata 中，因此 block table 继续严格覆盖最坏情况，不增加模式枚举。
 
 ## Reference 与 serving 边界
 
@@ -285,10 +292,9 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 
 ## 后续演进顺序
 
-1. 在现有 `PagedAttentionBackend` 边界实现 CUDA/Triton kernel。
-2. prefix caching 和 Scheduler-owned preemption。
+1. 增加 Triton 长上下文分段并行与归并，并补充跨显卡性能验收。
+2. Scheduler-owned preemption。
 3. 普通随机 Sampler。
-4. `TokenProposer + target verify + AcceptanceSampler` 投机解码。
-5. 进程/分布式 Worker 与生产级 serving。
+4. 进程/分布式 Worker 与生产级 serving。
 
 任何新能力都应先证明现有事实型契约表达不了，再新增字段或接口；不为未来功能预建空包。

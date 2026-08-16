@@ -18,7 +18,11 @@ from light_vllm.runtime.scheduler.interfaces import (
 @dataclass(slots=True)
 class _RequestState:
     num_tokens: int
+    max_num_tokens: int
+    prompt_token_ids: tuple[int, ...]
+    cache_epoch: int | None
     num_computed_tokens: int = 0
+    kv_attached: bool = False
 
 
 class TokenBudgetScheduler:
@@ -60,16 +64,32 @@ class TokenBudgetScheduler:
     def max_num_scheduled_tokens(self) -> int:
         return self._max_num_scheduled_tokens
 
-    def add(self, request_id: str, *, num_tokens: int) -> None:
+    def add(
+        self,
+        request_id: str,
+        *,
+        token_ids: tuple[int, ...],
+        max_num_tokens: int,
+        cache_epoch: int | None = None,
+    ) -> None:
         if not request_id:
             raise ValueError("request_id must not be empty")
-        if type(num_tokens) is not int or num_tokens <= 0:
-            raise ValueError("num_tokens must be a positive integer")
+        token_ids = tuple(token_ids)
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
+        if any(type(token_id) is not int or token_id < 0 for token_id in token_ids):
+            raise ValueError("token_ids must contain non-negative integers")
+        if type(max_num_tokens) is not int or max_num_tokens <= len(token_ids):
+            raise ValueError("max_num_tokens must leave room for at least one output token")
         if request_id in self._states:
             raise SchedulerError(f"request {request_id!r} is already scheduled")
 
-        self._kv_cache.add_request(request_id)
-        self._states[request_id] = _RequestState(num_tokens=num_tokens)
+        self._states[request_id] = _RequestState(
+            num_tokens=len(token_ids),
+            max_num_tokens=max_num_tokens,
+            prompt_token_ids=token_ids,
+            cache_epoch=cache_epoch,
+        )
         self._waiting.append(request_id)
 
     def remove(self, request_id: str) -> bool:
@@ -79,7 +99,8 @@ class TokenBudgetScheduler:
         self._running.pop(request_id, None)
         with suppress(ValueError):
             self._waiting.remove(request_id)
-        self._kv_cache.free(request_id)
+        if state.kv_attached:
+            self._kv_cache.free(request_id)
         return True
 
     def schedule(self) -> SchedulerOutput:
@@ -100,10 +121,21 @@ class TokenBudgetScheduler:
             max_output_tokens = 0
             # 只有本轮把现有 token 全部算完，才可以继续生成新 token。
             if num_scheduled_tokens == pending_tokens:
-                desired_lookahead = self._decoding_budget.num_lookahead_tokens
+                remaining_output_tokens = state.max_num_tokens - state.num_tokens
+                if remaining_output_tokens <= 0:
+                    raise SchedulerError(f"request {request_id!r} reached its token limit")
+                round_max_output_tokens = min(
+                    self._decoding_budget.max_output_tokens,
+                    remaining_output_tokens,
+                )
+                # 最后一个确认 token 不会写入 KV，所以最多只需为其余输出预留位置。
+                desired_lookahead = min(
+                    self._decoding_budget.num_lookahead_tokens,
+                    round_max_output_tokens - 1,
+                )
                 if num_scheduled_tokens + desired_lookahead <= token_budget:
                     num_lookahead_tokens = desired_lookahead
-                    max_output_tokens = self._decoding_budget.max_output_tokens
+                    max_output_tokens = round_max_output_tokens
                 elif pending_tokens == 1:
                     # 资源紧张时退化为普通 decode，保证请求仍能前进。
                     max_output_tokens = 1
@@ -127,6 +159,7 @@ class TokenBudgetScheduler:
                     num_lookahead_tokens=num_lookahead_tokens,
                     max_output_tokens=max_output_tokens,
                     block_ids=reservation.block_ids,
+                    num_readonly_prefix_blocks=reservation.num_readonly_prefix_blocks,
                 )
             )
             token_budget -= num_reserved_tokens
@@ -151,13 +184,31 @@ class TokenBudgetScheduler:
         if type(num_new_tokens) is not int or num_new_tokens < 0:
             raise ValueError("num_new_tokens must be a non-negative integer")
 
+        next_num_computed_tokens = state.num_computed_tokens + num_committed_tokens
+        next_num_tokens = state.num_tokens + num_new_tokens
+        if next_num_tokens > state.max_num_tokens:
+            raise SchedulerError(f"request {request_id!r} exceeded its token limit")
+        if next_num_computed_tokens > next_num_tokens:
+            raise SchedulerError(f"request {request_id!r} committed unknown tokens")
+
         # 提交已算完的输入，以及投机解码中已经写入缓存的新 token；其余预留释放。
         self._kv_cache.commit(request_id, num_committed_tokens)
-        state.num_computed_tokens += num_committed_tokens
+        state.num_computed_tokens = next_num_computed_tokens
         # 尚未写入缓存的新 token 会在下一轮作为普通输入继续计算。
-        state.num_tokens += num_new_tokens
+        state.num_tokens = next_num_tokens
 
     def _fill_open_slots(self) -> None:
         while self._waiting and len(self._running) < self._max_num_sequences:
             request_id = self._waiting.popleft()
-            self._running[request_id] = self._states[request_id]
+            state = self._states[request_id]
+            match = self._kv_cache.add_request(
+                request_id,
+                token_ids=state.prompt_token_ids,
+                cache_epoch=state.cache_epoch,
+            )
+            if not 0 <= match.num_cached_tokens < len(state.prompt_token_ids):
+                self._kv_cache.free(request_id)
+                raise SchedulerError("cached prefix must leave at least one token to compute")
+            state.num_computed_tokens = match.num_cached_tokens
+            state.kv_attached = True
+            self._running[request_id] = state

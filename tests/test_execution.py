@@ -1,3 +1,4 @@
+import asyncio
 from functools import partial
 
 import pytest
@@ -13,6 +14,7 @@ from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionCausalLM,
     TinyAttentionConfig,
 )
+from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
     DenseAttentionMetadata,
     ExecutionBatch,
@@ -21,9 +23,12 @@ from light_vllm.runtime.execution import (
     ExecutionNotReadyError,
     ExecutionOutput,
     ExecutionRequest,
+    GreedyAcceptanceSampler,
     LocalModelExecutor,
     LocalModelWorker,
     LocalTokenExecutor,
+    NGramSpeculativeDecodeHandler,
+    NGramTokenProposer,
     PagedKVCacheConfig,
     RequestOutput,
     TorchDenseAttention,
@@ -34,8 +39,15 @@ from light_vllm.runtime.execution.worker import (
     PagedStepHandler,
     StandardDecodeHandler,
 )
-from light_vllm.runtime.kv_cache import ContiguousKVCacheConfig
+from light_vllm.runtime.generation import GenerateRequest
+from light_vllm.runtime.kv_cache import (
+    ContiguousKVCacheConfig,
+    FixedKVBlockCapacity,
+    PagedKVCacheManager,
+    UnboundedKVCacheManager,
+)
 from light_vllm.runtime.sampling import GreedySampler
+from light_vllm.runtime.scheduler import DecodingBudget, TokenBudgetScheduler
 
 
 class IncrementingForwarder:
@@ -168,12 +180,16 @@ def _execution_request(
     num_computed_tokens: int,
     block_ids: tuple[int, ...] | None,
     *,
+    context_token_ids: tuple[int, ...] | None = None,
     num_lookahead_tokens: int = 0,
     max_output_tokens: int = 1,
 ) -> ExecutionRequest:
+    if context_token_ids is None:
+        context_token_ids = (0,) * num_computed_tokens + input_token_ids
     return ExecutionRequest(
         request_id=request_id,
         input_token_ids=input_token_ids,
+        context_token_ids=context_token_ids,
         num_computed_tokens=num_computed_tokens,
         num_lookahead_tokens=num_lookahead_tokens,
         max_output_tokens=max_output_tokens,
@@ -266,6 +282,7 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                 ExecutionRequest(
                     request_id="request",
                     input_token_ids=(1, 2),
+                    context_token_ids=(1, 2),
                     num_computed_tokens=0,
                     num_lookahead_tokens=0,
                     max_output_tokens=0,
@@ -280,6 +297,7 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
                 ExecutionRequest(
                     request_id="request",
                     input_token_ids=(3,),
+                    context_token_ids=(1, 2, 3),
                     num_computed_tokens=2,
                     num_lookahead_tokens=0,
                     max_output_tokens=1,
@@ -292,6 +310,88 @@ def test_model_executor_handles_prefill_without_sampling_then_decode() -> None:
     assert prefill.num_input_tokens_computed == 2
     assert prefill.output_token_ids == ()
     assert decode.output_token_ids == (4,)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize(
+    ("prompt", "expected_outputs", "expected_queries"),
+    [
+        (
+            (1, 2, 3, 4, 1, 2),
+            (3, 4, 5),
+            ((1, 2, 3, 4, 1, 2, 3, 4),),
+        ),
+        (
+            (1, 2, 3, 1, 2),
+            (3, 4, 5),
+            ((1, 2, 3, 1, 2, 3, 1), (4,)),
+        ),
+        (
+            (1, 3, 5),
+            (6, 7, 8),
+            ((1, 3, 5), (6,), (7,)),
+        ),
+    ],
+)
+def test_engine_ngram_speculation_matches_target_generation(
+    paged: bool,
+    prompt: tuple[int, ...],
+    expected_outputs: tuple[int, ...],
+    expected_queries: tuple[tuple[int, ...], ...],
+) -> None:
+    async def run() -> None:
+        class RecordingIncrementingForwarder(IncrementingForwarder):
+            def __init__(self) -> None:
+                super().__init__(vocab_size=16)
+                self.queries: list[tuple[int, ...]] = []
+
+            def forward(self, batch: ForwardBatch) -> ModelOutput:
+                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
+                self.queries.append(
+                    tuple(int(value) for value in batch.input_ids[0, :query_length])
+                )
+                return super().forward(batch)
+
+        forwarder = RecordingIncrementingForwarder()
+        provider = StaticSessionProvider(forwarder)
+        decode_handler = NGramSpeculativeDecodeHandler(
+            NGramTokenProposer(min_match_length=2, max_match_length=4),
+            GreedySampler(),
+            GreedyAcceptanceSampler(),
+        )
+        if paged:
+            worker = _paged_worker(
+                provider,
+                num_blocks=8,
+                block_size=2,
+                decode_handler=decode_handler,
+            )
+            logical_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=8, block_size=2))
+        else:
+            worker = _contiguous_worker(provider, decode_handler=decode_handler)
+            logical_cache = UnboundedKVCacheManager()
+        executor = LocalModelExecutor(worker)
+        executor.initialize()
+        engine = EngineCore(
+            executor,
+            TokenBudgetScheduler(
+                logical_cache,
+                max_num_sequences=1,
+                max_num_scheduled_tokens=8,
+                decoding_budget=DecodingBudget(
+                    num_lookahead_tokens=2,
+                    max_output_tokens=3,
+                ),
+            ),
+        )
+
+        result = await engine.generate(GenerateRequest(input_ids=prompt, max_new_tokens=3))
+        await engine.close()
+
+        assert result.generated_token_ids == expected_outputs
+        assert forwarder.queries == list(expected_queries)
+
+    asyncio.run(run())
 
 
 def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> None:
@@ -559,7 +659,7 @@ def test_worker_composes_step_and_decode_handlers_without_mode_branches() -> Non
 
     output = worker.execute(batch)
 
-    assert worker.capabilities == ExecutionCapabilities(None, 17)
+    assert worker.capabilities == ExecutionCapabilities(None, 17, model.generation)
     assert step.added == [("request", 5)]
     assert decode.call == (model, batch, step)
     assert output.requests[0].output_token_ids == (2, 3, 4)

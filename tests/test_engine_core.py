@@ -77,17 +77,20 @@ class RecordingExecutor:
         for request in batch.requests:
             token_ids = ()
             if request.max_output_tokens:
-                token_ids = (
+                candidates = (
                     (request.input_token_ids[-1] + 1, request.input_token_ids[-1] + 2)
                     if self.multiple_tokens
                     else (request.input_token_ids[-1] + 1,)
                 )
+                token_ids = candidates[: request.max_output_tokens]
             results.append(
                 RequestOutput(
                     request_id=request.request_id,
                     num_input_tokens_computed=len(request.input_token_ids),
                     output_token_ids=token_ids,
-                    num_cached_output_tokens=1 if self.multiple_tokens else 0,
+                    num_cached_output_tokens=(
+                        1 if self.multiple_tokens and request.num_lookahead_tokens else 0
+                    ),
                 )
             )
         return ExecutionOutput(requests=tuple(results))
@@ -131,6 +134,23 @@ def test_engine_accepts_multiple_committed_tokens_from_one_execution() -> None:
         assert result.generated_token_ids == (2, 3, 4)
         assert result.finish_reason == "length"
         assert executor.history == [((1,),), ((3,),)]
+
+    asyncio.run(run())
+
+
+def test_engine_stops_at_eos_inside_a_multi_token_result() -> None:
+    async def run() -> None:
+        executor = RecordingExecutor(multiple_tokens=True)
+        engine = _engine(executor, token_budget=8)
+        result = await engine.generate(
+            GenerateRequest(input_ids=(1,), max_new_tokens=3, eos_token_id=2)
+        )
+        await engine.close()
+
+        assert result.generated_token_ids == (2,)
+        assert result.finish_reason == "eos"
+        assert executor.history == [((1,),)]
+        assert not executor.active
 
     asyncio.run(run())
 

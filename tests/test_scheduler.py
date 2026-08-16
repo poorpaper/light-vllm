@@ -2,6 +2,7 @@ import pytest
 
 from light_vllm.runtime.kv_cache import (
     FixedKVBlockCapacity,
+    KVCacheMatch,
     PagedKVCacheManager,
     UnboundedKVCacheManager,
 )
@@ -18,7 +19,7 @@ def _scheduler(*, token_budget: int = 4, num_blocks: int = 8) -> TokenBudgetSche
 
 def test_scheduler_chunks_long_prompts_with_one_token_budget() -> None:
     scheduler = _scheduler(token_budget=2)
-    scheduler.add("request", num_tokens=5)
+    scheduler.add("request", token_ids=(1, 2, 3, 4, 5), max_num_tokens=9)
 
     first = scheduler.schedule().requests[0]
     assert first.num_computed_tokens == 0
@@ -40,9 +41,9 @@ def test_scheduler_chunks_long_prompts_with_one_token_budget() -> None:
 
 def test_scheduler_uses_one_budget_across_requests_and_refills_open_slots() -> None:
     scheduler = _scheduler(token_budget=3)
-    scheduler.add("a", num_tokens=2)
-    scheduler.add("b", num_tokens=2)
-    scheduler.add("c", num_tokens=1)
+    scheduler.add("a", token_ids=(1, 2), max_num_tokens=6)
+    scheduler.add("b", token_ids=(3, 4), max_num_tokens=6)
+    scheduler.add("c", token_ids=(5,), max_num_tokens=5)
 
     output = scheduler.schedule()
     assert [(item.request_id, item.num_scheduled_tokens) for item in output.requests] == [
@@ -58,10 +59,10 @@ def test_scheduler_uses_one_budget_across_requests_and_refills_open_slots() -> N
 
 def test_scheduler_rejects_duplicate_request_ids() -> None:
     scheduler = _scheduler()
-    scheduler.add("request", num_tokens=1)
+    scheduler.add("request", token_ids=(1,), max_num_tokens=5)
 
     with pytest.raises(SchedulerError, match="already scheduled"):
-        scheduler.add("request", num_tokens=1)
+        scheduler.add("request", token_ids=(1,), max_num_tokens=5)
 
 
 def test_scheduler_supports_reservations_without_block_placement() -> None:
@@ -70,7 +71,7 @@ def test_scheduler_supports_reservations_without_block_placement() -> None:
         max_num_sequences=1,
         max_num_scheduled_tokens=2,
     )
-    scheduler.add("request", num_tokens=3)
+    scheduler.add("request", token_ids=(1, 2, 3), max_num_tokens=7)
 
     first = scheduler.schedule().requests[0]
     assert first.block_ids is None
@@ -92,7 +93,7 @@ def test_scheduler_reserves_lookahead_without_a_decode_mode() -> None:
             max_output_tokens=2,
         ),
     )
-    scheduler.add("request", num_tokens=1)
+    scheduler.add("request", token_ids=(1,), max_num_tokens=4)
 
     first = scheduler.schedule().requests[0]
     assert first.num_scheduled_tokens == 1
@@ -104,3 +105,85 @@ def test_scheduler_reserves_lookahead_without_a_decode_mode() -> None:
     second = scheduler.schedule().requests[0]
     assert second.num_computed_tokens == 2
     assert second.num_scheduled_tokens == 1
+
+
+def test_scheduler_trims_speculative_budget_at_the_request_length_limit() -> None:
+    scheduler = TokenBudgetScheduler(
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1)),
+        max_num_sequences=1,
+        max_num_scheduled_tokens=4,
+        decoding_budget=DecodingBudget(
+            num_lookahead_tokens=3,
+            max_output_tokens=4,
+        ),
+    )
+    # 请求总共只允许再生成两个 token，不应为第三、第四个结果预留位置。
+    scheduler.add("request", token_ids=(1,), max_num_tokens=3)
+
+    scheduled = scheduler.schedule().requests[0]
+
+    assert scheduled.max_output_tokens == 2
+    assert scheduled.num_lookahead_tokens == 1
+    assert scheduled.block_ids == (0, 1)
+
+
+def test_scheduler_releases_an_invalid_prefix_match() -> None:
+    class InvalidMatchCache:
+        def __init__(self) -> None:
+            self.freed: list[str] = []
+
+        def add_request(self, request_id, *, token_ids, cache_epoch):
+            return KVCacheMatch(num_cached_tokens=len(token_ids))
+
+        def reserve(self, request_id, num_tokens):
+            raise AssertionError("invalid prefix must fail before reservation")
+
+        def commit(self, request_id, num_tokens):
+            raise AssertionError("invalid prefix must fail before commit")
+
+        def free(self, request_id):
+            self.freed.append(request_id)
+            return True
+
+    cache = InvalidMatchCache()
+    scheduler = TokenBudgetScheduler(
+        cache,
+        max_num_sequences=1,
+        max_num_scheduled_tokens=2,
+    )
+    scheduler.add("request", token_ids=(1, 2), max_num_tokens=6)
+
+    with pytest.raises(SchedulerError, match="leave at least one token"):
+        scheduler.schedule()
+    assert cache.freed == ["request"]
+
+
+def test_scheduler_starts_from_a_cached_readonly_prompt_prefix() -> None:
+    cache = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=4, block_size=2),
+        enable_prefix_caching=True,
+    )
+    warm_tokens = (1, 2, 3, 4, 5)
+    cache.add_request("warm", token_ids=warm_tokens, cache_epoch=1)
+    cache.reserve("warm", len(warm_tokens))
+    cache.commit("warm", len(warm_tokens))
+    cache.free("warm")
+    scheduler = TokenBudgetScheduler(
+        cache,
+        max_num_sequences=1,
+        max_num_scheduled_tokens=2,
+    )
+    scheduler.add(
+        "hit",
+        token_ids=(1, 2, 3, 4, 9),
+        max_num_tokens=9,
+        cache_epoch=1,
+    )
+
+    scheduled = scheduler.schedule().requests[0]
+
+    assert scheduled.num_computed_tokens == 4
+    assert scheduled.num_scheduled_tokens == 1
+    assert scheduled.num_readonly_prefix_blocks == 2
+    assert scheduled.block_ids is not None
+    assert scheduled.block_ids[:2] == (0, 1)

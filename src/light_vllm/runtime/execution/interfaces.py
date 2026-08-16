@@ -18,11 +18,49 @@ class ExecutionNotReadyError(ExecutionError):
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptanceResult:
+    """候选验收后可见的输出，以及其中已经写入 KV 的前缀长度。"""
+
+    output_token_ids: tuple[int, ...]
+    num_cached_output_tokens: int
+
+    def __post_init__(self) -> None:
+        output_token_ids = tuple(self.output_token_ids)
+        if not output_token_ids:
+            raise ValueError("acceptance result must contain at least one output token")
+        if any(type(token_id) is not int or token_id < 0 for token_id in output_token_ids):
+            raise ValueError("output_token_ids must contain non-negative integers")
+        if type(self.num_cached_output_tokens) is not int or not (
+            0 <= self.num_cached_output_tokens < len(output_token_ids)
+        ):
+            raise ValueError("cached output count must leave one uncached output token")
+        object.__setattr__(self, "output_token_ids", output_token_ids)
+
+
+class TokenProposer(Protocol):
+    """根据完整已知 token 历史提出少量候选 token。"""
+
+    def propose(self, token_ids: tuple[int, ...], *, max_tokens: int) -> tuple[int, ...]: ...
+
+
+class AcceptanceSampler(Protocol):
+    """对照目标模型结果，决定哪些候选可以确认。"""
+
+    def accept(
+        self,
+        draft_token_ids: tuple[int, ...],
+        target_token_ids: tuple[int, ...],
+    ) -> AcceptanceResult: ...
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionCapabilities:
     """执行器初始化后能够支持的模型长度和 KV cache 容量。"""
 
     max_model_tokens: int | None
     max_kv_cache_tokens: int | None
+    # 物理 KV 重新创建时递增；prefix cache 不能跨 epoch 复用旧页。
+    kv_cache_epoch: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,29 +74,47 @@ class ExecutionRequest:
 
     request_id: str
     input_token_ids: tuple[int, ...]
+    # 从 prompt 开始到当前已知末尾的完整 token；proposer 只读，不得在执行中修改。
+    context_token_ids: tuple[int, ...]
     num_computed_tokens: int
     num_lookahead_tokens: int
     max_output_tokens: int
     # 分页 KV cache 需要 block table；连续 KV cache 不需要，使用 None。
     block_ids: tuple[int, ...] | None
+    num_readonly_prefix_blocks: int = 0
 
     def __post_init__(self) -> None:
         input_token_ids = tuple(self.input_token_ids)
+        context_token_ids = tuple(self.context_token_ids)
         if not self.request_id:
             raise ValueError("request_id must not be empty")
         if not input_token_ids:
             raise ValueError("input_token_ids must not be empty")
         if any(type(token_id) is not int or token_id < 0 for token_id in input_token_ids):
             raise ValueError("input_token_ids must contain non-negative integers")
+        if not context_token_ids or any(
+            type(token_id) is not int or token_id < 0 for token_id in context_token_ids
+        ):
+            raise ValueError("context_token_ids must contain non-negative integers")
         if type(self.num_computed_tokens) is not int or self.num_computed_tokens < 0:
             raise ValueError("num_computed_tokens must be a non-negative integer")
         if type(self.num_lookahead_tokens) is not int or self.num_lookahead_tokens < 0:
             raise ValueError("num_lookahead_tokens must be a non-negative integer")
         if type(self.max_output_tokens) is not int or self.max_output_tokens < 0:
             raise ValueError("max_output_tokens must be a non-negative integer")
+        if type(self.num_readonly_prefix_blocks) is not int or self.num_readonly_prefix_blocks < 0:
+            raise ValueError("num_readonly_prefix_blocks must be a non-negative integer")
+        input_end = self.num_computed_tokens + len(input_token_ids)
+        if tuple(context_token_ids[self.num_computed_tokens : input_end]) != input_token_ids:
+            raise ValueError("input_token_ids must be the scheduled slice of context_token_ids")
         object.__setattr__(self, "input_token_ids", input_token_ids)
+        object.__setattr__(self, "context_token_ids", context_token_ids)
+        if self.block_ids is None and self.num_readonly_prefix_blocks:
+            raise ValueError("readonly prefix blocks require a block table")
         if self.block_ids is not None:
             object.__setattr__(self, "block_ids", tuple(self.block_ids))
+            if self.num_readonly_prefix_blocks > len(self.block_ids):
+                raise ValueError("readonly prefix blocks must fit within the block table")
 
 
 @dataclass(frozen=True, slots=True)

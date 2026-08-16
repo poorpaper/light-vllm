@@ -26,24 +26,27 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
   `PagedKVCacheManager` 额外按容量分配 block table。
+- 可选 prefix cache 由 `PagedKVCacheManager` 管理：只复用已提交的完整 prompt 页，缓存页使用哈希链、
+  引用计数和 LRU；共享前缀只读，各请求尾页独占。
 - composition root 通过 `kv_reservation=blocks|unbounded` 同时选择匹配的逻辑 manager 和
   `ModelStepHandler`；该选择不得进入 Engine、Executor 或 Worker 热路径。
 - `LocalModelExecutor` 只把执行端口委托给一个 `LocalModelWorker`。Worker 固定当前模型版本和请求生命周期；
   `ContiguousStepHandler` / `PagedStepHandler` 分别负责连续与分页 KV 的输入准备、物理缓存和模型 forward。
-- `StandardDecodeHandler` 负责无输出的输入步骤和普通单 token 解码；未来投机解码替换 DecodeHandler，不新增模式专用 Worker。
+- `StandardDecodeHandler` 负责普通单 token 解码；`NGramSpeculativeDecodeHandler` 组合历史候选、目标验证和贪心验收，
+  两者替换同一 Handler，不新增模式专用 Worker。
 - 固定页数或 CUDA 空闲显存策略在模型加载后解析成同一个分页容量对象，同时供逻辑 manager 与物理页池使用。
 - 可缓存模型只通过 `AttentionContext` 执行 attention，不内置 dense/paged fallback。reference 与连续缓存使用
-  `TorchDenseAttention`；分页缓存使用逐页读取 K/V、在线 softmax 的 `TorchPagedAttention`，
-  `PagedAttentionBackend` 是 CUDA/Triton 的替换边界。
+  `TorchDenseAttention`；分页缓存默认使用逐页读取 K/V 的 `TorchPagedAttention`，也可装配直接读取 block table、
+  融合 QK/在线 softmax/PV 的 `TritonPagedAttention`。
 - `RequestOutput` 分开表达本轮输入计算量、零到多个确认输出，以及已经写入 KV 的输出前缀。
 - `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
 - FastAPI adapter 只依赖 `EngineClient`，不知道 scheduler、runner、torch 或 KV cache。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
-当前尚未实现生产级 CUDA/Triton Paged Attention kernel、prefix caching、preemption、投机解码、分布式执行、
-tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorch Paged Attention 是物理分页正确性
-基线，不代表生产吞吐；当前也不宣称支持大多数 Transformers 模型。
+当前尚未实现 preemption、分布式执行、tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。
+PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend 已在 RTX 5090 上完成 FP16/BF16 数值对照，
+但尚未完成长上下文性能与跨显卡验收，仍不代表生产吞吐。当前也不宣称支持大多数 Transformers 模型。
 
 ## 代码地图
 
@@ -68,6 +71,7 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 | `src/light_vllm/runtime/execution/dense_attention.py` | reference/连续缓存共用的 dense attention 上下文 |
 | `src/light_vllm/runtime/execution/paged_cache.py` | 分页 Step Handler 拥有的物理 K/V tensor |
 | `src/light_vllm/runtime/execution/paged_attention.py` | Paged metadata 与 PyTorch correctness backend |
+| `src/light_vllm/runtime/execution/triton_paged_attention.py` | 可选 Triton fused Paged Attention backend |
 | `src/light_vllm/runtime/engine/admission.py` | 确定性请求容量准入 |
 | `src/light_vllm/runtime/engine/core.py` | 请求状态、迭代循环、事件与安全取消 |
 | `src/light_vllm/runtime/engine/in_process.py` | 同步 reference 到异步 Engine 的适配器 |
@@ -99,10 +103,10 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 16. 逻辑 KV reservation 每轮必须以 commit 或 remove 结束；只提交实际算完的输入和可见的已缓存输出前缀。
 17. 模型执行失败、输出校验失败或请求取消时，不得把本轮 token 写入 Engine 状态。
 18. 取消请求必须立即退出后续调度；已开始执行的同步步骤到达安全边界后，其结果必须丢弃。
-19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID 生命周期、未来 prefix cache 和 preemption；
+19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID、prefix cache 和未来 preemption；
     Worker/Step Handler 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
 20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。
-21. 投机解码未来由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor。
+21. 投机解码由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor 或 Worker。
 22. 不为尚未实现的 attention、memory 或 prefix routing 创建空包。
 23. 内部代码从所属功能域的 `interfaces.py` 导入稳定契约；需要实现时直接导入实现模块。
 24. 不维护未发布架构的历史兼容别名、空 facade 或旧路径。
@@ -114,8 +118,7 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 28. Paged Attention 实现必须通过 `PagedAttentionBackend` 创建同一个 `AttentionContext`，并直接按 block table
     读取物理页；不得以拼接完整历史 tensor 冒充分页实现。
 29. block table 必须精确覆盖本轮 `computed + query + lookahead reservation` 所需物理页，不得携带未预留尾页
-    或在单请求内重复页；
-    prefix sharing 拥有显式只读 ownership 之前，不同活动请求也不得共享物理页。
+    或在单请求内重复页；跨请求只能在相同逻辑位置共享双方都声明为只读的完整前缀页，可写尾页必须独占。
 30. `LocalModelWorker` 初始化时固定一个 `ModelSession`。reload 后活动请求继续使用旧 session，Worker 拒绝新请求；活动
     请求清空后才可按新 generation 重建物理缓存。
 31. 固定页数或显存发现策略必须解析成一个共享容量事实；逻辑 block manager 和物理页池不得各自配置容量。
@@ -168,7 +171,5 @@ git diff --check
 
 ## 下一步
 
-下一阶段在现有 `PagedAttentionBackend` 边界增加生产级 CUDA/Triton kernel；之后再加 prefix caching 和
-preemption。投机解码应从 `TokenProposer`、target verify 和 `AcceptanceSampler` 开始，返回事实型多 token
-结果，不改变
-EngineClient、generation 事件或 HTTP adapter。
+下一阶段针对长上下文把 Triton backend 改成分段计算与归并，并补充跨显卡性能验收；之后继续实现
+Scheduler-owned preemption。两项能力都不得改变 EngineClient、generation 事件或 HTTP adapter。
