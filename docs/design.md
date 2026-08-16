@@ -306,5 +306,8 @@ prefix 命中/LRU/epoch、投机全接受/部分接受/首个拒绝/短候选、
 别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、执行失败和取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
 
 边界命名与职责参考 [vLLM Architecture Overview](https://docs.vllm.ai/en/latest/design/arch_overview/)；分页布局与
-按需读取原则参考 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)。本项目保留这些成熟边界，但以
-可读的 PyTorch correctness backend 先固定行为，再替换优化 kernel。
+按需读取原则参考 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)。完整页哈希与 LRU 参考
+[vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/latest/design/prefix_caching/)，简单候选策略参考
+[vLLM N-Gram Speculation](https://docs.vllm.ai/en/latest/features/speculative_decoding/n_gram/) 和
+[SGLang Speculative Decoding](https://github.com/sgl-project/sglang/blob/main/docs_new/docs/advanced_features/speculative_decoding.mdx)。
+本项目保留这些成熟边界，但以可读的 PyTorch correctness 实现先固定行为，再替换优化 kernel。
