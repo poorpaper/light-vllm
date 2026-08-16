@@ -8,7 +8,7 @@ from typing import Protocol
 import torch
 from torch import Tensor
 
-from light_vllm.modeling.attention.interfaces import AttentionContext
+from light_vllm.modeling.attention.interfaces import AttentionContext, AttentionLayerSpec
 from light_vllm.runtime.execution.paged_cache import PagedKVCache
 from light_vllm.runtime.kv_cache import KVCacheError
 
@@ -160,6 +160,35 @@ class PagedAttentionBackend(Protocol):
     ) -> PagedAttentionContext: ...
 
 
+def _validate_paged_attention_tensors(
+    cache: PagedKVCache,
+    metadata: PagedAttentionMetadata,
+    layer_id: str,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+) -> AttentionLayerSpec:
+    """让不同 backend 共用同一套形状与页表校验。"""
+
+    layer_spec = cache.layer_spec(layer_id)
+    config = cache.config
+    if query.ndim != 4:
+        raise KVCacheError("paged attention query must have four dimensions")
+    if query.shape[:2] != key.shape[:2] or value.shape != key.shape:
+        raise KVCacheError("paged attention Q/K/V batch and query dimensions must match")
+    if query.shape[0] != metadata.batch_size:
+        raise KVCacheError("paged attention metadata batch size does not match query")
+    if query.shape[2:] != (layer_spec.num_query_heads, layer_spec.head_size):
+        raise KVCacheError("paged attention query shape does not match the layer spec")
+    if key.shape[2:] != (layer_spec.num_kv_heads, layer_spec.head_size):
+        raise KVCacheError("paged attention K/V shape does not match the layer spec")
+    metadata.validate_block_tables(
+        num_blocks=config.num_blocks,
+        block_size=config.block_size,
+    )
+    return layer_spec
+
+
 class TorchPagedAttention:
     """逐物理页读取 K/V 的在线 softmax attention。
 
@@ -188,22 +217,15 @@ class TorchPagedAttention:
         if layer_id in self._layer_ids:
             raise KVCacheError(f"paged attention layer {layer_id!r} ran more than once")
         self._layer_ids.add(layer_id)
-        layer_spec = self._cache.layer_spec(layer_id)
-        config = self._cache.config
-        if query.ndim != 4:
-            raise KVCacheError("paged attention query must have four dimensions")
-        if query.shape[:2] != key.shape[:2] or value.shape != key.shape:
-            raise KVCacheError("paged attention Q/K/V batch and query dimensions must match")
-        if query.shape[0] != self._metadata.batch_size:
-            raise KVCacheError("paged attention metadata batch size does not match query")
-        if query.shape[2:] != (layer_spec.num_query_heads, layer_spec.head_size):
-            raise KVCacheError("paged attention query shape does not match the layer spec")
-        if key.shape[2:] != (layer_spec.num_kv_heads, layer_spec.head_size):
-            raise KVCacheError("paged attention K/V shape does not match the layer spec")
-        self._metadata.validate_block_tables(
-            num_blocks=config.num_blocks,
-            block_size=config.block_size,
+        _validate_paged_attention_tensors(
+            self._cache,
+            self._metadata,
+            layer_id,
+            query,
+            key,
+            value,
         )
+        config = self._cache.config
 
         slot_mapping = self._metadata.slot_mapping(
             block_size=config.block_size,
