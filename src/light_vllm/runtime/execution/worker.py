@@ -226,6 +226,9 @@ class PagedStepHandler:
             block_tables=tuple(request.block_ids or () for request in batch.requests),
             num_computed_tokens=tuple(request.num_computed_tokens for request in batch.requests),
             query_lengths=tuple(query_lengths),
+            num_readonly_prefix_blocks=tuple(
+                request.num_readonly_prefix_blocks for request in batch.requests
+            ),
         )
         # Handler 选择具体 attention 实现，模型只通过统一接口调用它。
         attention = self._attention_backend.create(self._cache, metadata)

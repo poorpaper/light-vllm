@@ -136,3 +136,29 @@ def test_scheduler_releases_an_invalid_prefix_match() -> None:
     with pytest.raises(SchedulerError, match="leave at least one token"):
         scheduler.schedule()
     assert cache.freed == ["request"]
+
+
+def test_scheduler_starts_from_a_cached_readonly_prompt_prefix() -> None:
+    cache = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=4, block_size=2),
+        enable_prefix_caching=True,
+    )
+    warm_tokens = (1, 2, 3, 4, 5)
+    cache.add_request("warm", token_ids=warm_tokens, cache_epoch=1)
+    cache.reserve("warm", len(warm_tokens))
+    cache.commit("warm", len(warm_tokens))
+    cache.free("warm")
+    scheduler = TokenBudgetScheduler(
+        cache,
+        max_num_sequences=1,
+        max_num_scheduled_tokens=2,
+    )
+    scheduler.add("hit", token_ids=(1, 2, 3, 4, 9), cache_epoch=1)
+
+    scheduled = scheduler.schedule().requests[0]
+
+    assert scheduled.num_computed_tokens == 4
+    assert scheduled.num_scheduled_tokens == 1
+    assert scheduled.num_readonly_prefix_blocks == 2
+    assert scheduled.block_ids is not None
+    assert scheduled.block_ids[:2] == (0, 1)

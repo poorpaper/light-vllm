@@ -276,6 +276,7 @@ class EngineCore:
                     num_lookahead_tokens=item.num_lookahead_tokens,
                     max_output_tokens=item.max_output_tokens,
                     block_ids=item.block_ids,
+                    num_readonly_prefix_blocks=item.num_readonly_prefix_blocks,
                 )
             )
         return ExecutionBatch(requests=tuple(requests))

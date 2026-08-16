@@ -395,3 +395,69 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
         assert logical_cache.num_free_blocks == 8
 
     asyncio.run(run())
+
+
+def test_engine_reuses_a_shared_prompt_prefix_without_changing_generation() -> None:
+    async def run() -> None:
+        torch.manual_seed(31)
+        model = TinyAttentionCausalLM(
+            TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
+        ).eval()
+
+        class Forwarder:
+            generation = 1
+            kv_cache_spec = model.kv_cache_spec
+            max_model_tokens = None
+
+            def __init__(self) -> None:
+                self.query_lengths: list[tuple[int, ...]] = []
+
+            def forward(self, batch: ForwardBatch):
+                lengths = batch.sequence_lengths or (batch.input_ids.shape[1],)
+                self.query_lengths.append(lengths)
+                return model(batch)
+
+        forwarder = Forwarder()
+
+        class SessionProvider:
+            generation = 1
+
+            def open_session(self):
+                return forwarder
+
+        cache_config = PagedKVCacheConfig(num_blocks=8, block_size=2)
+        logical_cache = PagedKVCacheManager(
+            cache_config,
+            enable_prefix_caching=True,
+        )
+        worker = LocalModelWorker(
+            SessionProvider(),
+            partial(
+                PagedStepHandler,
+                cache_planner=cache_config,
+                attention_backend=TorchPagedAttentionBackend(),
+            ),
+            StandardDecodeHandler(GreedySampler()),
+        )
+        executor = LocalModelExecutor(worker)
+        executor.initialize()
+        engine = EngineCore(
+            executor,
+            TokenBudgetScheduler(
+                logical_cache,
+                max_num_sequences=1,
+                max_num_scheduled_tokens=8,
+            ),
+        )
+
+        await engine.generate(GenerateRequest(input_ids=(1, 2, 3, 4, 5), max_new_tokens=1))
+        second_prompt = (1, 2, 3, 4, 6)
+        result = await engine.generate(GenerateRequest(input_ids=second_prompt, max_new_tokens=1))
+        expected = int(_tiny_dense_forward(model, second_prompt)[0].logits[0, -1].argmax())
+        await engine.close()
+
+        assert result.generated_token_ids == (expected,)
+        assert forwarder.query_lengths == [(5,), (1,)]
+        assert logical_cache.num_free_blocks == 8
+
+    asyncio.run(run())

@@ -176,7 +176,7 @@ blocks    → PagedKVCacheManager     → PagedStepHandler
 3. 未提交的尾部自动回滚并归还多余 block。
 4. 完成、失败或取消时释放请求全部逻辑 block。
 5. 交给 Worker 的 block table 精确覆盖已提交 token、本轮 query 和显式 lookahead reservation，不包含未预留尾页。
-6. 当前活动物理页保持请求独占；prefix sharing 落地时必须显式表达只读共享与可写尾页 ownership。
+6. Prefix cache 只复用已经提交的完整 prompt 页；共享页必须在相同逻辑位置且双方都声明只读，可写尾页保持独占。
 
 连续与分页 Step Handler 都根据模型的同一个 `ModelKVCacheSpec` 创建物理缓存；装配层不再重复填写 layer/head 形状。
 分页 Step Handler 创建每层 `[block, offset, kv_head, head_size]` tensor。每个 query
@@ -285,10 +285,10 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 
 ## 后续演进顺序
 
-1. 在现有 `PagedAttentionBackend` 边界实现 CUDA/Triton kernel。
-2. prefix caching 和 Scheduler-owned preemption。
-3. 普通随机 Sampler。
-4. `TokenProposer + target verify + AcceptanceSampler` 投机解码。
+1. `TokenProposer + target verify + AcceptanceSampler` 投机解码。
+2. 在现有 `PagedAttentionBackend` 边界实现 CUDA/Triton kernel。
+3. Scheduler-owned preemption。
+4. 普通随机 Sampler。
 5. 进程/分布式 Worker 与生产级 serving。
 
 任何新能力都应先证明现有事实型契约表达不了，再新增字段或接口；不为未来功能预建空包。

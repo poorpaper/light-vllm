@@ -142,6 +142,9 @@ chunk；追上全部已知 token 后才采样输出。
 规格，Handler 以 `[block, offset, kv_head, head_size]` 布局创建页池；当前 PyTorch backend 直接逐页完成
 attention，适合 CPU correctness 与后续优化 kernel 的行为基线。
 
+增加 `--enable-prefix-caching` 后，Engine 会按 token 内容复用已经算完的完整 prompt 页。共享页只读，
+每个请求继续使用自己的可写尾页；模型重新加载后 cache epoch 改变，旧页索引会自动清空。
+
 `--kv-reservation unbounded` 装配无 block manager 与 `ContiguousStepHandler`，不限制逻辑 KV 容量。它保留
 无 Paged Attention 的请求级连续 tensor 路径，主要用于测试和结果对照，不是生产容量保护机制。两种 Handler
 都只读取模型的 `ModelKVCacheSpec`，装配层不重复填写 K/V 形状。
@@ -185,6 +188,6 @@ catalog.loaders.register("my-format", my_loader)
 ## 当前非目标
 
 当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback、独立 Greedy
-Sampler、原生 Qwen2 子集和可读性优先的物理 Paged Attention correctness backend。Tokenizer、文本 prompt、随机
-sampling、生产级 CUDA/Triton attention kernel、prefix caching、preemption、投机解码、分布式执行和
+Sampler、原生 Qwen2 子集、整页 prefix cache 和可读性优先的物理 Paged Attention correctness backend。
+Tokenizer、文本 prompt、随机 sampling、生产级 CUDA/Triton attention kernel、preemption、投机解码、分布式执行和
 OpenAI-compatible API 仍是后续能力。多进程实现将新增 `EngineClient` / Worker 拓扑，而不改 HTTP。

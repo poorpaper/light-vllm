@@ -143,6 +143,7 @@ class TokenBudgetScheduler:
                     num_lookahead_tokens=num_lookahead_tokens,
                     max_output_tokens=max_output_tokens,
                     block_ids=reservation.block_ids,
+                    num_readonly_prefix_blocks=reservation.num_readonly_prefix_blocks,
                 )
             )
             token_budget -= num_reserved_tokens

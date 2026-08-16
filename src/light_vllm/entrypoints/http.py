@@ -91,6 +91,7 @@ def create_serving_app(
     num_kv_blocks: int | None = None,
     kv_block_size: int = 16,
     kv_cache_memory_fraction: float = 0.8,
+    enable_prefix_caching: bool = False,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -123,13 +124,18 @@ def create_serving_app(
                 memory_fraction=kv_cache_memory_fraction,
             )
             # 同一容量对象同时交给逻辑分配和物理页池，避免两份配置漂移。
-            logical_cache = PagedKVCacheManager(cache_planner)
+            logical_cache = PagedKVCacheManager(
+                cache_planner,
+                enable_prefix_caching=enable_prefix_caching,
+            )
             step_factory = partial(
                 PagedStepHandler,
                 cache_planner=cache_planner,
                 attention_backend=TorchPagedAttentionBackend(),
             )
         elif kv_reservation == "unbounded":
+            if enable_prefix_caching:
+                raise ValueError("prefix caching requires paged KV reservation")
             # 连续缓存也直接读取模型声明的 KV 形状，这里只指定设备和数据类型。
             logical_cache = UnboundedKVCacheManager()
             step_factory = partial(
@@ -209,6 +215,11 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--kv-block-size", type=int, default=16)
     parser.add_argument("--kv-cache-memory-fraction", type=float, default=0.8)
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action="store_true",
+        help="reuse complete prompt KV blocks across requests",
+    )
     return parser
 
 
@@ -234,6 +245,7 @@ def main() -> None:
             num_kv_blocks=args.num_kv_blocks,
             kv_block_size=args.kv_block_size,
             kv_cache_memory_fraction=args.kv_cache_memory_fraction,
+            enable_prefix_caching=args.enable_prefix_caching,
         ),
         host=args.host,
         port=args.port,

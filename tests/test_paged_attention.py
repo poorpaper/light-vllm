@@ -226,6 +226,75 @@ def test_paged_attention_rejects_aliased_blocks_across_requests() -> None:
         )
 
 
+def test_paged_attention_allows_the_same_readonly_prefix_position() -> None:
+    torch.manual_seed(29)
+    cache = _cache()
+    past_keys = torch.randn(1, 2, 2, 4)
+    past_values = torch.randn(1, 2, 2, 4)
+    cache.write("attention", past_keys, past_values, torch.tensor([[0, 1]]))
+    metadata = PagedAttentionMetadata(
+        block_tables=((0, 1), (0, 2)),
+        num_computed_tokens=(2, 2),
+        query_lengths=(1, 1),
+        num_readonly_prefix_blocks=(1, 1),
+    )
+    query = torch.randn(2, 1, 2, 4)
+    key = torch.randn(2, 1, 2, 4)
+    value = torch.randn(2, 1, 2, 4)
+
+    output = TorchPagedAttention(cache, metadata).forward(
+        "attention",
+        query,
+        key,
+        value,
+        scale=0.5,
+    )
+
+    for row in range(2):
+        expected = _dense_attention(
+            query[row, 0],
+            torch.cat((past_keys[0], key[row]), dim=0),
+            torch.cat((past_values[0], value[row]), dim=0),
+        )
+        torch.testing.assert_close(output[row, 0], expected)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        PagedAttentionMetadata(
+            block_tables=((0, 1), (0, 2)),
+            num_computed_tokens=(2, 2),
+            query_lengths=(1, 1),
+            num_readonly_prefix_blocks=(1, 0),
+        ),
+        PagedAttentionMetadata(
+            block_tables=((0, 1, 2), (3, 0, 4)),
+            num_computed_tokens=(4, 4),
+            query_lengths=(1, 1),
+            num_readonly_prefix_blocks=(1, 2),
+        ),
+    ],
+)
+def test_paged_attention_rejects_misaligned_or_one_sided_prefix_sharing(
+    metadata: PagedAttentionMetadata,
+) -> None:
+    with pytest.raises(KVCacheError, match="alias a physical block across requests"):
+        metadata.validate_block_tables(num_blocks=5, block_size=2)
+
+
+def test_paged_attention_rejects_readonly_blocks_beyond_the_computed_prefix() -> None:
+    metadata = PagedAttentionMetadata(
+        block_tables=((0,),),
+        num_computed_tokens=(1,),
+        query_lengths=(1,),
+        num_readonly_prefix_blocks=(1,),
+    )
+
+    with pytest.raises(KVCacheError, match="exceed the computed prefix"):
+        metadata.validate_block_tables(num_blocks=2, block_size=2)
+
+
 @pytest.mark.parametrize(
     ("block_tables", "num_computed_tokens"),
     [

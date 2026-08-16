@@ -43,6 +43,7 @@ class ExecutionRequest:
     max_output_tokens: int
     # 分页 KV cache 需要 block table；连续 KV cache 不需要，使用 None。
     block_ids: tuple[int, ...] | None
+    num_readonly_prefix_blocks: int = 0
 
     def __post_init__(self) -> None:
         input_token_ids = tuple(self.input_token_ids)
@@ -58,9 +59,15 @@ class ExecutionRequest:
             raise ValueError("num_lookahead_tokens must be a non-negative integer")
         if type(self.max_output_tokens) is not int or self.max_output_tokens < 0:
             raise ValueError("max_output_tokens must be a non-negative integer")
+        if type(self.num_readonly_prefix_blocks) is not int or self.num_readonly_prefix_blocks < 0:
+            raise ValueError("num_readonly_prefix_blocks must be a non-negative integer")
         object.__setattr__(self, "input_token_ids", input_token_ids)
+        if self.block_ids is None and self.num_readonly_prefix_blocks:
+            raise ValueError("readonly prefix blocks require a block table")
         if self.block_ids is not None:
             object.__setattr__(self, "block_ids", tuple(self.block_ids))
+            if self.num_readonly_prefix_blocks > len(self.block_ids):
+                raise ValueError("readonly prefix blocks must fit within the block table")
 
 
 @dataclass(frozen=True, slots=True)

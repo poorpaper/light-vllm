@@ -20,20 +20,28 @@ class PagedAttentionMetadata:
     block_tables: tuple[tuple[int, ...], ...]
     num_computed_tokens: tuple[int, ...]
     query_lengths: tuple[int, ...]
+    num_readonly_prefix_blocks: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         block_tables = tuple(tuple(table) for table in self.block_tables)
         computed = tuple(self.num_computed_tokens)
         query_lengths = tuple(self.query_lengths)
+        readonly = tuple(self.num_readonly_prefix_blocks)
         num_requests = len(block_tables)
         if num_requests == 0:
             raise ValueError("paged attention metadata must contain at least one request")
         if len(computed) != num_requests or len(query_lengths) != num_requests:
             raise ValueError("paged attention metadata fields must have the same batch size")
+        if not readonly:
+            readonly = (0,) * num_requests
+        if len(readonly) != num_requests:
+            raise ValueError("readonly prefix counts must have the same batch size")
         if any(type(value) is not int or value < 0 for value in computed):
             raise ValueError("computed-token counts must be non-negative integers")
         if any(type(value) is not int or value <= 0 for value in query_lengths):
             raise ValueError("query lengths must be positive integers")
+        if any(type(value) is not int or value < 0 for value in readonly):
+            raise ValueError("readonly prefix counts must be non-negative integers")
         if any(
             type(block_id) is not int or block_id < 0
             for table in block_tables
@@ -43,6 +51,7 @@ class PagedAttentionMetadata:
         object.__setattr__(self, "block_tables", block_tables)
         object.__setattr__(self, "num_computed_tokens", computed)
         object.__setattr__(self, "query_lengths", query_lengths)
+        object.__setattr__(self, "num_readonly_prefix_blocks", readonly)
 
     @property
     def batch_size(self) -> int:
@@ -93,11 +102,12 @@ class PagedAttentionMetadata:
     ) -> None:
         """校验本轮可能读取的完整 block table 都落在物理页池内。"""
 
-        owned_blocks: set[int] = set()
-        for table, computed, query_length in zip(
+        block_owners: dict[int, tuple[int, bool]] = {}
+        for table, computed, query_length, num_readonly in zip(
             self.block_tables,
             self.num_computed_tokens,
             self.query_lengths,
+            self.num_readonly_prefix_blocks,
             strict=True,
         ):
             required_blocks = (computed + query_length + block_size - 1) // block_size
@@ -107,12 +117,18 @@ class PagedAttentionMetadata:
                 raise KVCacheError("block table contains unused physical blocks")
             if any(block_id >= num_blocks for block_id in table):
                 raise KVCacheError("block table contains an out-of-range physical block")
+            if num_readonly > len(table) or num_readonly * block_size > computed:
+                raise KVCacheError("readonly prefix blocks exceed the computed prefix")
             if len(set(table)) != len(table):
                 raise KVCacheError("block table aliases a physical block within one request")
-            if owned_blocks.intersection(table):
-                # Prefix sharing 需要显式的只读 ownership；当前所有活动页必须独占。
-                raise KVCacheError("block tables alias a physical block across requests")
-            owned_blocks.update(table)
+            for logical_index, block_id in enumerate(table):
+                readonly = logical_index < num_readonly
+                previous = block_owners.get(block_id)
+                if previous is not None and (
+                    previous[0] != logical_index or not previous[1] or not readonly
+                ):
+                    raise KVCacheError("block tables alias a physical block across requests")
+                block_owners[block_id] = (logical_index, readonly)
 
 
 class PagedAttentionContext(AttentionContext, Protocol):

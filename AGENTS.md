@@ -26,6 +26,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
   `PagedKVCacheManager` 额外按容量分配 block table。
+- 可选 prefix cache 由 `PagedKVCacheManager` 管理：只复用已提交的完整 prompt 页，缓存页使用哈希链、
+  引用计数和 LRU；共享前缀只读，各请求尾页独占。
 - composition root 通过 `kv_reservation=blocks|unbounded` 同时选择匹配的逻辑 manager 和
   `ModelStepHandler`；该选择不得进入 Engine、Executor 或 Worker 热路径。
 - `LocalModelExecutor` 只把执行端口委托给一个 `LocalModelWorker`。Worker 固定当前模型版本和请求生命周期；
@@ -41,7 +43,7 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - FastAPI adapter 只依赖 `EngineClient`，不知道 scheduler、runner、torch 或 KV cache。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
-当前尚未实现生产级 CUDA/Triton Paged Attention kernel、prefix caching、preemption、投机解码、分布式执行、
+当前尚未实现生产级 CUDA/Triton Paged Attention kernel、preemption、投机解码、分布式执行、
 tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorch Paged Attention 是物理分页正确性
 基线，不代表生产吞吐；当前也不宣称支持大多数 Transformers 模型。
 
@@ -99,7 +101,7 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 16. 逻辑 KV reservation 每轮必须以 commit 或 remove 结束；只提交实际算完的输入和可见的已缓存输出前缀。
 17. 模型执行失败、输出校验失败或请求取消时，不得把本轮 token 写入 Engine 状态。
 18. 取消请求必须立即退出后续调度；已开始执行的同步步骤到达安全边界后，其结果必须丢弃。
-19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID 生命周期、未来 prefix cache 和 preemption；
+19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID、prefix cache 和未来 preemption；
     Worker/Step Handler 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
 20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。
 21. 投机解码未来由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor。
@@ -114,8 +116,7 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 28. Paged Attention 实现必须通过 `PagedAttentionBackend` 创建同一个 `AttentionContext`，并直接按 block table
     读取物理页；不得以拼接完整历史 tensor 冒充分页实现。
 29. block table 必须精确覆盖本轮 `computed + query + lookahead reservation` 所需物理页，不得携带未预留尾页
-    或在单请求内重复页；
-    prefix sharing 拥有显式只读 ownership 之前，不同活动请求也不得共享物理页。
+    或在单请求内重复页；跨请求只能在相同逻辑位置共享双方都声明为只读的完整前缀页，可写尾页必须独占。
 30. `LocalModelWorker` 初始化时固定一个 `ModelSession`。reload 后活动请求继续使用旧 session，Worker 拒绝新请求；活动
     请求清空后才可按新 generation 重建物理缓存。
 31. 固定页数或显存发现策略必须解析成一个共享容量事实；逻辑 block manager 和物理页池不得各自配置容量。
@@ -168,7 +169,6 @@ git diff --check
 
 ## 下一步
 
-下一阶段在现有 `PagedAttentionBackend` 边界增加生产级 CUDA/Triton kernel；之后再加 prefix caching 和
-preemption。投机解码应从 `TokenProposer`、target verify 和 `AcceptanceSampler` 开始，返回事实型多 token
-结果，不改变
-EngineClient、generation 事件或 HTTP adapter。
+下一阶段从 `TokenProposer`、target verify 和 `AcceptanceSampler` 开始实现投机解码，返回事实型多 token
+结果，不改变 EngineClient、generation 事件或 HTTP adapter。生产级 CUDA/Triton kernel 与 Scheduler-owned
+preemption 后续继续沿现有 backend 和 KV manager 边界接入。

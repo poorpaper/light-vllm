@@ -44,6 +44,8 @@ class ScheduledRequest:
     max_output_tokens: int
     # 分页后端返回 block table；连续缓存返回 None。
     block_ids: tuple[int, ...] | None
+    # 完整写入且不会再修改的前缀页数；只有这些页可以跨请求共享。
+    num_readonly_prefix_blocks: int = 0
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -56,8 +58,14 @@ class ScheduledRequest:
             raise ValueError("num_lookahead_tokens must be a non-negative integer")
         if type(self.max_output_tokens) is not int or self.max_output_tokens < 0:
             raise ValueError("max_output_tokens must be a non-negative integer")
+        if type(self.num_readonly_prefix_blocks) is not int or self.num_readonly_prefix_blocks < 0:
+            raise ValueError("num_readonly_prefix_blocks must be a non-negative integer")
+        if self.block_ids is None and self.num_readonly_prefix_blocks:
+            raise ValueError("readonly prefix blocks require a block table")
         if self.block_ids is not None:
             object.__setattr__(self, "block_ids", tuple(self.block_ids))
+            if self.num_readonly_prefix_blocks > len(self.block_ids):
+                raise ValueError("readonly prefix blocks must fit within the block table")
 
 
 @dataclass(frozen=True, slots=True)

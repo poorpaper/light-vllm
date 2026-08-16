@@ -192,8 +192,9 @@ rollback API。
 请求会组成一个 padded forward batch，`sequence_lengths` 屏蔽 padding，`positions` 始终保存请求内绝对位置。
 连续与分页 Step Handler 都从模型唯一的 `ModelKVCacheSpec` 获取逐层 KV 形状，装配层不再重复配置层数、KV head 或
 head size。模型只调用 `AttentionContext`，不依赖具体 page layout。block table 必须精确覆盖当前有效前缀、
-query 与显式 lookahead reservation，不携带未预留尾页；当前每个活动物理页归一个请求独占。未来 prefix sharing 必须显式
-区分只读共享前缀与可写尾页，不能仅允许 block ID 别名。
+query 与显式 lookahead reservation，不携带未预留尾页。可选 prefix cache 只索引已经提交的完整 prompt 页；
+哈希链保留父摘要和本页精确 token，零引用页进入 LRU。跨请求只允许在相同逻辑位置共享双方都声明为只读的前缀页，
+query 与未填满尾页始终独占。命中时至少留一个 token 重新计算 logits；prompt 恰好整页时会重算最后一整页。
 
 连续 Step Handler 为每个请求创建 `TorchDenseAttention`。它读取请求级连续历史，在模型逐层调用时完成 dense
 attention 并暂存本轮 K/V；只有模型 forward 和输出校验全部成功，Handler 才把所有层一次性追加到
@@ -279,9 +280,9 @@ flowchart LR
     Logical --> Sampling["独立 Greedy Sampler<br/>完成"]
     Sampling --> Paged["物理 Paged Attention<br/>PyTorch correctness 完成"]
     Paged --> Capacity["capacity discovery + admission<br/>完成"]
-    Capacity --> Kernel["CUDA/Triton kernel<br/>下一步"]
-    Kernel --> Prefix["Prefix cache / preemption"]
-    Prefix --> Spec["Speculative decoding"]
+    Capacity --> Prefix["Prefix cache<br/>完成"]
+    Prefix --> Spec["Speculative decoding<br/>下一步"]
+    Spec --> Kernel["CUDA/Triton kernel<br/>后续"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。
