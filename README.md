@@ -144,7 +144,7 @@ chunk；追上全部已知 token 后才采样输出。
 attention，适合 CPU correctness；可选 Triton backend 直接按 block table 读取分页 K/V，在一个 kernel 内完成
 QK、在线 softmax 和 PV。
 
-CUDA Linux/WSL 环境可安装可选依赖并显式启用 Triton：
+CUDA Linux/WSL 环境可安装可选依赖并显式启用 Triton；该 extra 使用 Torch 2.6 或更高版本：
 
 ```bash
 python -m pip install -e ".[serve,triton]"
