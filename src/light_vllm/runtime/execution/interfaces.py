@@ -18,6 +18,42 @@ class ExecutionNotReadyError(ExecutionError):
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptanceResult:
+    """候选验收后可见的输出，以及其中已经写入 KV 的前缀长度。"""
+
+    output_token_ids: tuple[int, ...]
+    num_cached_output_tokens: int
+
+    def __post_init__(self) -> None:
+        output_token_ids = tuple(self.output_token_ids)
+        if not output_token_ids:
+            raise ValueError("acceptance result must contain at least one output token")
+        if any(type(token_id) is not int or token_id < 0 for token_id in output_token_ids):
+            raise ValueError("output_token_ids must contain non-negative integers")
+        if type(self.num_cached_output_tokens) is not int or not (
+            0 <= self.num_cached_output_tokens < len(output_token_ids)
+        ):
+            raise ValueError("cached output count must leave one uncached output token")
+        object.__setattr__(self, "output_token_ids", output_token_ids)
+
+
+class TokenProposer(Protocol):
+    """根据完整已知 token 历史提出少量候选 token。"""
+
+    def propose(self, token_ids: tuple[int, ...], *, max_tokens: int) -> tuple[int, ...]: ...
+
+
+class AcceptanceSampler(Protocol):
+    """对照目标模型结果，决定哪些候选可以确认。"""
+
+    def accept(
+        self,
+        draft_token_ids: tuple[int, ...],
+        target_token_ids: tuple[int, ...],
+    ) -> AcceptanceResult: ...
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionCapabilities:
     """执行器初始化后能够支持的模型长度和 KV cache 容量。"""
 
