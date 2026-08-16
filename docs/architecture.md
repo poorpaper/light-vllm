@@ -61,13 +61,14 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `CapacityAdmission` | 根据 capabilities 拒绝空闲引擎也不可能完成的请求 | 排队、公平性、preemption |
 | `TokenBudgetScheduler` | FCFS、并发槽、token budget、逻辑 KV 分配 | 模型 forward、采样、事件 |
 | `UnboundedKVCacheManager` | 无容量限制的 reservation、提交与回滚基线 | block、K/V tensor |
-| `PagedKVCacheManager` | 逻辑 block 预留、提交、回滚、释放 | K/V tensor、attention kernel |
+| `PagedKVCacheManager` | 逻辑 block、prefix 索引、引用计数、LRU 与回滚 | K/V tensor、attention kernel |
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
 | `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
 | `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
 | `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
 | `PagedStepHandler` | padded batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
 | `StandardDecodeHandler` | 普通 prefill/单 token decode 的结果转换与采样 | KV 布局、调度 |
+| `NGramSpeculativeDecodeHandler` | 历史候选、目标验证、验收与拒绝尾部截断 | KV 布局、调度 |
 | `PagedKVCachePlanner` | 模型加载后把固定页数或空闲显存预算解析为容量 | 请求调度、page ownership |
 | `TorchDenseAttention` | 读取连续历史、dense causal attention、暂存本轮 K/V | 模型结构、物理分页 |
 | `PagedAttentionBackend` | 为页池和批次事实创建 `AttentionContext` | 模型分发、调度 |
@@ -113,10 +114,12 @@ frontier。
 ExecutionRequest
 ├── request_id
 ├── input_token_ids
+├── context_token_ids
 ├── num_computed_tokens
 ├── num_lookahead_tokens
 ├── max_output_tokens
 ├── block_ids: tuple[int, ...] | None
+└── num_readonly_prefix_blocks
 ```
 
 Executor 返回：
@@ -246,8 +249,9 @@ class Sampler(Protocol):
 argmax；以后增加 temperature、top-k 或 top-p 时，不修改 Engine、Scheduler、ModelRunner 或 Executor
 接口。
 
-投机解码的 acceptance sampling 与普通 Sampler 是不同职责。未来在执行实现中组合 proposer、target verify 与
-acceptance sampler，仍返回同一个事实型 `RequestOutput`，不增加 prefill/decode 模式枚举。
+投机解码的 acceptance sampling 与普通 Sampler 是不同职责。当前 n-gram 实现只读单请求完整 token 历史，
+优先续写最长且最近的重复后缀；目标模型一次验证实际候选，验收器返回同一个事实型 `RequestOutput`。候选不足
+lookahead 时，剩余预留仍显式留在分页 metadata 中，因此 block table 继续严格覆盖最坏情况，不增加模式枚举。
 
 ## Reference 与 serving 边界
 
@@ -285,10 +289,9 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 
 ## 后续演进顺序
 
-1. `TokenProposer + target verify + AcceptanceSampler` 投机解码。
-2. 在现有 `PagedAttentionBackend` 边界实现 CUDA/Triton kernel。
-3. Scheduler-owned preemption。
-4. 普通随机 Sampler。
-5. 进程/分布式 Worker 与生产级 serving。
+1. 在现有 `PagedAttentionBackend` 边界实现 CUDA/Triton kernel。
+2. Scheduler-owned preemption。
+3. 普通随机 Sampler。
+4. 进程/分布式 Worker 与生产级 serving。
 
 任何新能力都应先证明现有事实型契约表达不了，再新增字段或接口；不为未来功能预建空包。

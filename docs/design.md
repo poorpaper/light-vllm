@@ -47,7 +47,7 @@ src/light_vllm/
 - [当前架构总览](diagrams/light-vllm-current-overview.html)：区分模型加载路径与固定 ModelSession 的执行热路径，不承载 KV 和 attention 细节；
 - [KV cache 容量与所有权](diagrams/light-vllm-kv-ownership.html)：从模型 KV 形状、显存预算一直画到逻辑 page ID、物理张量和提交/回收；
 - [Paged Attention 地址映射](diagrams/light-vllm-paged-attention-token-path.html)：用具体数字展示绝对位置、block table、物理 slot、K/V 写入和逐页 attention；
-- [普通与投机解码的共同执行契约](diagrams/light-vllm-iteration-transaction.html)：区分当前普通 Decode Handler 和未来投机 Decode Handler，并展示 cached prefix 如何提交；
+- [普通与投机解码的共同执行契约](diagrams/light-vllm-iteration-transaction.html)：区分两种 Decode Handler，并展示 cached prefix 如何提交；
 - [Worker 与模型版本生命周期](diagrams/light-vllm-worker-lifecycle.html)：模型重新加载时，旧请求、旧 Step Handler 和新请求之间的边界。
 
 原有 [`light-vllm-overall-architecture.drawio`](assets/light-vllm-overall-architecture.drawio) 及其
@@ -117,8 +117,8 @@ Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者
 | `EngineCapabilities` | 初始化后可发现的模型、KV、并发和单轮容量事实 |
 | `EngineClient` | serving 使用的异步生成端口和 capabilities 查询 |
 
-`SchedulerOutput` 和 `RequestOutput` 是未来扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
-并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和未来投机验证因此能共用同一循环。
+`SchedulerOutput` 和 `RequestOutput` 是扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
+并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和投机验证因此共用同一循环。
 
 原生 Qwen2 模型也使用这组契约：Qwen 层只生成带 RoPE 的 Q/K/V 并调用 `AttentionContext`，不再保留模型内
 dense fallback。上下文完成 KV 读写、softmax 和 value 聚合。HF/ModelScope 兼容快照统一由
@@ -231,8 +231,10 @@ worker = LocalModelWorker(runner, step_factory, StandardDecodeHandler(sampler))
 model_executor = LocalModelExecutor(worker)
 ```
 
-新增 top-k/top-p 时实现新的 Sampler 并装配。投机解码的 acceptance sampler 不等同于普通 Sampler，
-未来会作为投机 `DecodeHandler` 的内部组件与 proposer、target verify 组合。
+新增 top-k/top-p 时实现新的 Sampler 并装配。投机解码的 acceptance sampler 不等同于普通 Sampler：
+`NGramSpeculativeDecodeHandler` 先从完整请求历史提出候选，把“本轮输入 + 候选”交给目标模型，再从原输入最后一行
+开始读取验证结果。第一次不同时返回已接受前缀和目标 token；全部相同时额外返回一个 bonus token。被拒绝的物理
+KV 尾部立即截断，Scheduler 只提交真实接受的候选前缀。
 
 ## 9. Reference 与 Engine Core
 
@@ -259,6 +261,7 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 | 调度契约 | `src/light_vllm/runtime/scheduler/interfaces.py` |
 | token-budget 调度 | `src/light_vllm/runtime/scheduler/token_budget.py` |
 | 执行契约 | `src/light_vllm/runtime/execution/interfaces.py` |
+| n-gram 投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
 | 本地 Worker | `src/light_vllm/runtime/execution/worker.py` |
 | Dense Attention | `src/light_vllm/runtime/execution/dense_attention.py` |
@@ -281,8 +284,8 @@ flowchart LR
     Sampling --> Paged["物理 Paged Attention<br/>PyTorch correctness 完成"]
     Paged --> Capacity["capacity discovery + admission<br/>完成"]
     Capacity --> Prefix["Prefix cache<br/>完成"]
-    Prefix --> Spec["Speculative decoding<br/>下一步"]
-    Spec --> Kernel["CUDA/Triton kernel<br/>后续"]
+    Prefix --> Spec["Speculative decoding<br/>完成"]
+    Spec --> Kernel["CUDA/Triton kernel<br/>下一步"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。
@@ -299,8 +302,8 @@ git diff --check
 ```
 
 测试必须覆盖固定 ModelSession、token budget、chunked prefill、多 token 与已缓存输出前缀、容量规划与 admission、
-逻辑 block 回滚、非连续物理页、block table 别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、执行失败和取消
-资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
+prefix 命中/LRU/epoch、投机全接受/部分接受/首个拒绝/短候选、逻辑 block 回滚、非连续物理页、block table
+别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、执行失败和取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
 
 边界命名与职责参考 [vLLM Architecture Overview](https://docs.vllm.ai/en/latest/design/arch_overview/)；分页布局与
 按需读取原则参考 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)。本项目保留这些成熟边界，但以

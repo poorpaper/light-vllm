@@ -32,7 +32,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   `ModelStepHandler`；该选择不得进入 Engine、Executor 或 Worker 热路径。
 - `LocalModelExecutor` 只把执行端口委托给一个 `LocalModelWorker`。Worker 固定当前模型版本和请求生命周期；
   `ContiguousStepHandler` / `PagedStepHandler` 分别负责连续与分页 KV 的输入准备、物理缓存和模型 forward。
-- `StandardDecodeHandler` 负责无输出的输入步骤和普通单 token 解码；未来投机解码替换 DecodeHandler，不新增模式专用 Worker。
+- `StandardDecodeHandler` 负责普通单 token 解码；`NGramSpeculativeDecodeHandler` 组合历史候选、目标验证和贪心验收，
+  两者替换同一 Handler，不新增模式专用 Worker。
 - 固定页数或 CUDA 空闲显存策略在模型加载后解析成同一个分页容量对象，同时供逻辑 manager 与物理页池使用。
 - 可缓存模型只通过 `AttentionContext` 执行 attention，不内置 dense/paged fallback。reference 与连续缓存使用
   `TorchDenseAttention`；分页缓存使用逐页读取 K/V、在线 softmax 的 `TorchPagedAttention`，
@@ -43,7 +44,7 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - FastAPI adapter 只依赖 `EngineClient`，不知道 scheduler、runner、torch 或 KV cache。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
-当前尚未实现生产级 CUDA/Triton Paged Attention kernel、preemption、投机解码、分布式执行、
+当前尚未实现生产级 CUDA/Triton Paged Attention kernel、preemption、分布式执行、
 tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorch Paged Attention 是物理分页正确性
 基线，不代表生产吞吐；当前也不宣称支持大多数 Transformers 模型。
 
@@ -104,7 +105,7 @@ tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。PyTorc
 19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID、prefix cache 和未来 preemption；
     Worker/Step Handler 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
 20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。
-21. 投机解码未来由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor。
+21. 投机解码由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor 或 Worker。
 22. 不为尚未实现的 attention、memory 或 prefix routing 创建空包。
 23. 内部代码从所属功能域的 `interfaces.py` 导入稳定契约；需要实现时直接导入实现模块。
 24. 不维护未发布架构的历史兼容别名、空 facade 或旧路径。
@@ -169,6 +170,5 @@ git diff --check
 
 ## 下一步
 
-下一阶段从 `TokenProposer`、target verify 和 `AcceptanceSampler` 开始实现投机解码，返回事实型多 token
-结果，不改变 EngineClient、generation 事件或 HTTP adapter。生产级 CUDA/Triton kernel 与 Scheduler-owned
-preemption 后续继续沿现有 backend 和 KV manager 边界接入。
+下一阶段在现有 `PagedAttentionBackend` 边界实现生产级 CUDA/Triton kernel；之后继续实现 Scheduler-owned
+preemption。两项能力都不得改变 EngineClient、generation 事件或 HTTP adapter。

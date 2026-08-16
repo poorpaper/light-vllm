@@ -74,6 +74,7 @@ def test_engine_core_does_not_import_model_or_transport_details() -> None:
         "torch",
         "light_vllm.modeling.models",
         "light_vllm.modeling.runner",
+        "light_vllm.runtime.execution.speculative",
         "light_vllm.serving",
     )
 
@@ -82,6 +83,17 @@ def test_engine_core_does_not_import_model_or_transport_details() -> None:
         for module in modules
         for prefix in forbidden_prefixes
     )
+
+
+def test_speculative_strategy_stays_out_of_scheduler_and_worker() -> None:
+    """候选算法只由组合根装配，不进入调度或设备执行骨架。"""
+
+    targets = (
+        SOURCE_ROOT / "runtime" / "scheduler" / "token_budget.py",
+        SOURCE_ROOT / "runtime" / "execution" / "worker.py",
+    )
+    for path in targets:
+        assert "light_vllm.runtime.execution.speculative" not in _imported_modules(path), path
 
 
 def test_cacheable_models_delegate_softmax_to_attention_context() -> None:
