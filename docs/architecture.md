@@ -292,7 +292,7 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 
 ## 后续演进顺序
 
-1. 在 CUDA 环境完成 Triton 数值验收，并增加长上下文分段并行与归并。
+1. 增加 Triton 长上下文分段并行与归并，并补充跨显卡性能验收。
 2. Scheduler-owned preemption。
 3. 普通随机 Sampler。
 4. 进程/分布式 Worker 与生产级 serving。

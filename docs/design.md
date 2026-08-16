@@ -291,11 +291,12 @@ flowchart LR
     Paged --> Capacity["capacity discovery + admission<br/>完成"]
     Capacity --> Prefix["Prefix cache<br/>完成"]
     Prefix --> Spec["Speculative decoding<br/>完成"]
-    Spec --> Kernel["Triton fused attention<br/>首版完成，GPU 验收待办"]
+    Spec --> Kernel["Triton fused attention<br/>首版与 GPU 数值对照完成"]
 ```
 
-当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton 节点只表示实现和装配完成，
-当前开发环境没有 CUDA/Triton，因此 GPU 编译、数值与性能验收不包含在这一状态中。
+当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
+Torch 2.8.0、Triton 3.4.0 环境完成 JIT，以及 FP16/BF16、prefill/decode、GQA、共享 prefix、lookahead 的
+PyTorch 数值对照；长上下文性能和跨显卡验收仍是后续工作。
 
 ## 12. 验证要求
 
@@ -311,6 +312,8 @@ git diff --check
 测试必须覆盖固定 ModelSession、token budget、chunked prefill、多 token 与已缓存输出前缀、容量规划与 admission、
 prefix 命中/LRU/epoch、投机全接受/部分接受/首个拒绝/短候选、逻辑 block 回滚、非连续物理页、block table
 别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、执行失败和取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
+Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、padded GQA、decode 历史、共享
+prefix 和未使用 lookahead。
 
 边界命名与职责参考 [vLLM Architecture Overview](https://docs.vllm.ai/en/latest/design/arch_overview/)；分页布局与
 按需读取原则参考 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)。完整页哈希与 LRU 参考

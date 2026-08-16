@@ -45,8 +45,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
 当前尚未实现 preemption、分布式执行、tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。
-PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend 尚未完成 GPU 数值、长上下文性能与跨显卡
-验收，均不代表生产吞吐。当前也不宣称支持大多数 Transformers 模型。
+PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend 已在 RTX 5090 上完成 FP16/BF16 数值对照，
+但尚未完成长上下文性能与跨显卡验收，仍不代表生产吞吐。当前也不宣称支持大多数 Transformers 模型。
 
 ## 代码地图
 
@@ -171,5 +171,5 @@ git diff --check
 
 ## 下一步
 
-下一阶段先在 CUDA 环境完成 Triton backend 的数值验收，并针对长上下文改成分段计算与归并；之后继续实现
+下一阶段针对长上下文把 Triton backend 改成分段计算与归并，并补充跨显卡性能验收；之后继续实现
 Scheduler-owned preemption。两项能力都不得改变 EngineClient、generation 事件或 HTTP adapter。

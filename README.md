@@ -158,8 +158,9 @@ light-vllm-serve \
 ```
 
 首版 Triton kernel 支持 FP16/BF16、MHA/GQA、padded batch 和不超过 256 的 head size。K/V 写入与 attention
-读取分成同一 CUDA stream 上的两个顺序步骤，避免 prefill 读取尚未写完的数据。它当前以清晰实现为主，GPU
-数值、长上下文性能和不同显卡的调优仍待验收；默认 backend 因此保持为 `torch`。
+读取分成同一 CUDA stream 上的两个顺序步骤，避免 prefill 读取尚未写完的数据。RTX 5090 上的 FP16/BF16
+prefill、decode、共享 prefix 和投机多 query 数值对照已经通过；长上下文性能和跨显卡调优仍待验收，默认
+backend 因此保持为 `torch`。
 
 增加 `--enable-prefix-caching` 后，Engine 会按 token 内容复用已经算完的完整 prompt 页。共享页只读，
 每个请求继续使用自己的可写尾页；模型重新加载后 cache epoch 改变，旧页索引会自动清空。
@@ -212,6 +213,6 @@ catalog.loaders.register("my-format", my_loader)
 
 当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback、独立 Greedy
 Sampler、原生 Qwen2 子集、整页 prefix cache、简单 n-gram 投机解码、PyTorch Paged Attention correctness backend
-和可选的首版 Triton fused attention。Tokenizer、文本 prompt、随机 sampling、经过 GPU 验收与长上下文调优的
+和可选的首版 Triton fused attention。Tokenizer、文本 prompt、随机 sampling、经过长上下文调优和跨显卡验收的
 生产级 attention kernel、preemption、分布式执行和 OpenAI-compatible API 仍是后续能力。多进程实现将新增
 `EngineClient` / Worker 拓扑，而不改 HTTP。
