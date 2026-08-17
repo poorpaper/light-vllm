@@ -120,10 +120,11 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 `SchedulerOutput` 和 `RequestOutput` 是扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
 并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和投机验证因此共用同一循环。
 
-原生 Qwen2 模型也使用这组契约：Qwen 层只生成带 RoPE 的 Q/K/V 并调用 `AttentionContext`，不再保留模型内
-dense fallback。上下文完成 KV 读写、softmax 和 value 聚合。HF/ModelScope 兼容快照统一由
-`SafetensorsModelLoader` 读取；来源差异不会扩散到模型、Worker 或 Engine。当前支持 full attention 和
-default RoPE，未实现配置在加载时直接报错。
+原生 Qwen family 模型也使用这组契约：`qwen2` 与 `qwen2.5` 注册名指向同一个 factory，官方 Qwen2.5
+checkpoint 仍声明 `model_type: qwen2`，3B 等模型尺寸只来自 `config.json`，不会进入 runner 的分发逻辑。
+Qwen 层只生成带 RoPE 的 Q/K/V 并调用 `AttentionContext`，不再保留模型内 dense fallback。上下文完成 KV
+读写、softmax 和 value 聚合。HF/ModelScope 兼容快照统一由 `SafetensorsModelLoader` 读取；来源差异不会
+扩散到模型、Worker 或 Engine。当前支持 full attention 和 default RoPE，未实现配置在加载时直接报错。
 
 ## 5. 一次迭代
 

@@ -132,9 +132,16 @@ class Qwen2Config:
 class Qwen2RMSNorm(nn.Module):
     """按每个 token 的均方根缩放隐藏状态。"""
 
-    def __init__(self, hidden_size: int, eps: float) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float,
+        *,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
         self._eps = eps
 
     def forward(self, hidden_states: Tensor) -> Tensor:
@@ -148,11 +155,33 @@ class Qwen2RMSNorm(nn.Module):
 class Qwen2MLP(nn.Module):
     """Qwen2 的门控前馈网络。"""
 
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(
+        self,
+        config: Qwen2Config,
+        *,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.gate_proj = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False,
+            **factory_kwargs,
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False,
+            **factory_kwargs,
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=False,
+            **factory_kwargs,
+        )
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
@@ -184,8 +213,16 @@ def _apply_rotary(
 class Qwen2Attention(nn.Module):
     """生成 Q/K/V，并把实际 attention 交给当前执行后端。"""
 
-    def __init__(self, config: Qwen2Config, layer_index: int) -> None:
+    def __init__(
+        self,
+        config: Qwen2Config,
+        layer_index: int,
+        *,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
         self._layer_id = f"model.layers.{layer_index}.self_attn"
         self._num_query_heads = config.num_attention_heads
         self._num_kv_heads = config.num_key_value_heads
@@ -195,21 +232,25 @@ class Qwen2Attention(nn.Module):
             config.hidden_size,
             config.num_attention_heads * config.head_size,
             bias=True,
+            **factory_kwargs,
         )
         self.k_proj = nn.Linear(
             config.hidden_size,
             config.num_key_value_heads * config.head_size,
             bias=True,
+            **factory_kwargs,
         )
         self.v_proj = nn.Linear(
             config.hidden_size,
             config.num_key_value_heads * config.head_size,
             bias=True,
+            **factory_kwargs,
         )
         self.o_proj = nn.Linear(
             config.num_attention_heads * config.head_size,
             config.hidden_size,
             bias=False,
+            **factory_kwargs,
         )
 
     def forward(
@@ -253,12 +294,28 @@ class Qwen2Attention(nn.Module):
 class Qwen2DecoderLayer(nn.Module):
     """一层 self-attention、前馈网络和两次残差连接。"""
 
-    def __init__(self, config: Qwen2Config, layer_index: int) -> None:
+    def __init__(
+        self,
+        config: Qwen2Config,
+        layer_index: int,
+        *,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
-        self.self_attn = Qwen2Attention(config, layer_index)
-        self.mlp = Qwen2MLP(config)
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.self_attn = Qwen2Attention(config, layer_index, **factory_kwargs)
+        self.mlp = Qwen2MLP(config, **factory_kwargs)
+        self.input_layernorm = Qwen2RMSNorm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            **factory_kwargs,
+        )
+        self.post_attention_layernorm = Qwen2RMSNorm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            **factory_kwargs,
+        )
 
     def forward(
         self,
@@ -283,28 +340,48 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     """词向量、连续多层 Decoder 和最终归一化。"""
 
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(
+        self,
+        config: Qwen2Config,
+        *,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
             config.hidden_size,
             config.pad_token_id,
+            **factory_kwargs,
         )
         self.layers = nn.ModuleList(
-            Qwen2DecoderLayer(config, layer_index)
+            Qwen2DecoderLayer(config, layer_index, **factory_kwargs)
             for layer_index in range(config.num_hidden_layers)
         )
-        self.norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps, **factory_kwargs)
 
 
 class Qwen2ForCausalLM(nn.Module):
     """只实现推理所需的 Qwen2 路径，权重名称与 HF checkpoint 对齐。"""
 
-    def __init__(self, config: Qwen2Config) -> None:
+    def __init__(
+        self,
+        config: Qwen2Config,
+        *,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
         self.config = config
-        self.model = Qwen2Model(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model = Qwen2Model(config, **factory_kwargs)
+        self.lm_head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            **factory_kwargs,
+        )
         self.apply(self._initialize_weights)
         if config.tie_word_embeddings:
             # 输入词向量和输出分类层可以共用同一份参数。
@@ -312,7 +389,11 @@ class Qwen2ForCausalLM(nn.Module):
 
     @classmethod
     def from_spec(cls, spec: ModelSpec) -> Qwen2ForCausalLM:
-        return cls(Qwen2Config.from_mapping(spec.model_args))
+        return cls(
+            Qwen2Config.from_mapping(spec.model_args),
+            device=spec.device,
+            dtype=spec.dtype,
+        )
 
     @property
     def max_model_tokens(self) -> int:

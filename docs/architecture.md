@@ -219,9 +219,11 @@ CPU reference/连续 KV 路径通过执行层接入可读的 `TorchDenseAttentio
 
 ## Qwen 与 checkpoint 来源
 
-`qwen2` 注册项当前覆盖 Qwen2/Qwen2.5 的 full-attention、default-RoPE 配置，包括 GQA、tied embedding 和
-分片 safetensors。sliding-window、rope scaling、量化权重和 tokenizer 尚未实现，遇到这些配置会明确拒绝，
-不会回退到近似计算。
+`qwen2` 与 `qwen2.5` 注册项指向同一个 Qwen family factory，因为官方 Qwen2.5 checkpoint 仍使用
+`model_type: qwen2` 和 `Qwen2ForCausalLM` 权重结构；模型规模完全由快照配置决定，核心路由不按 3B 等尺寸
+分支。当前用官方 Qwen2.5-3B-Instruct 配置覆盖 36 层、GQA 和 BF16 目标构造，并继续支持
+full-attention、default-RoPE、tied embedding 和分片 safetensors。sliding-window、rope scaling、量化权重
+和 tokenizer 尚未实现，遇到这些配置会明确拒绝，不会回退到近似计算。
 
 Hugging Face 和 ModelScope 只负责把模型快照下载到本地。两边常见的 `config.json + model*.safetensors +
 model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`；loader 解析配置、逐分片复制权重并检查
