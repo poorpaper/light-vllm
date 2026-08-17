@@ -7,7 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from light_vllm import ForwardBatch, ModelSpec, create_runner
+from light_vllm import ForwardBatch, ModelSpec, create_catalog, create_runner
 from light_vllm.modeling.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from light_vllm.runtime.execution.dense_attention import (
     DenseAttentionMetadata,
@@ -32,6 +32,38 @@ def qwen2_args(**changes: object) -> dict[str, object]:
         "max_position_embeddings": 32,
         "rope_theta": 1_000_000.0,
         "tie_word_embeddings": True,
+    }
+    values.update(changes)
+    return values
+
+
+def qwen25_3b_args(**changes: object) -> dict[str, object]:
+    """Qwen/Qwen2.5-3B-Instruct 发布的 config.json 字段。"""
+
+    values: dict[str, object] = {
+        "architectures": ["Qwen2ForCausalLM"],
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "eos_token_id": 151645,
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "initializer_range": 0.02,
+        "intermediate_size": 11008,
+        "max_position_embeddings": 32768,
+        "max_window_layers": 70,
+        "model_type": "qwen2",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 36,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
+        "sliding_window": 32768,
+        "tie_word_embeddings": True,
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.43.1",
+        "use_cache": True,
+        "use_sliding_window": False,
+        "vocab_size": 151936,
     }
     values.update(changes)
     return values
@@ -78,6 +110,29 @@ def test_qwen2_exposes_model_limits_and_kv_shape() -> None:
     )
     assert all(layer.num_query_heads == 4 for layer in session.kv_cache_spec.layers)
     assert all(layer.num_kv_heads == 2 for layer in session.kv_cache_spec.layers)
+
+
+def test_qwen25_3b_official_config_builds_on_requested_device_and_dtype() -> None:
+    factory = create_catalog().models.get("qwen2.5")
+    model = factory(
+        ModelSpec(
+            architecture="qwen2.5",
+            model_args=qwen25_3b_args(),
+            device="meta",
+            dtype=torch.bfloat16,
+        )
+    )
+
+    assert isinstance(model, Qwen2ForCausalLM)
+    assert model.config.num_hidden_layers == 36
+    assert model.config.num_attention_heads == 16
+    assert model.config.num_key_value_heads == 2
+    assert model.config.head_size == 128
+    assert len(model.model.layers) == 36
+    assert model.model.layers[0].self_attn.q_proj.weight.shape == (2048, 2048)
+    assert model.model.layers[0].self_attn.k_proj.weight.shape == (256, 2048)
+    assert model.model.embed_tokens.weight.device.type == "meta"
+    assert model.model.embed_tokens.weight.dtype == torch.bfloat16
 
 
 def test_qwen2_contiguous_kv_matches_full_sequence() -> None:
@@ -166,9 +221,17 @@ def _write_snapshot(
     )
 
 
-@pytest.mark.parametrize(("sharded", "tied"), ((False, True), (True, False)))
+@pytest.mark.parametrize(
+    ("architecture", "sharded", "tied"),
+    (
+        ("qwen2", False, True),
+        ("qwen2", True, False),
+        ("qwen2.5", True, True),
+    ),
+)
 def test_qwen2_loads_hf_compatible_safetensors_snapshot(
     tmp_path: Path,
+    architecture: str,
     sharded: bool,
     tied: bool,
 ) -> None:
@@ -182,7 +245,7 @@ def test_qwen2_loads_hf_compatible_safetensors_snapshot(
     runner = create_runner()
     runner.load(
         ModelSpec(
-            architecture="qwen2",
+            architecture=architecture,
             loader="safetensors",
             weights=tmp_path,
         )

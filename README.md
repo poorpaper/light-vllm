@@ -102,14 +102,18 @@ from light_vllm import ModelSpec, create_runner
 runner = create_runner()
 runner.load(
     ModelSpec(
-        architecture="qwen2",
+        architecture="qwen2.5",
         loader="safetensors",
-        weights=Path("D:/models/Qwen2.5-0.5B-Instruct"),
+        weights=Path("D:/models/Qwen2.5-3B-Instruct"),
         device="cuda",
         dtype=torch.bfloat16,
     )
 )
 ```
+
+`qwen2.5` 是显式注册名；它与 `qwen2` 复用同一个 factory，因为官方 Qwen2.5 checkpoint 仍声明
+`model_type: qwen2`，模型尺寸由快照的 `config.json` 决定。当前已用官方 Qwen2.5-3B-Instruct 配置验证
+36 层、16 个 query head、2 个 KV head 和 BF16 目标构造。
 
 当前支持 Qwen2/Qwen2.5 的 full attention、default RoPE、GQA、tied embedding 和 safetensors 分片。
 sliding-window、RoPE scaling、量化权重和 tokenizer 尚未实现；因此这是明确的 Qwen 子集支持，不是“大多数 HF
