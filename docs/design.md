@@ -268,7 +268,8 @@ token 时记录 TTFT/TPOT；请求完成、失败或取消时记录结果。Sche
 token 预算，分页 KV 提供不能立即回收的 slot 与总容量。Qwen2、Qwen2.5、投机解码和普通解码复用同一路径。
 
 `InMemoryPerformanceObserver` 是专门的性能观察角色，只做短临界区计数。它不能调整 Scheduler 参数，也不执行
-网络或文件 I/O。`serving/prometheus.py` 把快照转换成标准文本；Grafana 直接消费 Prometheus，HPA 通过
+网络或文件 I/O；Engine 会隔离 observer 异常，指标故障不能泄漏请求或改变生成结果。
+`serving/prometheus.py` 把快照转换成标准文本；Grafana 直接消费 Prometheus，HPA 通过
 Prometheus Adapter 消费 `light_vllm_queue_tokens`。未来性能 Guardian 必须通过单独的有界控制端口工作，不能
 把策略塞进 observer 或 token 热路径。
 
@@ -318,7 +319,7 @@ flowchart LR
     Capacity --> Prefix["Prefix cache<br/>完成"]
     Prefix --> Spec["Speculative decoding<br/>完成"]
     Spec --> Kernel["Triton fused attention<br/>首版与 GPU 数值对照完成"]
-    Kernel --> Metrics["性能指标 + Prometheus/Grafana<br/>完成"]
+    Kernel --> Metrics["性能指标 + Prometheus/Grafana/HPA<br/>完成"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、

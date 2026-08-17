@@ -157,6 +157,36 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
     asyncio.run(run())
 
 
+def test_observer_failure_does_not_change_generation_or_leak_resources() -> None:
+    class FailingObserver(InMemoryPerformanceObserver):
+        def request_started(self, request_id: str, *, num_prompt_tokens: int) -> None:
+            raise RuntimeError("observer unavailable")
+
+        def tokens_generated(self, request_id: str, *, count: int) -> None:
+            raise RuntimeError("observer unavailable")
+
+        def request_finished(self, request_id: str, *, outcome) -> None:
+            raise RuntimeError("observer unavailable")
+
+        def scheduler_updated(self, stats) -> None:
+            raise RuntimeError("observer unavailable")
+
+    async def run() -> None:
+        executor = RecordingExecutor()
+        engine = _engine(
+            executor,
+            performance_observer=FailingObserver("test-model"),
+        )
+
+        result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
+        await engine.close()
+
+        assert result.generated_token_ids == (2,)
+        assert not executor.active
+
+    asyncio.run(run())
+
+
 def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
     async def run() -> None:
         executor = RecordingExecutor()
@@ -232,6 +262,33 @@ def test_cancelled_request_releases_resources_at_the_safe_boundary() -> None:
         assert kv_cache.num_free_blocks == 16
         assert executor.lease_release_count == 1
         assert observer.snapshot().cancelled_requests_total == 1
+
+    asyncio.run(run())
+
+
+def test_close_records_an_active_request_once_and_is_idempotent() -> None:
+    async def run() -> None:
+        executor = RecordingExecutor(block_first_step=True)
+        observer = InMemoryPerformanceObserver("test-model")
+        engine = _engine(executor, performance_observer=observer)
+        events = engine.stream(GenerateRequest(input_ids=(1,), max_new_tokens=2))
+        pending = asyncio.create_task(anext(events))
+        assert await asyncio.wait_for(
+            asyncio.to_thread(executor.first_step_started.wait, 1.0),
+            timeout=1.5,
+        )
+
+        close_task = asyncio.create_task(engine.close())
+        await asyncio.sleep(0)
+        executor.release_first_step.set()
+        await close_task
+        with pytest.raises(GenerationError, match="closed"):
+            await pending
+        await events.aclose()
+        await engine.close()
+
+        assert observer.snapshot().cancelled_requests_total == 1
+        assert not executor.active
 
     asyncio.run(run())
 

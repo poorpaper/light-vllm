@@ -298,6 +298,7 @@ Scheduler 拥有 token-aware 队列的语义：`waiting_token_budget` 是等待�
 Prometheus renderer 只依赖 `PerformanceMetricsReader`，生成 HTTP 路由仍只依赖 `EngineClient`。Grafana 看板和
 HPA 位于仓库外控制面：前者查询 histogram/计数，后者经 Prometheus Adapter 读取每 Pod 的
 `light_vllm_queue_tokens`。observer 不执行 I/O 或自动调参；未来 Guardian 需要单独控制端口和有界安全更新点。
+Engine 隔离所有 observer 回调异常，第三方指标实现失效时请求仍必须完成并正常释放资源。
 
 ## 模型加载不变量
 

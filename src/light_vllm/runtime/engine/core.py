@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -31,6 +32,8 @@ from light_vllm.runtime.generation.interfaces import (
 )
 from light_vllm.runtime.observability.interfaces import PerformanceObserver, RequestOutcome
 from light_vllm.runtime.scheduler.interfaces import Scheduler, SchedulerError, SchedulerOutput
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,10 +213,7 @@ class EngineCore:
                 self._states.pop(request_id, None)
                 raise
             if self._performance_observer is not None:
-                self._performance_observer.request_started(
-                    request_id,
-                    num_prompt_tokens=len(request.input_ids),
-                )
+                self._observe_request_started(request_id, num_prompt_tokens=len(request.input_ids))
                 self._publish_scheduler_stats()
             self._start_driver_locked()
             return state
@@ -321,10 +321,7 @@ class EngineCore:
                 num_new_tokens=len(visible_tokens),
             )
             if visible_tokens and self._performance_observer is not None:
-                self._performance_observer.tokens_generated(
-                    item.request_id,
-                    count=len(visible_tokens),
-                )
+                self._observe_tokens_generated(item.request_id, count=len(visible_tokens))
             # 已确认但尚未写入 KV cache 的 token，会在下一轮作为输入再计算一次。
             for token_id in visible_tokens:
                 position = state.generated_count
@@ -396,8 +393,32 @@ class EngineCore:
 
     def _publish_scheduler_stats(self) -> None:
         if self._performance_observer is not None:
-            self._performance_observer.scheduler_updated(self._scheduler.stats)
+            try:
+                self._performance_observer.scheduler_updated(self._scheduler.stats)
+            except Exception:
+                # 指标是旁路能力；第三方 observer 故障不能改变推理结果。
+                _LOGGER.exception("performance observer failed to record scheduler stats")
+
+    def _observe_request_started(self, request_id: str, *, num_prompt_tokens: int) -> None:
+        if self._performance_observer is not None:
+            try:
+                self._performance_observer.request_started(
+                    request_id,
+                    num_prompt_tokens=num_prompt_tokens,
+                )
+            except Exception:
+                _LOGGER.exception("performance observer failed to start a request")
+
+    def _observe_tokens_generated(self, request_id: str, *, count: int) -> None:
+        if self._performance_observer is not None:
+            try:
+                self._performance_observer.tokens_generated(request_id, count=count)
+            except Exception:
+                _LOGGER.exception("performance observer failed to record generated tokens")
 
     def _observe_request_finished(self, request_id: str, *, outcome: RequestOutcome) -> None:
         if self._performance_observer is not None:
-            self._performance_observer.request_finished(request_id, outcome=outcome)
+            try:
+                self._performance_observer.request_finished(request_id, outcome=outcome)
+            except Exception:
+                _LOGGER.exception("performance observer failed to finish a request")

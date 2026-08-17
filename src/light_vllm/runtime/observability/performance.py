@@ -126,8 +126,10 @@ class InMemoryPerformanceObserver:
                 if count > 1:
                     self._tpot.observe(0.0, count=count - 1)
             else:
-                # 一次执行返回 N 个 token 时，把两次可见时间之差均摊给 N 个 token。
-                self._tpot.observe((now - timing.last_token_at) / count, count=count)
+                # 一批 token 在同一安全点可见：第一个跨越完整时间间隔，其余间隔为零。
+                self._tpot.observe(now - timing.last_token_at)
+                if count > 1:
+                    self._tpot.observe(0.0, count=count - 1)
             timing.last_token_at = now
             self._generation_tokens_total += count
 

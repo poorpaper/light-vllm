@@ -31,9 +31,13 @@ Engine runtime 启动后直接暴露 `GET /metrics`，不需要在 token 热路�
 
 ## Kubernetes HPA
 
-`prometheus-adapter-values.yaml` 给出 Prometheus Adapter 的最小规则，`hpa.yaml` 使用
-`autoscaling/v2` 的 Pods `AverageValue`。生产环境的 Prometheus 抓取目标必须带 `namespace` 和 `pod`
-标签；阈值 `4096` 只是示例，应按模型、GPU、并发压测和 TTFT SLO 调整，并保留 scale-down
+`pod-monitor.yaml` 让 Prometheus Operator 按 Pod 抓取 `/metrics`，并产生 Adapter 规则需要的
+`namespace` / `pod` 标签。目标 Deployment 的 Pod template 需要标签
+`app.kubernetes.io/name: light-vllm`，容器端口需要命名为 `http`。
+
+`prometheus-adapter-values.yaml` 给出 Prometheus Adapter 规则，`hpa.yaml` 使用 `autoscaling/v2` 的 Pods
+`AverageValue`。三个文件共同组成 Kubernetes 路径；本地静态 `prometheus.yml` 只供单机 Grafana 体验，
+不提供每 Pod 标签。阈值 `4096` 只是示例，应按模型、GPU、并发压测和 TTFT SLO 调整，并保留 scale-down
 稳定窗口以减少抖动。
 
 相关上游文档：

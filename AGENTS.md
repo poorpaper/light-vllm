@@ -136,7 +136,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 34. Hugging Face 与 ModelScope 只是 checkpoint 来源；兼容快照先落到本地目录，再由同一个 loader 校验配置、
     分片和权重，不能复制两套 Qwen 执行实现。
 35. `PerformanceObserver` 只能接收请求生命周期事实和 Scheduler/KV 不可变快照；它不得执行 I/O、修改运行时
-    状态或按 architecture/模型尺寸分支。Prometheus/Grafana/HPA 表达必须留在控制面 adapter。
+    状态或按 architecture/模型尺寸分支。Engine 必须隔离 observer 异常，不能让指标故障改变推理结果。
+    Prometheus/Grafana/HPA 表达必须留在控制面 adapter。
 
 ## 锁与资源的准确含义
 
