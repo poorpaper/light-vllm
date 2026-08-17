@@ -47,6 +47,9 @@ def test_interface_modules_do_not_import_their_implementations() -> None:
         SOURCE_ROOT / "runtime" / "scheduler" / "interfaces.py": (
             "light_vllm.runtime.scheduler.token_budget",
         ),
+        SOURCE_ROOT / "runtime" / "observability" / "interfaces.py": (
+            "light_vllm.runtime.observability.performance",
+        ),
     }
 
     for path, implementations in boundaries.items():

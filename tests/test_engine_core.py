@@ -17,6 +17,7 @@ from light_vllm.runtime.execution import (
     RequestOutput,
 )
 from light_vllm.runtime.kv_cache import FixedKVBlockCapacity, PagedKVCacheManager
+from light_vllm.runtime.observability import InMemoryPerformanceObserver
 from light_vllm.runtime.scheduler import DecodingBudget, TokenBudgetScheduler
 
 
@@ -96,7 +97,12 @@ class RecordingExecutor:
         return ExecutionOutput(requests=tuple(results))
 
 
-def _engine(executor: RecordingExecutor, *, token_budget: int = 2) -> EngineCore:
+def _engine(
+    executor: RecordingExecutor,
+    *,
+    token_budget: int = 2,
+    performance_observer: InMemoryPerformanceObserver | None = None,
+) -> EngineCore:
     scheduler = TokenBudgetScheduler(
         PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2)),
         max_num_sequences=2,
@@ -107,7 +113,48 @@ def _engine(executor: RecordingExecutor, *, token_budget: int = 2) -> EngineCore
             else None
         ),
     )
-    return EngineCore(executor, scheduler)
+    return EngineCore(
+        executor,
+        scheduler,
+        performance_observer=performance_observer,
+    )
+
+
+def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+
+    class TimedExecutor(RecordingExecutor):
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            clock.now += 0.2
+            return super().execute(batch)
+
+    async def run() -> None:
+        observer = InMemoryPerformanceObserver("qwen2.5", clock=clock)
+        engine = _engine(
+            TimedExecutor(),
+            token_budget=2,
+            performance_observer=observer,
+        )
+        result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=2))
+        await engine.close()
+
+        snapshot = observer.snapshot()
+        assert result.generated_token_ids == (2, 3)
+        assert snapshot.time_to_first_token.total == pytest.approx(0.2)
+        assert snapshot.time_per_output_token.total == pytest.approx(0.2)
+        assert snapshot.prompt_tokens_total == 1
+        assert snapshot.generation_tokens_total == 2
+        assert snapshot.finished_requests_total == 1
+        assert snapshot.scheduler.waiting_requests == 0
+        assert snapshot.scheduler.running_requests == 0
+
+    asyncio.run(run())
 
 
 def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
@@ -158,13 +205,14 @@ def test_engine_stops_at_eos_inside_a_multi_token_result() -> None:
 def test_cancelled_request_releases_resources_at_the_safe_boundary() -> None:
     async def run() -> None:
         executor = RecordingExecutor(block_first_step=True)
+        observer = InMemoryPerformanceObserver("test-model")
         kv_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2))
         scheduler = TokenBudgetScheduler(
             kv_cache,
             max_num_sequences=2,
             max_num_scheduled_tokens=2,
         )
-        engine = EngineCore(executor, scheduler)
+        engine = EngineCore(executor, scheduler, performance_observer=observer)
         events = engine.stream(GenerateRequest(input_ids=(1,), max_new_tokens=2))
         pending = asyncio.create_task(anext(events))
         try:
@@ -183,6 +231,7 @@ def test_cancelled_request_releases_resources_at_the_safe_boundary() -> None:
         await engine.close()
         assert kv_cache.num_free_blocks == 16
         assert executor.lease_release_count == 1
+        assert observer.snapshot().cancelled_requests_total == 1
 
     asyncio.run(run())
 
@@ -194,11 +243,13 @@ def test_execution_failure_is_delivered_to_the_request() -> None:
 
     async def run() -> None:
         executor = FailingExecutor()
-        engine = _engine(executor)
+        observer = InMemoryPerformanceObserver("test-model")
+        engine = _engine(executor, performance_observer=observer)
         with pytest.raises(GenerationError, match="invalid execution output"):
             await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
         await engine.close()
         assert executor.lease_release_count == 1
+        assert observer.snapshot().failed_requests_total == 1
 
     asyncio.run(run())
 

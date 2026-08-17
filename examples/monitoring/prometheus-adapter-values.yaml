@@ -1,0 +1,13 @@
+rules:
+  custom:
+    - seriesQuery: 'light_vllm_queue_tokens{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: ^light_vllm_queue_tokens$
+        as: light_vllm_queue_tokens
+      metricsQuery: max by (<<.GroupBy>>) (<<.Series>>{<<.LabelMatchers>>})

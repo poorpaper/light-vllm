@@ -41,7 +41,10 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `RequestOutput` 分开表达本轮输入计算量、零到多个确认输出，以及已经写入 KV 的输出前缀。
 - `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
-- FastAPI adapter 只依赖 `EngineClient`，不知道 scheduler、runner、torch 或 KV cache。
+- `PerformanceObserver` 在 Engine 已生效的生命周期边界记录 TTFT/TPOT 与请求结果，只读取 Scheduler/KV
+  不可变快照；Prometheus、Grafana 和 HPA 不进入推理热路径。
+- FastAPI 生成路由只依赖 `EngineClient`；`/metrics` 只依赖独立的 `PerformanceMetricsReader`，两者都不知道
+  scheduler、runner、torch 或具体模型。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
 当前尚未实现 preemption、分布式执行、tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。
@@ -76,7 +79,10 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/runtime/engine/core.py` | 请求状态、迭代循环、事件与安全取消 |
 | `src/light_vllm/runtime/engine/in_process.py` | 同步 reference 到异步 Engine 的适配器 |
 | `src/light_vllm/runtime/engine/interfaces.py` | serving 使用的异步 `EngineClient` |
+| `src/light_vllm/runtime/observability/interfaces.py` | 性能快照、读取端口与观察者契约 |
+| `src/light_vllm/runtime/observability/performance.py` | 进程内 TTFT/TPOT、token 与请求结果聚合 |
 | `src/light_vllm/serving/http.py` | FastAPI JSON/SSE adapter |
+| `src/light_vllm/serving/prometheus.py` | 性能快照到 Prometheus 文本格式的转换 |
 | `src/light_vllm/entrypoints/http.py` | 具体组件的装配入口 |
 
 ## 必须保持的架构不变量
@@ -90,7 +96,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 6. 所有模型接受 `ForwardBatch`，返回只包含 logits 的 `ModelOutput`；K/V 读写由 `AttentionContext` 和 Step Handler
    完成，loader 负责 device、dtype 与 `eval()`。
 7. `ReferenceGenerationService` 只依赖 `TokenExecutor`，不得依赖 runner、torch 或具体模型。
-8. transport adapter 只依赖 `EngineClient`；HTTP/RPC schema 和 wire format 不得进入核心契约。
+8. transport 的生成路由只依赖 `EngineClient`；监控路由可以额外依赖独立只读指标端口。HTTP/RPC schema、
+   Prometheus 格式和 wire format 均不得进入核心契约。
 9. `stream` 是同步与异步生成的唯一执行路径；`generate` 只收集同一事件流。
 10. 流在取消、关闭和异常时必须释放资源；首事件后的错误由 adapter 编码到流中。
 11. `InProcessEngineClient` 只做 sync-to-async 适配，不承担 scheduling。
@@ -128,6 +135,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
     `AttentionContext`，不得保留模型内 dense fallback，也不得绑定 HF FlashAttention 或物理 page layout。
 34. Hugging Face 与 ModelScope 只是 checkpoint 来源；兼容快照先落到本地目录，再由同一个 loader 校验配置、
     分片和权重，不能复制两套 Qwen 执行实现。
+35. `PerformanceObserver` 只能接收请求生命周期事实和 Scheduler/KV 不可变快照；它不得执行 I/O、修改运行时
+    状态或按 architecture/模型尺寸分支。Prometheus/Grafana/HPA 表达必须留在控制面 adapter。
 
 ## 锁与资源的准确含义
 
@@ -140,6 +149,9 @@ reference 的请求不占用 worker thread，并让同步 iterator 的创建、`
 `EngineCore` 的异步锁保护请求状态、Scheduler 状态和 driver 生命周期。模型执行发生在锁外；执行前通过
 Executor lease 固定物理资源，取消只标记释放，tensor 等 lease 退出后再销毁。正在执行的分页请求被取消时，
 Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边界。
+
+`InMemoryPerformanceObserver` 只有独立短临界区，记录单调时钟与计数；它不持有 Engine 锁做 I/O，也不是未来
+性能 Guardian。Guardian 如需自动调参，必须通过单独控制端口提交有界决策，不能反向拿 observer 修改内部状态。
 
 ## 新增扩展的方式
 
@@ -157,6 +169,9 @@ Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边
 `LocalModelWorker` 和 Step Handler，不修改 Scheduler、Engine 或模型分发。
 
 新增 serving 协议：只消费 `EngineClient`，在 adapter 内转换请求、结果、错误和 wire format。
+
+新增指标后端：实现 `PerformanceMetricsReader` 的表达适配器，消费不可变快照；不要把 Prometheus SDK、Grafana
+或 HPA 逻辑放进 Engine、Scheduler、Worker 或模型。
 
 ## 开发与验证
 

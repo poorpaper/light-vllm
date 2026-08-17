@@ -30,6 +30,36 @@ class KVCacheNotFoundError(KVCacheError):
 
 
 @dataclass(frozen=True, slots=True)
+class KVCacheStats:
+    """KV cache 当前可观测的容量事实。
+
+    分页缓存按已经分配、不能立即回收的 token slot 计数；可淘汰的 prefix
+    page 视为可用容量。连续缓存没有固定上限，因此两个字段都返回 ``None``。
+    """
+
+    used_token_slots: int | None = None
+    capacity_token_slots: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.used_token_slots is None) != (self.capacity_token_slots is None):
+            raise ValueError("KV cache usage and capacity must both be known or unknown")
+        if self.used_token_slots is None:
+            return
+        if type(self.used_token_slots) is not int or self.used_token_slots < 0:
+            raise ValueError("used_token_slots must be a non-negative integer")
+        if type(self.capacity_token_slots) is not int or self.capacity_token_slots <= 0:
+            raise ValueError("capacity_token_slots must be a positive integer")
+        if self.used_token_slots > self.capacity_token_slots:
+            raise ValueError("KV cache usage must not exceed capacity")
+
+    @property
+    def usage_ratio(self) -> float | None:
+        if self.used_token_slots is None or self.capacity_token_slots is None:
+            return None
+        return self.used_token_slots / self.capacity_token_slots
+
+
+@dataclass(frozen=True, slots=True)
 class ContiguousLayerKV:
     """连续布局中一层 K/V 的有效片段。
 
@@ -99,6 +129,9 @@ class KVCacheManager(Protocol):
 
     实现可以返回 block table，也可以只记录 token 数；两者都必须支持提交和释放。
     """
+
+    @property
+    def stats(self) -> KVCacheStats: ...
 
     def add_request(
         self,
@@ -178,6 +211,11 @@ class UnboundedKVCacheManager:
 
     def __init__(self) -> None:
         self._allocations: dict[str, _UnboundedAllocation] = {}
+
+    @property
+    def stats(self) -> KVCacheStats:
+        # 连续缓存按请求动态增长，没有可用于计算占用率的固定容量。
+        return KVCacheStats()
 
     def add_request(
         self,
@@ -259,6 +297,16 @@ class PagedKVCacheManager:
     @property
     def block_size(self) -> int:
         return self._capacity.block_size
+
+    @property
+    def stats(self) -> KVCacheStats:
+        self._sync_capacity()
+        assert self._num_blocks is not None
+        used_blocks = self._num_blocks - self.num_free_blocks
+        return KVCacheStats(
+            used_token_slots=used_blocks * self.block_size,
+            capacity_token_slots=self._num_blocks * self.block_size,
+        )
 
     @property
     def num_free_blocks(self) -> int:

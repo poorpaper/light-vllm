@@ -55,8 +55,9 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `ContiguousStepHandler`：保留请求级连续 K/V 的无分页正确性基线。
 - `StandardDecodeHandler`：处理普通 prefill 和单 token decode。
 - `NGramSpeculativeDecodeHandler`：从当前请求历史提出候选，由同一个目标模型一次验证，不新增 Worker。
+- `PerformanceObserver`：在统一 Engine 边界记录 TTFT、TPOT、队列、token backlog 与 KV 使用率。
 - `GreedySampler`：独立于 Executor 的贪心采样策略。
-- FastAPI adapter：协议外层的 JSON/SSE 接口，只依赖 `EngineClient`。
+- FastAPI adapter：生成路由只依赖 `EngineClient`，`/metrics` 只依赖独立的性能快照读取端口。
 
 ## 快速开始
 
@@ -194,6 +195,22 @@ curl -N -X POST http://127.0.0.1:8000/generate/stream \
 ```
 
 另有 `GET /healthz` 与 `GET /readyz`。模型在应用 lifespan 中加载完成后，readiness 才返回成功。
+
+## 性能指标
+
+`engine` runtime 额外提供 Prometheus `GET /metrics`：
+
+```bash
+curl http://127.0.0.1:8000/metrics
+```
+
+它包含 TTFT、TPOT、waiting/running 请求、token-aware 等待预算、KV cache 使用率和 token 吞吐。
+指标来自同一套 Engine/Scheduler/KV 事实，与 `qwen2`、`qwen2.5` 或具体模型尺寸无关；`reference`
+runtime 没有 Scheduler 和固定 KV 容量，因此不伪造这些指标。
+
+可直接导入的 Grafana dashboard、Prometheus 抓取配置和 Kubernetes HPA 示例见
+[`examples/monitoring`](examples/monitoring/README.md)。HPA 推荐消费 `light_vllm_queue_tokens`，它以等待
+请求的剩余最大 token 预算表示 backlog，比单纯请求数更能区分长短请求。
 
 HTTP adapter 当前最多接受 4096 个输入 token，`max_new_tokens` 也最多为 4096。进程内
 reference engine 仍然一次只执行一个完整请求；并发请求在 event loop 中等待准入，不占用推理线程。
