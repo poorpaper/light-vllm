@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import AsyncGenerator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -30,10 +29,12 @@ from light_vllm.runtime.generation.interfaces import (
     GenerationNotReadyError,
     TokenGenerated,
 )
-from light_vllm.runtime.observability.interfaces import PerformanceObserver, RequestOutcome
+from light_vllm.runtime.observability.dispatch import SafeCompositePerformanceObserver
+from light_vllm.runtime.observability.interfaces import (
+    PerformanceObserver,
+    StepObservation,
+)
 from light_vllm.runtime.scheduler.interfaces import Scheduler, SchedulerError, SchedulerOutput
-
-_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +112,7 @@ class EngineCore:
         self._executor = executor
         self._scheduler = scheduler
         self._admission = admission or CapacityAdmission()
-        self._performance_observer = performance_observer
+        self._performance_observer = SafeCompositePerformanceObserver(performance_observer)
         self._states: dict[str, _RequestState] = {}
         self._executing_request_ids: set[str] = set()
         self._pending_scheduler_removals: set[str] = set()
@@ -177,7 +178,10 @@ class EngineCore:
                 for request_id, state in tuple(self._states.items()):
                     removed = self._remove_request_locked(request_id)
                     if removed is not None:
-                        self._observe_request_finished(request_id, outcome="cancelled")
+                        self._performance_observer.request_finished(
+                            request_id,
+                            outcome="cancelled",
+                        )
                     state.events.put_nowait(
                         _RequestFailed(GenerationError("generation engine is closed"))
                     )
@@ -212,9 +216,11 @@ class EngineCore:
                 self._scheduler.remove(request_id)
                 self._states.pop(request_id, None)
                 raise
-            if self._performance_observer is not None:
-                self._observe_request_started(request_id, num_prompt_tokens=len(request.input_ids))
-                self._publish_scheduler_stats()
+            self._performance_observer.request_started(
+                request_id,
+                num_prompt_tokens=len(request.input_ids),
+            )
+            self._publish_scheduler_stats()
             self._start_driver_locked()
             return state
 
@@ -222,7 +228,7 @@ class EngineCore:
         async with self._lock:
             state = self._remove_request_locked(request_id)
             if state is not None:
-                self._observe_request_finished(request_id, outcome="cancelled")
+                self._performance_observer.request_finished(request_id, outcome="cancelled")
                 self._publish_scheduler_stats()
 
     def _start_driver_locked(self) -> None:
@@ -252,6 +258,17 @@ class EngineCore:
                     raw_output = await asyncio.to_thread(self._executor.execute, batch)
                     # 结果完整通过检查前，不更新请求进度，也不提交 KV cache。
                     output = _validated_output(batch, raw_output)
+                    if raw_output.step_elapsed_seconds is not None:
+                        self._performance_observer.step_completed(
+                            StepObservation(
+                                num_scheduled_tokens=sum(
+                                    len(request.input_token_ids) + request.num_lookahead_tokens
+                                    for request in batch.requests
+                                ),
+                                num_requests=len(batch.requests),
+                                elapsed_seconds=raw_output.step_elapsed_seconds,
+                            )
+                        )
                 except Exception as exc:
                     async with self._lock:
                         self._fail_batch_locked(scheduled.request_ids, exc)
@@ -320,8 +337,11 @@ class EngineCore:
                 num_committed_tokens=(result.num_input_tokens_computed + num_cached_visible_tokens),
                 num_new_tokens=len(visible_tokens),
             )
-            if visible_tokens and self._performance_observer is not None:
-                self._observe_tokens_generated(item.request_id, count=len(visible_tokens))
+            if visible_tokens:
+                self._performance_observer.tokens_generated(
+                    item.request_id,
+                    count=len(visible_tokens),
+                )
             # 已确认但尚未写入 KV cache 的 token，会在下一轮作为输入再计算一次。
             for token_id in visible_tokens:
                 position = state.generated_count
@@ -348,7 +368,7 @@ class EngineCore:
 
     def _finish_locked(self, state: _RequestState, reason: FinishReason) -> None:
         self._remove_request_locked(state.request_id)
-        self._observe_request_finished(state.request_id, outcome="finished")
+        self._performance_observer.request_finished(state.request_id, outcome="finished")
         state.events.put_nowait(GenerationFinished(finish_reason=reason))
 
     def _remove_request_locked(self, request_id: str) -> _RequestState | None:
@@ -375,14 +395,14 @@ class EngineCore:
         for request_id in request_ids:
             state = self._remove_request_locked(request_id)
             if state is not None:
-                self._observe_request_finished(request_id, outcome="failed")
+                self._performance_observer.request_finished(request_id, outcome="failed")
                 state.events.put_nowait(_RequestFailed(_execution_error(exc)))
 
     def _fail_all_locked(self, exc: Exception) -> None:
         for request_id in tuple(self._states):
             state = self._remove_request_locked(request_id)
             if state is not None:
-                self._observe_request_finished(request_id, outcome="failed")
+                self._performance_observer.request_finished(request_id, outcome="failed")
                 state.events.put_nowait(_RequestFailed(_execution_error(exc)))
         self._publish_scheduler_stats()
 
@@ -392,33 +412,4 @@ class EngineCore:
         self._publish_scheduler_stats()
 
     def _publish_scheduler_stats(self) -> None:
-        if self._performance_observer is not None:
-            try:
-                self._performance_observer.scheduler_updated(self._scheduler.stats)
-            except Exception:
-                # 指标是旁路能力；第三方 observer 故障不能改变推理结果。
-                _LOGGER.exception("performance observer failed to record scheduler stats")
-
-    def _observe_request_started(self, request_id: str, *, num_prompt_tokens: int) -> None:
-        if self._performance_observer is not None:
-            try:
-                self._performance_observer.request_started(
-                    request_id,
-                    num_prompt_tokens=num_prompt_tokens,
-                )
-            except Exception:
-                _LOGGER.exception("performance observer failed to start a request")
-
-    def _observe_tokens_generated(self, request_id: str, *, count: int) -> None:
-        if self._performance_observer is not None:
-            try:
-                self._performance_observer.tokens_generated(request_id, count=count)
-            except Exception:
-                _LOGGER.exception("performance observer failed to record generated tokens")
-
-    def _observe_request_finished(self, request_id: str, *, outcome: RequestOutcome) -> None:
-        if self._performance_observer is not None:
-            try:
-                self._performance_observer.request_finished(request_id, outcome=outcome)
-            except Exception:
-                _LOGGER.exception("performance observer failed to finish a request")
+        self._performance_observer.scheduler_updated(self._scheduler.stats)

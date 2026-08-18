@@ -1,6 +1,6 @@
 rules:
   custom:
-    - seriesQuery: 'light_vllm_queue_tokens{namespace!="",pod!=""}'
+    - seriesQuery: 'light_vllm_waiting_max_remaining_tokens{namespace!="",pod!=""}'
       resources:
         overrides:
           namespace:
@@ -8,6 +8,6 @@ rules:
           pod:
             resource: pod
       name:
-        matches: ^light_vllm_queue_tokens$
-        as: light_vllm_queue_tokens
+        matches: ^light_vllm_waiting_max_remaining_tokens$
+        as: light_vllm_waiting_max_remaining_tokens
       metricsQuery: max by (<<.GroupBy>>) (<<.Series>>{<<.LabelMatchers>>})

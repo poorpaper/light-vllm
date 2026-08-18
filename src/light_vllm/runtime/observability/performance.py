@@ -12,6 +12,8 @@ from light_vllm.runtime.observability.interfaces import (
     HistogramSnapshot,
     PerformanceSnapshot,
     RequestOutcome,
+    StepLatencySnapshot,
+    StepObservation,
 )
 from light_vllm.runtime.scheduler.interfaces import SchedulerStats
 
@@ -33,6 +35,8 @@ _LATENCY_BOUNDS = (
     120.0,
     300.0,
 )
+
+_STEP_TOKEN_BOUNDS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
 class _Histogram:
@@ -67,9 +71,7 @@ class _Histogram:
 @dataclass(slots=True)
 class _RequestTiming:
     started_at: float
-    num_prompt_tokens: int
     last_token_at: float | None = None
-    prompt_recorded: bool = False
 
 
 class InMemoryPerformanceObserver:
@@ -87,9 +89,18 @@ class InMemoryPerformanceObserver:
         self._clock = clock
         self._lock = RLock()
         self._requests: dict[str, _RequestTiming] = {}
-        self._scheduler = SchedulerStats(0, 0, 0, 0, KVCacheStats())
+        self._scheduler = SchedulerStats(
+            waiting_requests=0,
+            running_requests=0,
+            waiting_pending_tokens=0,
+            running_pending_tokens=0,
+            waiting_max_remaining_tokens=0,
+            running_max_remaining_tokens=0,
+            kv_cache=KVCacheStats(),
+        )
         self._ttft = _Histogram(_LATENCY_BOUNDS)
-        self._tpot = _Histogram(_LATENCY_BOUNDS)
+        self._inter_token_latency = _Histogram(_LATENCY_BOUNDS)
+        self._step_latency: dict[int | None, _Histogram] = {}
         self._prompt_tokens_total = 0
         self._generation_tokens_total = 0
         self._request_outcomes: dict[RequestOutcome, int] = {
@@ -108,8 +119,9 @@ class InMemoryPerformanceObserver:
                 raise ValueError(f"request {request_id!r} is already observed")
             self._requests[request_id] = _RequestTiming(
                 started_at=self._clock(),
-                num_prompt_tokens=num_prompt_tokens,
             )
+            # 统计所有已经进入 Engine 的 prompt，包括随后失败或取消的请求。
+            self._prompt_tokens_total += num_prompt_tokens
 
     def tokens_generated(self, request_id: str, *, count: int) -> None:
         if type(count) is not int or count <= 0:
@@ -119,17 +131,14 @@ class InMemoryPerformanceObserver:
             now = self._clock()
             if timing.last_token_at is None:
                 self._ttft.observe(now - timing.started_at)
-                if not timing.prompt_recorded:
-                    self._prompt_tokens_total += timing.num_prompt_tokens
-                    timing.prompt_recorded = True
                 # 同一次执行返回多个确认 token 时，它们在同一安全点可见。
                 if count > 1:
-                    self._tpot.observe(0.0, count=count - 1)
+                    self._inter_token_latency.observe(0.0, count=count - 1)
             else:
                 # 一批 token 在同一安全点可见：第一个跨越完整时间间隔，其余间隔为零。
-                self._tpot.observe(now - timing.last_token_at)
+                self._inter_token_latency.observe(now - timing.last_token_at)
                 if count > 1:
-                    self._tpot.observe(0.0, count=count - 1)
+                    self._inter_token_latency.observe(0.0, count=count - 1)
             timing.last_token_at = now
             self._generation_tokens_total += count
 
@@ -143,13 +152,37 @@ class InMemoryPerformanceObserver:
         with self._lock:
             self._scheduler = stats
 
+    def step_completed(self, observation: StepObservation) -> None:
+        if not isinstance(observation, StepObservation):
+            raise TypeError("observation must be StepObservation")
+        bucket = next(
+            (bound for bound in _STEP_TOKEN_BOUNDS if observation.num_scheduled_tokens <= bound),
+            None,
+        )
+        with self._lock:
+            histogram = self._step_latency.setdefault(bucket, _Histogram(_LATENCY_BOUNDS))
+            histogram.observe(observation.elapsed_seconds)
+
     def snapshot(self) -> PerformanceSnapshot:
         with self._lock:
             return PerformanceSnapshot(
                 model_name=self._model_name,
                 scheduler=self._scheduler,
                 time_to_first_token=self._ttft.snapshot(),
-                time_per_output_token=self._tpot.snapshot(),
+                inter_token_latency=self._inter_token_latency.snapshot(),
+                step_latency=tuple(
+                    StepLatencySnapshot(
+                        max_scheduled_tokens=bucket,
+                        latency=histogram.snapshot(),
+                    )
+                    for bucket, histogram in sorted(
+                        self._step_latency.items(),
+                        key=lambda item: (
+                            item[0] is None,
+                            item[0] if item[0] is not None else 0,
+                        ),
+                    )
+                ),
                 prompt_tokens_total=self._prompt_tokens_total,
                 generation_tokens_total=self._generation_tokens_total,
                 finished_requests_total=self._request_outcomes["finished"],

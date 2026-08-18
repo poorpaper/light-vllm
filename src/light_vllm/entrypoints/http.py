@@ -21,6 +21,7 @@ from light_vllm.modeling.models.interfaces import ModelSpec
 from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
+from light_vllm.runtime.execution.interfaces import ExecutionTimer
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionBackend,
@@ -35,6 +36,10 @@ from light_vllm.runtime.execution.speculative import (
     GreedyAcceptanceSampler,
     NGramSpeculativeDecodeHandler,
     NGramTokenProposer,
+)
+from light_vllm.runtime.execution.timing import (
+    CudaEventExecutionTimer,
+    WallClockExecutionTimer,
 )
 from light_vllm.runtime.execution.worker import (
     ContiguousStepHandler,
@@ -110,6 +115,12 @@ def _create_paged_attention_backend(
     )
 
     return TritonPagedAttentionBackend()
+
+
+def _create_execution_timer(spec: ModelSpec) -> ExecutionTimer:
+    if torch.device(spec.device).type == "cuda":
+        return CudaEventExecutionTimer(spec.device)
+    return WallClockExecutionTimer()
 
 
 def create_serving_app(
@@ -218,7 +229,10 @@ def create_serving_app(
             step_factory,
             decode_handler,
         )
-        model_executor = LocalModelExecutor(worker)
+        model_executor = LocalModelExecutor(
+            worker,
+            timer=_create_execution_timer(spec),
+        )
         scheduler = TokenBudgetScheduler(
             logical_cache,
             max_num_sequences=max_num_sequences,

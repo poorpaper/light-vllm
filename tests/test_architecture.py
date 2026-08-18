@@ -99,6 +99,13 @@ def test_speculative_strategy_stays_out_of_scheduler_and_worker() -> None:
         assert "light_vllm.runtime.execution.speculative" not in _imported_modules(path), path
 
 
+def test_observability_implementation_is_not_reexported_from_root() -> None:
+    import light_vllm
+
+    assert not hasattr(light_vllm, "InMemoryPerformanceObserver")
+    assert not hasattr(light_vllm, "PerformanceSnapshot")
+
+
 def test_cacheable_models_delegate_softmax_to_attention_context() -> None:
     """模型可以生成 Q/K/V，但不能重新拥有 attention kernel。"""
 

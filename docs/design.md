@@ -66,7 +66,7 @@ flowchart TB
     Bridge --> Reference["ReferenceGenerationService"]
 
     Core --> Scheduler["TokenBudgetScheduler"]
-    Core --> Observer["PerformanceObserver<br/>TTFT / TPOT / outcomes"]
+    Core --> Observer["PerformanceObserver<br/>TTFT / ITL / step / outcomes"]
     Scheduler --> Observer
     Observer --> Metrics["Prometheus /metrics"]
     Metrics --> Grafana["Grafana / HPA"]
@@ -264,14 +264,16 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 ## 10. 性能观测
 
 观测只建立在已经生效的事实上：请求成功加入 Executor 和 Scheduler 后开始计时；输出通过校验并成为可见
-token 时记录 TTFT/TPOT；请求完成、失败或取消时记录结果。Scheduler 提供 waiting/running 请求数及各自剩余
-token 预算，分页 KV 提供不能立即回收的 slot 与总容量。Qwen2、Qwen2.5、投机解码和普通解码复用同一路径。
+token 时记录 TTFT/可见 token 间隔；请求完成、失败或取消时记录结果。Scheduler 分开提供已知 pending 输入和
+包含最大输出预算的保守 backlog；Executor 报告按 scheduled-token 桶聚合的已完成 step 延迟。Qwen2、Qwen2.5、
+投机解码和普通解码复用同一路径。
 
 `InMemoryPerformanceObserver` 是专门的性能观察角色，只做短临界区计数。它不能调整 Scheduler 参数，也不执行
-网络或文件 I/O；Engine 会隔离 observer 异常，指标故障不能泄漏请求或改变生成结果。
+网络或文件 I/O；`SafeCompositePerformanceObserver` 会停用首次失败的旁路实现，指标故障不能泄漏请求、同步刷屏
+或改变生成结果。
 `serving/prometheus.py` 把快照转换成标准文本；Grafana 直接消费 Prometheus，HPA 通过
-Prometheus Adapter 消费 `light_vllm_queue_tokens`。未来性能 Guardian 必须通过单独的有界控制端口工作，不能
-把策略塞进 observer 或 token 热路径。
+Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`。未来性能 Guardian 必须通过单独的有界控制
+端口工作，不能把策略塞进 observer 或 token 热路径。
 
 ## 11. 代码映射
 
@@ -292,6 +294,7 @@ Prometheus Adapter 消费 `light_vllm_queue_tokens`。未来性能 Guardian 必�
 | 执行契约 | `src/light_vllm/runtime/execution/interfaces.py` |
 | n-gram 投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
+| 执行 step 计时 | `src/light_vllm/runtime/execution/timing.py` |
 | 本地 Worker | `src/light_vllm/runtime/execution/worker.py` |
 | Dense Attention | `src/light_vllm/runtime/execution/dense_attention.py` |
 | 物理分页 KV | `src/light_vllm/runtime/execution/paged_cache.py` |
@@ -302,6 +305,7 @@ Prometheus Adapter 消费 `light_vllm_queue_tokens`。未来性能 Guardian 必�
 | EngineClient | `src/light_vllm/runtime/engine/interfaces.py` |
 | 性能观察契约 | `src/light_vllm/runtime/observability/interfaces.py` |
 | 进程内性能聚合 | `src/light_vllm/runtime/observability/performance.py` |
+| 性能观察者隔离 | `src/light_vllm/runtime/observability/dispatch.py` |
 | HTTP adapter | `src/light_vllm/serving/http.py` |
 | Prometheus adapter | `src/light_vllm/serving/prometheus.py` |
 | 装配入口 | `src/light_vllm/entrypoints/http.py` |
@@ -339,7 +343,7 @@ git diff --check
 
 测试必须覆盖固定 ModelSession、token budget、chunked prefill、多 token 与已缓存输出前缀、容量规划与 admission、
 prefix 命中/LRU/epoch、投机全接受/部分接受/首个拒绝/短候选、逻辑 block 回滚、非连续物理页、block table
-别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、TTFT/TPOT、token-aware 队列、KV 使用率、执行失败和取消
+别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、TTFT/ITL、step 延迟、两种 token backlog、KV 使用率、执行失败和取消
 资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
 Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、padded GQA、decode 历史、共享
 prefix 和未使用 lookahead。

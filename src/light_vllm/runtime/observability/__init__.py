@@ -4,6 +4,8 @@ from light_vllm.runtime.observability.interfaces import (
     PerformanceObserver,
     PerformanceSnapshot,
     RequestOutcome,
+    StepLatencySnapshot,
+    StepObservation,
 )
 from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
 
@@ -14,4 +16,6 @@ __all__ = [
     "PerformanceObserver",
     "PerformanceSnapshot",
     "RequestOutcome",
+    "StepLatencySnapshot",
+    "StepObservation",
 ]

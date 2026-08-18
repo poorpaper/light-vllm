@@ -44,8 +44,10 @@ def _histogram(
     snapshot: HistogramSnapshot,
     *,
     labels: dict[str, str],
+    include_metadata: bool = True,
 ) -> None:
-    lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} histogram"))
+    if include_metadata:
+        lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} histogram"))
     for bound, count in zip(
         snapshot.bounds,
         snapshot.cumulative_counts,
@@ -85,18 +87,34 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
     )
     _metric(
         lines,
-        "light_vllm_queue_tokens",
+        "light_vllm_waiting_pending_tokens",
         "gauge",
-        "Conservative remaining token budget of waiting requests.",
-        scheduler.waiting_token_budget,
+        "Known input tokens not yet computed for waiting requests.",
+        scheduler.waiting_pending_tokens,
         labels=labels,
     )
     _metric(
         lines,
-        "light_vllm_running_tokens",
+        "light_vllm_running_pending_tokens",
         "gauge",
-        "Conservative remaining token budget of running requests.",
-        scheduler.running_token_budget,
+        "Known input tokens not yet computed for running requests.",
+        scheduler.running_pending_tokens,
+        labels=labels,
+    )
+    _metric(
+        lines,
+        "light_vllm_waiting_max_remaining_tokens",
+        "gauge",
+        "Conservative remaining token upper bound of waiting requests.",
+        scheduler.waiting_max_remaining_tokens,
+        labels=labels,
+    )
+    _metric(
+        lines,
+        "light_vllm_running_max_remaining_tokens",
+        "gauge",
+        "Conservative remaining token upper bound of running requests.",
+        scheduler.running_max_remaining_tokens,
         labels=labels,
     )
 
@@ -136,16 +154,28 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
     )
     _histogram(
         lines,
-        "light_vllm_time_per_output_token_seconds",
-        "Time between visible output tokens after the first token.",
-        snapshot.time_per_output_token,
+        "light_vllm_inter_token_latency_seconds",
+        "Visible interval between output tokens after the first token.",
+        snapshot.inter_token_latency,
         labels=labels,
     )
+    for index, step in enumerate(snapshot.step_latency):
+        token_bucket = (
+            str(step.max_scheduled_tokens) if step.max_scheduled_tokens is not None else "+Inf"
+        )
+        _histogram(
+            lines,
+            "light_vllm_engine_step_seconds",
+            "Completed device-step latency grouped by scheduled-token upper bound.",
+            step.latency,
+            labels={**labels, "scheduled_tokens_le": token_bucket},
+            include_metadata=index == 0,
+        )
     _metric(
         lines,
         "light_vllm_prompt_tokens_total",
         "counter",
-        "Prompt tokens of requests that emitted at least one token.",
+        "Prompt tokens admitted to the engine.",
         snapshot.prompt_tokens_total,
         labels=labels,
     )

@@ -72,12 +72,17 @@ class TokenBudgetScheduler:
         return SchedulerStats(
             waiting_requests=len(self._waiting),
             running_requests=len(self._running),
-            waiting_token_budget=sum(
-                self._remaining_token_budget(self._states[request_id])
-                for request_id in self._waiting
+            waiting_pending_tokens=sum(
+                self._pending_tokens(self._states[request_id]) for request_id in self._waiting
             ),
-            running_token_budget=sum(
-                self._remaining_token_budget(state) for state in self._running.values()
+            running_pending_tokens=sum(
+                self._pending_tokens(state) for state in self._running.values()
+            ),
+            waiting_max_remaining_tokens=sum(
+                self._max_remaining_tokens(self._states[request_id]) for request_id in self._waiting
+            ),
+            running_max_remaining_tokens=sum(
+                self._max_remaining_tokens(state) for state in self._running.values()
             ),
             kv_cache=self._kv_cache.stats,
         )
@@ -232,5 +237,9 @@ class TokenBudgetScheduler:
             self._running[request_id] = state
 
     @staticmethod
-    def _remaining_token_budget(state: _RequestState) -> int:
+    def _pending_tokens(state: _RequestState) -> int:
+        return state.num_tokens - state.num_computed_tokens
+
+    @staticmethod
+    def _max_remaining_tokens(state: _RequestState) -> int:
         return state.max_num_tokens - state.num_computed_tokens

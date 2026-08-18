@@ -11,18 +11,20 @@ Engine runtime 启动后直接暴露 `GET /metrics`，不需要在 token 热路�
    `host.docker.internal` 时，替换成服务实际地址。
 3. 在 Grafana 配置 Prometheus datasource，导入 `grafana-dashboard.json`。
 
-看板已经包含 TTFT、TPOT、输出吞吐、请求队列、token-aware 队列和 KV cache 使用率。主要指标为：
+看板已经包含 TTFT、可见 token 间隔、step 延迟、输出吞吐、请求队列和 KV cache 使用率。主要指标为：
 
 | 指标 | 含义 |
 | --- | --- |
 | `light_vllm_time_to_first_token_seconds` | 请求准入到首个可见 token |
-| `light_vllm_time_per_output_token_seconds` | 首 token 之后，相邻可见输出 token 的平均间隔 |
+| `light_vllm_inter_token_latency_seconds` | 首 token 之后，相邻可见输出 token 的间隔 |
+| `light_vllm_engine_step_seconds` | 按 scheduled-token 上界分桶的已完成设备 step 延迟 |
 | `light_vllm_requests_waiting` | 等待 Scheduler 槽位的请求数 |
-| `light_vllm_queue_tokens` | 等待请求尚未计算的保守 token 上界，适合作为 HPA backlog |
+| `light_vllm_waiting_pending_tokens` | 等待请求当前已知但尚未计算的输入 |
+| `light_vllm_waiting_max_remaining_tokens` | 包含最大输出预算的保守上界，适合作为 HPA backlog |
 | `light_vllm_kv_cache_usage_ratio` | 不能立即回收的分页 KV slot / 总 slot |
 
-`queue_tokens` 使用请求的最大输出预算，因此偏保守，但它不需要 tokenizer 或猜测未来停止点。连续 KV
-基线没有固定容量，所以不会输出 KV 容量与使用率指标。
+`waiting_max_remaining_tokens` 使用请求的最大输出预算，因此偏保守；TTFT 估算应使用 pending 输入和 step 延迟，
+不能混用。连续 KV 基线没有固定容量，所以不会输出 KV 容量与使用率指标。
 
 边界与业界常见做法保持一致：vLLM 也区分 waiting/running、TTFT/TPOT 与 KV 使用率，SGLang 把运行请求、
 队列请求和 token/KV 指标收敛在独立 observability collector；light-vllm 保留这些稳定概念，但用一个很小的

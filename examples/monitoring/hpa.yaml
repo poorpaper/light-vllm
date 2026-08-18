@@ -16,7 +16,7 @@ spec:
     - type: Pods
       pods:
         metric:
-          name: light_vllm_queue_tokens
+          name: light_vllm_waiting_max_remaining_tokens
         target:
           type: AverageValue
           # 示例阈值；应按模型、GPU 和实测 SLO 调整。

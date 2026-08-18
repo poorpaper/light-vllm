@@ -94,22 +94,26 @@ class SchedulerOutput:
 class SchedulerStats:
     """Scheduler 对观测面公开的不可变负载快照。
 
-    token budget 使用请求声明的最大总长度减去已经计算的 token 数。它是
-    保守的剩余工作量上界，适合比“请求个数”更精细地表达 HPA backlog。
+    pending tokens 只统计当前已知但尚未计算的输入；max remaining tokens
+    还包含请求允许生成的最大输出，是适合 HPA 的保守工作量上界。
     """
 
     waiting_requests: int
     running_requests: int
-    waiting_token_budget: int
-    running_token_budget: int
+    waiting_pending_tokens: int
+    running_pending_tokens: int
+    waiting_max_remaining_tokens: int
+    running_max_remaining_tokens: int
     kv_cache: KVCacheStats
 
     def __post_init__(self) -> None:
         values = (
             self.waiting_requests,
             self.running_requests,
-            self.waiting_token_budget,
-            self.running_token_budget,
+            self.waiting_pending_tokens,
+            self.running_pending_tokens,
+            self.waiting_max_remaining_tokens,
+            self.running_max_remaining_tokens,
         )
         if any(type(value) is not int or value < 0 for value in values):
             raise ValueError("scheduler statistics must be non-negative integers")

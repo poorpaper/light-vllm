@@ -718,3 +718,23 @@ def test_local_model_executor_delegates_without_changing_values() -> None:
         ("execute", batch),
         ("free", "request"),
     ]
+
+
+def test_local_model_executor_attaches_completed_step_latency() -> None:
+    class Worker:
+        ready = True
+        capabilities = ExecutionCapabilities(None, None)
+
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            return ExecutionOutput(requests=(RequestOutput("request", 1),))
+
+    class Timer:
+        def measure(self, operation):
+            return operation(), 0.125
+
+    executor = LocalModelExecutor(Worker(), timer=Timer())
+    batch = ExecutionBatch(requests=(_execution_request("request", (1,), 0, None),))
+
+    output = executor.execute(batch)
+
+    assert output.step_elapsed_seconds == pytest.approx(0.125)

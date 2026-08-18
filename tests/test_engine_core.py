@@ -132,7 +132,11 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
     class TimedExecutor(RecordingExecutor):
         def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
             clock.now += 0.2
-            return super().execute(batch)
+            output = super().execute(batch)
+            return ExecutionOutput(
+                requests=output.requests,
+                step_elapsed_seconds=0.2,
+            )
 
     async def run() -> None:
         observer = InMemoryPerformanceObserver("qwen2.5", clock=clock)
@@ -147,7 +151,11 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
         snapshot = observer.snapshot()
         assert result.generated_token_ids == (2, 3)
         assert snapshot.time_to_first_token.total == pytest.approx(0.2)
-        assert snapshot.time_per_output_token.total == pytest.approx(0.2)
+        assert snapshot.inter_token_latency.total == pytest.approx(0.2)
+        assert len(snapshot.step_latency) == 1
+        assert snapshot.step_latency[0].max_scheduled_tokens == 1
+        assert snapshot.step_latency[0].latency.count == 2
+        assert snapshot.step_latency[0].latency.total == pytest.approx(0.4)
         assert snapshot.prompt_tokens_total == 1
         assert snapshot.generation_tokens_total == 2
         assert snapshot.finished_requests_total == 1

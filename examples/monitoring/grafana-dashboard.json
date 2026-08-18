@@ -39,17 +39,17 @@
       "id": 2,
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(light_vllm_time_per_output_token_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(light_vllm_inter_token_latency_seconds_bucket[5m])))",
           "legendFormat": "{{model}} p95",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(light_vllm_time_per_output_token_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(light_vllm_inter_token_latency_seconds_bucket[5m])))",
           "legendFormat": "{{model}} p50",
           "refId": "B"
         }
       ],
-      "title": "TPOT",
+      "title": "Inter-token latency",
       "type": "timeseries"
     },
     {
@@ -94,12 +94,12 @@
       "id": 5,
       "targets": [
         {
-          "expr": "sum by (model) (light_vllm_queue_tokens)",
+          "expr": "sum by (model) (light_vllm_waiting_max_remaining_tokens)",
           "legendFormat": "{{model}} waiting",
           "refId": "A"
         },
         {
-          "expr": "sum by (model) (light_vllm_running_tokens)",
+          "expr": "sum by (model) (light_vllm_running_max_remaining_tokens)",
           "legendFormat": "{{model}} running",
           "refId": "B"
         }
@@ -125,6 +125,21 @@
       ],
       "title": "KV cache 使用率",
       "type": "gauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 7,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, model, scheduled_tokens_le) (rate(light_vllm_engine_step_seconds_bucket[5m])))",
+          "legendFormat": "{{model}} <= {{scheduled_tokens_le}} tokens",
+          "refId": "A"
+        }
+      ],
+      "title": "Engine step latency p95",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

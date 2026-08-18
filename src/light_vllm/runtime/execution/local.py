@@ -21,6 +21,7 @@ from light_vllm.runtime.execution.interfaces import (
     ExecutionLease,
     ExecutionNotReadyError,
     ExecutionOutput,
+    ExecutionTimer,
     ModelWorker,
     TokenExecutionSession,
 )
@@ -107,8 +108,14 @@ class LocalModelExecutor:
     以后增加多进程或分布式执行时，可以替换这个 Executor；调度策略不放在这里。
     """
 
-    def __init__(self, worker: ModelWorker) -> None:
+    def __init__(
+        self,
+        worker: ModelWorker,
+        *,
+        timer: ExecutionTimer | None = None,
+    ) -> None:
         self._worker = worker
+        self._timer = timer
 
     @property
     def ready(self) -> bool:
@@ -131,4 +138,10 @@ class LocalModelExecutor:
         return self._worker.acquire(request_ids)
 
     def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
-        return self._worker.execute(batch)
+        if self._timer is None:
+            return self._worker.execute(batch)
+        output, elapsed_seconds = self._timer.measure(lambda: self._worker.execute(batch))
+        return ExecutionOutput(
+            requests=output.requests,
+            step_elapsed_seconds=elapsed_seconds,
+        )

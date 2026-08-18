@@ -343,9 +343,9 @@ def test_qwen_engine_runtime_exposes_model_agnostic_performance_metrics(
         f'light_vllm_time_to_first_token_seconds_count{{model="{architecture}"}} 1' in metrics.text
     )
     assert (
-        f'light_vllm_time_per_output_token_seconds_count{{model="{architecture}"}} 1'
-        in metrics.text
+        f'light_vllm_inter_token_latency_seconds_count{{model="{architecture}"}} 1' in metrics.text
     )
+    assert f'light_vllm_engine_step_seconds_count{{model="{architecture}"' in metrics.text
     assert (
         f'light_vllm_requests_total{{model="{architecture}",outcome="finished"}} 1' in metrics.text
     )
