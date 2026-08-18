@@ -152,7 +152,7 @@ def create_serving_app(
     ttft_prediction_min_observations: int = 3,
     enable_self_resubmit: bool = False,
     max_self_resubmits: int = 2,
-    max_self_resubmit_recomputed_tokens: int = 4096,
+    self_resubmit_strict_fallback_recomputed_tokens: int = 4096,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -265,7 +265,9 @@ def create_serving_app(
             self_resubmit_policy=(
                 SelfResubmitPolicy(
                     max_resubmits=max_self_resubmits,
-                    max_recomputed_tokens=max_self_resubmit_recomputed_tokens,
+                    strict_fallback_recomputed_tokens=(
+                        self_resubmit_strict_fallback_recomputed_tokens
+                    ),
                 )
                 if enable_self_resubmit
                 else None
@@ -420,7 +422,7 @@ def _create_parser() -> argparse.ArgumentParser:
     resubmit.add_argument("--enable-self-resubmit", action="store_true")
     resubmit.add_argument("--max-self-resubmits", type=int, default=2)
     resubmit.add_argument(
-        "--max-self-resubmit-recomputed-tokens",
+        "--self-resubmit-strict-fallback-recomputed-tokens",
         type=int,
         default=4096,
     )
@@ -467,7 +469,9 @@ def main() -> None:
             ttft_prediction_min_observations=args.ttft_prediction_min_observations,
             enable_self_resubmit=args.enable_self_resubmit,
             max_self_resubmits=args.max_self_resubmits,
-            max_self_resubmit_recomputed_tokens=(args.max_self_resubmit_recomputed_tokens),
+            self_resubmit_strict_fallback_recomputed_tokens=(
+                args.self_resubmit_strict_fallback_recomputed_tokens
+            ),
         ),
         host=args.host,
         port=args.port,

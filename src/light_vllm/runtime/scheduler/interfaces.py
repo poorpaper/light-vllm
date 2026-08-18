@@ -63,20 +63,24 @@ class ShortRequestPolicy:
 
 @dataclass(frozen=True, slots=True)
 class SelfResubmitPolicy:
-    """KV 撞墙时只回滚当前请求，并为重算设置明确上限。
+    """KV 撞墙时只回滚当前请求，并限制重复回滚代价。
 
-    达到任一上限后，请求下一次准入会自动恢复 completion claim，
-    从而保证策略不会无限回滚。
+    达到回滚次数或累计重算阈值后，请求下一次准入会自动恢复
+    completion claim，从而保证策略不会无限回滚。最后一次回滚可能
+    跨过 token 阈值，因此该字段是 strict fallback 阈值，不是硬上限。
     """
 
     max_resubmits: int = 2
-    max_recomputed_tokens: int = 4096
+    strict_fallback_recomputed_tokens: int = 4096
 
     def __post_init__(self) -> None:
         if type(self.max_resubmits) is not int or self.max_resubmits <= 0:
             raise ValueError("max_resubmits must be a positive integer")
-        if type(self.max_recomputed_tokens) is not int or self.max_recomputed_tokens < 0:
-            raise ValueError("max_recomputed_tokens must be a non-negative integer")
+        if (
+            type(self.strict_fallback_recomputed_tokens) is not int
+            or self.strict_fallback_recomputed_tokens < 0
+        ):
+            raise ValueError("strict fallback token threshold must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +160,9 @@ class SchedulerStats:
     waiting_max_remaining_tokens: int
     running_max_remaining_tokens: int
     kv_cache: KVCacheStats
+    short_launch_requests: int = 0
+    self_resubmits_total: int = 0
+    self_resubmit_recomputed_tokens_total: int = 0
 
     def __post_init__(self) -> None:
         values = (
@@ -165,6 +172,9 @@ class SchedulerStats:
             self.running_pending_tokens,
             self.waiting_max_remaining_tokens,
             self.running_max_remaining_tokens,
+            self.short_launch_requests,
+            self.self_resubmits_total,
+            self.self_resubmit_recomputed_tokens_total,
         )
         if any(type(value) is not int or value < 0 for value in values):
             raise ValueError("scheduler statistics must be non-negative integers")

@@ -7,7 +7,12 @@ from threading import Event
 
 import pytest
 
-from light_vllm import GenerateRequest, GenerationError, GenerationOverloadedError
+from light_vllm import (
+    GenerateRequest,
+    GenerationError,
+    GenerationOverloadedError,
+    TokenGenerated,
+)
 from light_vllm.runtime.engine import (
     EngineCore,
     PredictiveTTFTAdmission,
@@ -23,7 +28,11 @@ from light_vllm.runtime.execution import (
 )
 from light_vllm.runtime.kv_cache import FixedKVBlockCapacity, PagedKVCacheManager
 from light_vllm.runtime.observability import InMemoryPerformanceObserver
-from light_vllm.runtime.scheduler import DecodingBudget, TokenBudgetScheduler
+from light_vllm.runtime.scheduler import (
+    DecodingBudget,
+    SelfResubmitPolicy,
+    TokenBudgetScheduler,
+)
 
 
 class _Lease:
@@ -268,6 +277,69 @@ def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
 
         assert executor.history == [((1, 2),), ((3,),), ((4,),)]
         assert result.generated_token_ids == (4, 5)
+        assert not executor.active
+
+    asyncio.run(run())
+
+
+def test_engine_self_resubmit_preserves_visible_history_and_releases_kv() -> None:
+    async def run() -> None:
+        executor = RecordingExecutor(block_first_step=True)
+        kv_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1))
+        scheduler = TokenBudgetScheduler(
+            kv_cache,
+            max_num_sequences=2,
+            max_num_scheduled_tokens=1,
+            self_resubmit_policy=SelfResubmitPolicy(
+                max_resubmits=1,
+                strict_fallback_recomputed_tokens=100,
+            ),
+        )
+        engine = EngineCore(executor, scheduler)
+
+        async def collect(request: GenerateRequest):
+            return [event async for event in engine.stream(request)]
+
+        first = asyncio.create_task(collect(GenerateRequest(input_ids=(1,), max_new_tokens=4)))
+        try:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(executor.first_step_started.wait, 1.0),
+                timeout=1.5,
+            )
+            second = asyncio.create_task(
+                collect(GenerateRequest(input_ids=(10,), max_new_tokens=4))
+            )
+            for _ in range(100):
+                if len(executor.active) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(executor.active) == 2
+        finally:
+            executor.release_first_step.set()
+
+        first_events, second_events = await asyncio.wait_for(
+            asyncio.gather(first, second),
+            timeout=3.0,
+        )
+        await engine.close()
+
+        first_tokens = [event for event in first_events if isinstance(event, TokenGenerated)]
+        second_tokens = [event for event in second_events if isinstance(event, TokenGenerated)]
+        assert [(event.token_id, event.position) for event in first_tokens] == [
+            (2, 0),
+            (3, 1),
+            (4, 2),
+            (5, 3),
+        ]
+        assert [(event.token_id, event.position) for event in second_tokens] == [
+            (11, 0),
+            (12, 1),
+            (13, 2),
+            (14, 3),
+        ]
+        assert scheduler.stats.self_resubmits_total >= 1
+        assert kv_cache.num_free_blocks == 4
+        assert kv_cache.stats.claimed_token_slots == 0
         assert not executor.active
 
     asyncio.run(run())

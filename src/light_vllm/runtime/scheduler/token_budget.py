@@ -1,4 +1,4 @@
-"""FCFS token-budget Scheduler。"""
+"""带短请求保护和可选自回滚的分层 token-budget Scheduler。"""
 
 from __future__ import annotations
 
@@ -37,10 +37,11 @@ class _RequestState:
 
 
 class TokenBudgetScheduler:
-    """在固定 token budget 内按 FCFS 选择请求。
+    """在固定 token budget 内按资源池和轮转顺序选择请求。
 
     prompt 和输出 token 使用同一套计数。长 prompt 会自然拆成多个 chunk；
-    只有追上当前全部已知 token 时，执行侧才需要采样新 token。
+    只有追上当前全部已知 token 时，执行侧才需要采样新 token。短请求策略
+    关闭时，所有请求退化为一个通用池。
     """
 
     def __init__(
@@ -74,6 +75,8 @@ class TokenBudgetScheduler:
         self._common_order: deque[str] = deque()
         self._states: dict[str, _RequestState] = {}
         self._resubmitted_in_step: list[str] = []
+        self._self_resubmits_total = 0
+        self._self_resubmit_recomputed_tokens_total = 0
 
     @property
     def has_requests(self) -> bool:
@@ -107,6 +110,9 @@ class TokenBudgetScheduler:
                 self._max_remaining_tokens(state) for state in self._running.values()
             ),
             kv_cache=self._kv_cache.stats,
+            short_launch_requests=len(self._short_launch_order),
+            self_resubmits_total=self._self_resubmits_total,
+            self_resubmit_recomputed_tokens_total=self._self_resubmit_recomputed_tokens_total,
         )
 
     def add(
@@ -166,12 +172,6 @@ class TokenBudgetScheduler:
             recovery.force_completion_claim = True
             self._waiting.remove(recovery_id)
             self._waiting.appendleft(recovery_id)
-            policy = self._short_request_policy
-            if policy is not None:
-                recovery.waiting_steps = max(
-                    recovery.waiting_steps,
-                    policy.regular_aging_steps,
-                )
             classifications = self._classify_waiting_requests()
             self._admit_waiting_requests(classifications)
             scheduled = self._schedule_admitted_requests()
@@ -471,6 +471,8 @@ class TokenBudgetScheduler:
 
         state.num_resubmits += 1
         state.num_recomputed_tokens += state.num_computed_tokens
+        self._self_resubmits_total += 1
+        self._self_resubmit_recomputed_tokens_total += state.num_computed_tokens
         state.num_computed_tokens = 0
         state.kv_attached = False
         state.is_short = False
@@ -481,12 +483,9 @@ class TokenBudgetScheduler:
         assert policy is not None
         if (
             state.num_resubmits >= policy.max_resubmits
-            or state.num_recomputed_tokens >= policy.max_recomputed_tokens
+            or state.num_recomputed_tokens >= policy.strict_fallback_recomputed_tokens
         ):
             state.force_completion_claim = True
-        short_policy = self._short_request_policy
-        if short_policy is not None:
-            state.waiting_steps = max(state.waiting_steps, short_policy.regular_aging_steps)
         self._waiting.append(request_id)
         self._resubmitted_in_step.append(request_id)
 

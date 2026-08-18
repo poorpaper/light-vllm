@@ -120,6 +120,7 @@ def test_short_request_reserve_runs_beside_a_long_prefill() -> None:
 
     output = scheduler.schedule()
 
+    assert scheduler.stats.short_launch_requests == 1
     assert [
         (item.request_id, item.num_scheduled_tokens, item.max_output_tokens)
         for item in output.requests
@@ -131,6 +132,7 @@ def test_short_request_reserve_runs_beside_a_long_prefill() -> None:
             num_committed_tokens=item.num_scheduled_tokens,
             num_new_tokens=1,
         )
+    assert scheduler.stats.short_launch_requests == 0
 
     # 首 token 之后短请求只能进入通用池，不能继续占用预留池。
     assert scheduler.schedule().request_ids == ("long",)
@@ -279,7 +281,7 @@ def test_self_resubmit_recomputes_without_reemitting_and_then_falls_back_to_stri
         max_num_scheduled_tokens=1,
         self_resubmit_policy=SelfResubmitPolicy(
             max_resubmits=1,
-            max_recomputed_tokens=100,
+            strict_fallback_recomputed_tokens=100,
         ),
     )
     scheduler.add("a", token_ids=(1,), max_num_tokens=4)
@@ -294,6 +296,8 @@ def test_self_resubmit_recomputes_without_reemitting_and_then_falls_back_to_stri
     collision = scheduler.schedule()
     assert collision.request_ids == ("b",)
     assert scheduler.stats.waiting_requests == 1
+    assert scheduler.stats.self_resubmits_total == 1
+    assert scheduler.stats.self_resubmit_recomputed_tokens_total == 2
     scheduler.complete("b", num_committed_tokens=1, num_new_tokens=1)
     scheduler.remove("b")
 
@@ -303,6 +307,47 @@ def test_self_resubmit_recomputes_without_reemitting_and_then_falls_back_to_stri
     assert recompute.max_output_tokens == 0
     # 已达 resubmit 上限，a 重新准入时恢复了 completion claim。
     assert scheduler.stats.kv_cache.claimed_token_slots == 2
+
+
+def test_self_resubmit_does_not_borrow_short_headroom_without_real_aging() -> None:
+    scheduler = TokenBudgetScheduler(
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=3, block_size=1)),
+        max_num_sequences=3,
+        max_num_scheduled_tokens=2,
+        short_request_policy=_short_policy(
+            max_effective_prompt_tokens=1,
+            max_total_tokens=2,
+            reserved_scheduled_tokens=1,
+            reserved_kv_token_slots=1,
+            regular_aging_steps=10,
+        ),
+        self_resubmit_policy=SelfResubmitPolicy(
+            max_resubmits=1,
+            strict_fallback_recomputed_tokens=100,
+        ),
+    )
+    scheduler.add("a", token_ids=(1,), max_num_tokens=4)
+    scheduler.add("b", token_ids=(2,), max_num_tokens=4)
+
+    for request_id in ("a", "b"):
+        output = scheduler.schedule()
+        assert output.request_ids == (request_id,)
+        scheduler.complete(request_id, num_committed_tokens=1, num_new_tokens=1)
+
+    # a 撞墙并回滚，b 使用空出的页完成；回滚本身不能伪造等待年龄。
+    collision = scheduler.schedule()
+    assert collision.request_ids == ("b",)
+    assert scheduler.stats.self_resubmits_total == 1
+    scheduler.complete("b", num_committed_tokens=1, num_new_tokens=1)
+    scheduler.remove("b")
+    scheduler.add("short", token_ids=(9,), max_num_tokens=2)
+
+    output = scheduler.schedule()
+
+    # short 先取得严格 claim；b 只能继续等，不能借 aging 绕过预留水位。
+    assert output.request_ids == ("short",)
+    assert scheduler.stats.running_requests == 1
+    assert scheduler.stats.waiting_requests == 1
 
 
 def test_scheduler_rejects_duplicate_request_ids() -> None:
