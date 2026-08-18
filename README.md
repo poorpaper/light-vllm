@@ -47,7 +47,7 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `ReferenceGenerationService`：以 token event stream 为唯一路径的最小生成参考实现。
 - `InProcessEngineClient`：把同步 reference 实现适配为稳定的异步 serving 端口。
 - `EngineCore`：按 `schedule -> execute -> update` 驱动异步请求与事件流。
-- `TokenBudgetScheduler`：统一规划 prompt、chunked prefill 与 decode 的 token 数。
+- `TokenBudgetScheduler`：统一规划 prompt、chunked prefill 与 decode，并可组合短请求资源池和 self-resubmit。
 - `PagedKVCacheManager`：管理逻辑 block 的预留、提交、回滚和释放。
 - `LocalModelExecutor` / `LocalModelWorker`：把本地执行拓扑、模型版本和具体计算能力分开。
 - `LocalModelWorker`：固定当前模型版本和请求生命周期，并组合 Step / Decode Handler。
@@ -56,6 +56,7 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `StandardDecodeHandler`：处理普通 prefill 和单 token decode。
 - `NGramSpeculativeDecodeHandler`：从当前请求历史提出候选，由同一个目标模型一次验证，不新增 Worker。
 - `PerformanceObserver`：在统一 Engine 边界记录 TTFT、可见 token 间隔、step 延迟、队列与 KV 使用率。
+- `PredictiveTTFTAdmission`：用真实 step 延迟滑窗预测排队 TTFT，并在超过全局 SLO 时早拒。
 - `GreedySampler`：独立于 Executor 的贪心采样策略。
 - FastAPI adapter：生成路由只依赖 `EngineClient`，`/metrics` 只依赖独立的性能快照读取端口。
 
@@ -178,6 +179,39 @@ backend 因此保持为 `torch`。
 无 Paged Attention 的请求级连续 tensor 路径，主要用于测试和结果对照，不是生产容量保护机制。两种 Handler
 都只读取模型的 `ModelKVCacheSpec`，装配层不重复填写 K/V 形状。
 
+### 非抢占调度与 TTFT 保护
+
+分页 KV 默认使用严格非抢占准入：请求进入 running 前领取覆盖其最大可提交长度的 completion claim，之后不会
+因为其他请求占满 KV 而被挑作 victim。可以同时启用短请求资源池与 TTFT 早拒：
+
+```bash
+light-vllm-serve \
+  --architecture tiny-attention-causal-lm \
+  --runtime engine \
+  --kv-reservation blocks \
+  --num-kv-blocks 128 \
+  --kv-block-size 16 \
+  --max-num-sequences 8 \
+  --max-num-scheduled-tokens 256 \
+  --short-request-max-effective-prompt-tokens 32 \
+  --short-request-max-total-tokens 64 \
+  --short-request-reserved-scheduled-tokens 32 \
+  --short-request-reserved-kv-token-slots 63 \
+  --short-request-reserved-sequences 1 \
+  --regular-request-aging-steps 8 \
+  --max-tolerable-ttft-seconds 1.5
+```
+
+短请求按 prefix 命中后的有效 prompt 和最大总长度分类；scheduled token、KV slot 和 sequence 都有独立预留。
+首次 token 可见后，请求回到通用 round-robin。常规请求等待达到 aging 阈值后可以借用 KV 水位，避免饥饿。
+TTFT 预测使用 `新 prompt + waiting pending + running pending`，由每个真实 step 的滑窗延迟持续更新；样本不足时
+放行。确定性容量不足返回 422，预测超过 SLO 返回可重试的 429。
+
+实验性 `--enable-self-resubmit` 会允许常规请求 best-effort 使用 KV；撞墙者只释放自己的 KV 并从 PREFILL 重算，
+不会回滚第三方，也不会重复输出已经可见的 token。它默认关闭且仅支持 `blocks`。可用
+`--max-self-resubmits` 和 `--self-resubmit-strict-fallback-recomputed-tokens` 控制何时恢复严格 completion claim，
+从而给活锁一个有界退出路径。
+
 当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
 
 ```bash
@@ -204,9 +238,9 @@ curl -N -X POST http://127.0.0.1:8000/generate/stream \
 curl http://127.0.0.1:8000/metrics
 ```
 
-它包含 TTFT、可见 token 间隔、真实完成的 step 延迟、waiting/running 请求、两种 token backlog、KV cache
-使用率和 token 吞吐。`pending_tokens` 只统计当前已知输入；`max_remaining_tokens` 还包含最大输出预算，适合
-保守扩缩容，二者不会混用。
+它包含 TTFT、可见 token 间隔、真实完成的 step 延迟、waiting/running 请求、短请求首 token lane、两种 token
+backlog、KV cache 使用率/claim、self-resubmit 重算代价、准入拒绝和 token 吞吐。`pending_tokens` 只统计当前
+已知输入；`max_remaining_tokens` 还包含最大输出预算，适合保守扩缩容，二者不会混用。
 指标来自同一套 Engine/Scheduler/KV 事实，与 `qwen2`、`qwen2.5` 或具体模型尺寸无关；`reference`
 runtime 没有 Scheduler 和固定 KV 容量，因此不伪造这些指标。
 
@@ -238,5 +272,5 @@ catalog.loaders.register("my-format", my_loader)
 当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback、独立 Greedy
 Sampler、原生 Qwen2 子集、整页 prefix cache、简单 n-gram 投机解码、PyTorch Paged Attention correctness backend
 和可选的首版 Triton fused attention。Tokenizer、文本 prompt、随机 sampling、经过长上下文调优和跨显卡验收的
-生产级 attention kernel、preemption、分布式执行和 OpenAI-compatible API 仍是后续能力。多进程实现将新增
+生产级 attention kernel、第三方 victim preemption、分布式执行和 OpenAI-compatible API 仍是后续能力。多进程实现将新增
 `EngineClient` / Worker 拓扑，而不改 HTTP。
