@@ -19,6 +19,10 @@ class GenerationRejectedError(GenerationError):
     """请求超出当前引擎明确能力时抛出。"""
 
 
+class GenerationOverloadedError(GenerationError):
+    """请求可执行，但当前负载预计无法满足延迟 SLO。"""
+
+
 @dataclass(frozen=True, slots=True)
 class GenerateRequest:
     """一次生成请求，创建后不能修改。"""

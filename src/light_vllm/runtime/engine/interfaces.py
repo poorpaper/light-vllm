@@ -9,6 +9,8 @@ from light_vllm.runtime.generation.interfaces import (
     GenerateResult,
     GenerationEvent,
 )
+from light_vllm.runtime.observability.interfaces import StepObservation
+from light_vllm.runtime.scheduler.interfaces import SchedulerStats
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +38,22 @@ class RequestAdmission(Protocol):
     """请求进入调度队列前，检查它是否可能被当前引擎处理。"""
 
     def validate(self, request: GenerateRequest, capabilities: EngineCapabilities) -> None: ...
+
+
+class StepLatencyPredictor(Protocol):
+    """根据待处理 token 量估计首 token 前的计算延迟。"""
+
+    def predict(self, num_pending_tokens: int) -> float | None: ...
+
+    def observe(self, observation: StepObservation) -> None: ...
+
+
+class TTFTAdmission(Protocol):
+    """依据实时调度负载做可选的 TTFT SLO 准入。"""
+
+    def validate(self, request: GenerateRequest, stats: SchedulerStats) -> None: ...
+
+    def step_completed(self, observation: StepObservation) -> None: ...
 
 
 class EngineClient(Protocol):

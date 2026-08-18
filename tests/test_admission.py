@@ -1,0 +1,73 @@
+import pytest
+
+from light_vllm.runtime.engine.admission import (
+    PredictiveTTFTAdmission,
+    SlidingWindowStepLatencyPredictor,
+)
+from light_vllm.runtime.generation import GenerateRequest, GenerationOverloadedError
+from light_vllm.runtime.kv_cache import KVCacheStats
+from light_vllm.runtime.observability import StepObservation
+from light_vllm.runtime.scheduler import SchedulerStats
+
+
+def _observe(
+    predictor: SlidingWindowStepLatencyPredictor,
+    tokens: int,
+    latency: float,
+) -> None:
+    predictor.observe(
+        StepObservation(
+            num_scheduled_tokens=tokens,
+            num_requests=1,
+            elapsed_seconds=latency,
+        )
+    )
+
+
+def _scheduler_stats(*, waiting_tokens: int, running_tokens: int) -> SchedulerStats:
+    return SchedulerStats(
+        waiting_requests=1,
+        running_requests=1,
+        waiting_pending_tokens=waiting_tokens,
+        running_pending_tokens=running_tokens,
+        waiting_max_remaining_tokens=waiting_tokens,
+        running_max_remaining_tokens=running_tokens,
+        kv_cache=KVCacheStats(),
+    )
+
+
+def test_step_latency_predictor_uses_window_interpolation_and_extrapolation() -> None:
+    predictor = SlidingWindowStepLatencyPredictor(window_size=2, min_observations=1)
+    for latency in (0.02, 0.04, 0.06):
+        _observe(predictor, 2, latency)
+    _observe(predictor, 6, 0.12)
+
+    assert predictor.predict(1) == pytest.approx(0.05)
+    assert predictor.predict(2) == pytest.approx(0.05)
+    assert predictor.predict(4) == pytest.approx(0.085)
+    assert predictor.predict(12) == pytest.approx(0.24)
+
+
+def test_step_latency_predictor_is_fail_open_until_warm() -> None:
+    predictor = SlidingWindowStepLatencyPredictor(min_observations=2)
+
+    _observe(predictor, 4, 0.1)
+    assert predictor.predict(4) is None
+    _observe(predictor, 4, 0.2)
+
+    assert predictor.predict(4) == pytest.approx(0.15)
+
+
+def test_predictive_ttft_admission_uses_prompt_plus_current_pending_tokens() -> None:
+    predictor = SlidingWindowStepLatencyPredictor(min_observations=1)
+    _observe(predictor, 9, 0.6)
+    admission = PredictiveTTFTAdmission(
+        predictor,
+        max_tolerable_ttft_seconds=0.5,
+    )
+
+    with pytest.raises(GenerationOverloadedError, match="predicted TTFT 0.600s"):
+        admission.validate(
+            GenerateRequest(input_ids=(1, 2), max_new_tokens=8),
+            _scheduler_stats(waiting_tokens=4, running_tokens=3),
+        )
