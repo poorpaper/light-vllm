@@ -161,10 +161,12 @@ class KVCacheManager(Protocol):
         max_num_committed_tokens: int,
         cache_epoch: int | None,
         min_free_token_slots: int = 0,
+        guarantee_completion: bool = True,
     ) -> KVCacheMatch | None:
-        """原子地固定 prefix 并为请求取得完成容量承诺。
+        """原子地固定 prefix，并按策略取得完成容量承诺。
 
         返回 ``None`` 表示暂时容量不足，manager 不得留下部分状态。
+        关闭完成承诺后，后续 ``reserve`` 可以因实时容量不足而失败。
         """
 
         ...
@@ -219,7 +221,8 @@ class _PrefixBlockKey:
 @dataclass(slots=True)
 class _LogicalAllocation:
     block_ids: list[int]
-    completion_block_limit: int
+    completion_block_limit: int | None
+    min_free_blocks: int = 0
     prompt_block_keys: tuple[_PrefixBlockKey, ...] = ()
     num_readonly_prefix_blocks: int = 0
     num_committed_tokens: int = 0
@@ -264,6 +267,7 @@ class UnboundedKVCacheManager:
         max_num_committed_tokens: int,
         cache_epoch: int | None,
         min_free_token_slots: int = 0,
+        guarantee_completion: bool = True,
     ) -> KVCacheMatch | None:
         if not request_id:
             raise ValueError("request_id must not be empty")
@@ -273,6 +277,8 @@ class UnboundedKVCacheManager:
             raise ValueError("max_num_committed_tokens must cover the prompt")
         if type(min_free_token_slots) is not int or min_free_token_slots < 0:
             raise ValueError("min_free_token_slots must be a non-negative integer")
+        if type(guarantee_completion) is not bool:
+            raise ValueError("guarantee_completion must be a boolean")
         if request_id in self._allocations:
             raise KVCacheError(f"KV cache for request {request_id!r} already exists")
         self._allocations[request_id] = _UnboundedAllocation()
@@ -384,6 +390,7 @@ class PagedKVCacheManager:
         max_num_committed_tokens: int,
         cache_epoch: int | None,
         min_free_token_slots: int = 0,
+        guarantee_completion: bool = True,
     ) -> KVCacheMatch | None:
         self._sync_capacity()
         if not request_id:
@@ -396,6 +403,8 @@ class PagedKVCacheManager:
             raise ValueError("max_num_committed_tokens must cover the prompt")
         if type(min_free_token_slots) is not int or min_free_token_slots < 0:
             raise ValueError("min_free_token_slots must be a non-negative integer")
+        if type(guarantee_completion) is not bool:
+            raise ValueError("guarantee_completion must be a boolean")
         if request_id in self._allocations:
             raise KVCacheError(f"KV cache for request {request_id!r} already exists")
         if self._enable_prefix_caching and (type(cache_epoch) is not int or cache_epoch < 0):
@@ -405,8 +414,12 @@ class PagedKVCacheManager:
         prompt_block_keys = self._prompt_block_keys(token_ids, cache_epoch)
         matched_blocks = self._matched_prompt_blocks(prompt_block_keys)
 
-        completion_block_limit = self._blocks_for(max_num_committed_tokens)
-        new_claims = completion_block_limit - len(matched_blocks)
+        completion_block_limit = (
+            self._blocks_for(max_num_committed_tokens) if guarantee_completion else None
+        )
+        new_claims = (
+            0 if completion_block_limit is None else completion_block_limit - len(matched_blocks)
+        )
         newly_pinned_blocks = sum(
             self._block_ref_counts[block_id] == 0 for block_id in matched_blocks
         )
@@ -430,6 +443,7 @@ class PagedKVCacheManager:
         self._allocations[request_id] = _LogicalAllocation(
             block_ids=matched_blocks,
             completion_block_limit=completion_block_limit,
+            min_free_blocks=min_free_blocks,
             prompt_block_keys=prompt_block_keys,
             num_readonly_prefix_blocks=len(matched_blocks),
             num_committed_tokens=num_cached_tokens,
@@ -450,9 +464,21 @@ class PagedKVCacheManager:
         target_tokens = allocation.num_committed_tokens + num_tokens
         target_blocks = self._blocks_for(target_tokens)
         new_block_count = target_blocks - len(allocation.block_ids)
-        available_claim = allocation.completion_block_limit - len(allocation.block_ids)
-        if new_block_count > available_claim:
-            raise KVCacheError(f"request {request_id!r} exceeded its KV completion claim")
+        if allocation.completion_block_limit is not None:
+            available_claim = allocation.completion_block_limit - len(allocation.block_ids)
+            if new_block_count > available_claim:
+                raise KVCacheError(f"request {request_id!r} exceeded its KV completion claim")
+        else:
+            assert self._num_blocks is not None
+            used_blocks = self._num_blocks - self.num_free_blocks
+            if (
+                used_blocks
+                + self._num_completion_claimed_blocks
+                + new_block_count
+                + allocation.min_free_blocks
+                > self._num_blocks
+            ):
+                raise KVCacheCapacityError("best-effort KV reservation reached its watermark")
 
         new_blocks: list[int] = []
         try:
@@ -463,7 +489,8 @@ class PagedKVCacheManager:
                 self._release_block(block_id)
             raise
         allocation.block_ids.extend(new_blocks)
-        self._num_completion_claimed_blocks -= new_block_count
+        if allocation.completion_block_limit is not None:
+            self._num_completion_claimed_blocks -= new_block_count
         allocation.num_reserved_tokens = num_tokens
         return KVCacheReservation(
             block_ids=tuple(allocation.block_ids),
@@ -488,9 +515,10 @@ class PagedKVCacheManager:
         allocation = self._allocations.pop(request_id, None)
         if allocation is None:
             return False
-        self._num_completion_claimed_blocks -= allocation.completion_block_limit - len(
-            allocation.block_ids
-        )
+        if allocation.completion_block_limit is not None:
+            self._num_completion_claimed_blocks -= allocation.completion_block_limit - len(
+                allocation.block_ids
+            )
         # 先释放复用概率更低的后缀，避免根页先被 LRU 淘汰后
         # 留下无法从根达到的子页。
         for block_id in reversed(allocation.block_ids):
@@ -501,7 +529,8 @@ class PagedKVCacheManager:
         keep = self._blocks_for(allocation.num_committed_tokens)
         released = allocation.block_ids[keep:]
         del allocation.block_ids[keep:]
-        self._num_completion_claimed_blocks += len(released)
+        if allocation.completion_block_limit is not None:
+            self._num_completion_claimed_blocks += len(released)
         for block_id in reversed(released):
             self._release_block(block_id)
 

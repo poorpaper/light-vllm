@@ -200,6 +200,35 @@ def test_partial_commit_turns_unused_blocks_back_into_completion_claims() -> Non
     assert manager.stats.claimed_token_slots == 0
 
 
+def test_best_effort_reservation_keeps_its_kv_watermark() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1))
+    _add_logical_request(
+        manager,
+        "guarded",
+        (1,),
+        max_num_committed_tokens=2,
+    )
+    admitted = manager.try_add_request(
+        "best-effort",
+        token_ids=(2,),
+        max_num_committed_tokens=4,
+        cache_epoch=1,
+        min_free_token_slots=1,
+        guarantee_completion=False,
+    )
+    assert admitted is not None
+    assert manager.stats.claimed_token_slots == 2
+
+    manager.reserve("best-effort", 1)
+    manager.commit("best-effort", 1)
+    with pytest.raises(KVCacheCapacityError, match="watermark"):
+        manager.reserve("best-effort", 1)
+
+    manager.free("guarded")
+    reservation = manager.reserve("best-effort", 1)
+    assert reservation.block_ids == (0, 1)
+
+
 def test_unbounded_manager_tracks_reservations_without_block_placement() -> None:
     manager = UnboundedKVCacheManager()
     _add_logical_request(manager, "request", (1, 2, 3))
