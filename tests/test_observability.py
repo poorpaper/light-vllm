@@ -147,6 +147,7 @@ def test_scheduler_snapshot_exposes_token_aware_queue_and_kv_usage() -> None:
     assert scheduled.waiting_max_remaining_tokens == 8
     assert scheduled.running_requests == 1
     assert scheduled.running_pending_tokens == 3
+    assert scheduled.current_pending_tokens == 5
     assert scheduled.running_max_remaining_tokens == 6
     assert scheduled.kv_cache.used_token_slots == 4
     assert scheduled.kv_cache.capacity_token_slots == 8
@@ -195,14 +196,14 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     observer.scheduler_updated(scheduler.stats)
     observer.step_completed(
         StepObservation(
-            num_scheduled_tokens=2,
+            num_model_tokens_computed=2,
             num_requests=1,
             elapsed_seconds=0.02,
         )
     )
     observer.step_completed(
         StepObservation(
-            num_scheduled_tokens=7,
+            num_model_tokens_computed=7,
             num_requests=2,
             elapsed_seconds=0.04,
         )
@@ -222,11 +223,11 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     assert 'light_vllm_self_resubmit_rolled_back_tokens_total{model="qwen2"} 0' in response.text
     assert "light_vllm_time_to_first_token_seconds_bucket" in response.text
     assert (
-        'light_vllm_engine_step_seconds_count{model="qwen2",scheduled_tokens_le="2"} 1'
+        'light_vllm_engine_step_seconds_count{model="qwen2",model_tokens_computed_le="2"} 1'
         in response.text
     )
     assert (
-        'light_vllm_engine_step_seconds_count{model="qwen2",scheduled_tokens_le="8"} 1'
+        'light_vllm_engine_step_seconds_count{model="qwen2",model_tokens_computed_le="8"} 1'
         in response.text
     )
     assert response.text.count("# HELP light_vllm_engine_step_seconds ") == 1

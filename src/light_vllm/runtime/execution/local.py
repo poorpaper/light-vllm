@@ -143,5 +143,6 @@ class LocalModelExecutor:
         output, elapsed_seconds = self._timer.measure(lambda: self._worker.execute(batch))
         return ExecutionOutput(
             requests=output.requests,
+            num_model_tokens_computed=output.num_model_tokens_computed,
             step_elapsed_seconds=elapsed_seconds,
         )

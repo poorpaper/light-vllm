@@ -194,14 +194,16 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
     )
     for index, step in enumerate(snapshot.step_latency):
         token_bucket = (
-            str(step.max_scheduled_tokens) if step.max_scheduled_tokens is not None else "+Inf"
+            str(step.max_model_tokens_computed)
+            if step.max_model_tokens_computed is not None
+            else "+Inf"
         )
         _histogram(
             lines,
             "light_vllm_engine_step_seconds",
-            "Completed device-step latency grouped by scheduled-token upper bound.",
+            "Completed device-step latency grouped by actual model-token upper bound.",
             step.latency,
-            labels={**labels, "scheduled_tokens_le": token_bucket},
+            labels={**labels, "model_tokens_computed_le": token_bucket},
             include_metadata=index == 0,
         )
     _metric(

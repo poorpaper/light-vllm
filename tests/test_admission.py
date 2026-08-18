@@ -17,7 +17,7 @@ def _observe(
 ) -> None:
     predictor.observe(
         StepObservation(
-            num_scheduled_tokens=tokens,
+            num_model_tokens_computed=tokens,
             num_requests=1,
             elapsed_seconds=latency,
         )
@@ -93,6 +93,37 @@ def test_predictive_ttft_admission_uses_prompt_plus_current_pending_tokens() -> 
             GenerateRequest(input_ids=(1, 2), max_new_tokens=8),
             _scheduler_stats(waiting_tokens=4, running_tokens=3),
         )
+
+
+def test_predictive_ttft_admission_uses_global_current_work_not_future_outputs() -> None:
+    class RecordingPredictor:
+        def __init__(self) -> None:
+            self.inputs: list[int] = []
+
+        def predict(self, num_pending_tokens: int) -> None:
+            self.inputs.append(num_pending_tokens)
+            return None
+
+        def observe(self, observation: StepObservation) -> None:
+            return
+
+    predictor = RecordingPredictor()
+    admission = PredictiveTTFTAdmission(predictor, max_tolerable_ttft_seconds=0.5)
+    stats = SchedulerStats(
+        waiting_requests=3,
+        running_requests=300,
+        waiting_pending_tokens=8_000,
+        running_pending_tokens=300,
+        waiting_max_remaining_tokens=50_000,
+        running_max_remaining_tokens=100_000,
+        kv_cache=KVCacheStats(),
+    )
+
+    admission.validate(GenerateRequest(input_ids=(1, 2), max_new_tokens=4096), stats)
+
+    # 300 个 decode 各贡献当前 1 token，再与剩余 prefill 和新 prompt 全局求和。
+    assert stats.current_pending_tokens == 8_300
+    assert predictor.inputs == [8_302]
 
 
 def test_predictive_ttft_admission_does_not_average_away_a_slow_step() -> None:

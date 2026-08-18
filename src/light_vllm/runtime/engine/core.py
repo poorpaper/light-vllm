@@ -76,6 +76,12 @@ def _validated_output(batch: ExecutionBatch, output: ExecutionOutput) -> dict[st
     by_request_id = {result.request_id: result for result in output.requests}
     if set(by_request_id) != set(batch.request_ids):
         raise ExecutionError("model executor must return one result for every request")
+    min_model_tokens = sum(len(request.input_token_ids) for request in batch.requests)
+    max_model_tokens = sum(
+        len(request.input_token_ids) + request.num_lookahead_tokens for request in batch.requests
+    )
+    if not min_model_tokens <= output.num_model_tokens_computed <= max_model_tokens:
+        raise ExecutionError("executor reported model-token work outside its execution budget")
     for request in batch.requests:
         result = by_request_id[request.request_id]
         if result.num_input_tokens_computed != len(request.input_token_ids):
@@ -277,10 +283,7 @@ class EngineCore:
                     output = _validated_output(batch, raw_output)
                     if raw_output.step_elapsed_seconds is not None:
                         observation = StepObservation(
-                            num_scheduled_tokens=sum(
-                                len(request.input_token_ids) + request.num_lookahead_tokens
-                                for request in batch.requests
-                            ),
+                            num_model_tokens_computed=raw_output.num_model_tokens_computed,
                             num_requests=len(batch.requests),
                             elapsed_seconds=raw_output.step_elapsed_seconds,
                         )

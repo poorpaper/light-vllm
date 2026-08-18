@@ -64,7 +64,7 @@ class SlidingWindowStepLatencyPredictor:
             raise TypeError("observation must be StepObservation")
         with self._lock:
             samples = self._samples.setdefault(
-                observation.num_scheduled_tokens,
+                observation.num_model_tokens_computed,
                 deque(maxlen=self._window_size),
             )
             samples.append(observation.elapsed_seconds)
@@ -98,7 +98,11 @@ class SlidingWindowStepLatencyPredictor:
 
 
 class PredictiveTTFTAdmission:
-    """请求入队前，用当前 pending token 总量检查 TTFT SLO。"""
+    """请求入队前，用全系统当前 pending token 总量检查 TTFT SLO。
+
+    每个请求只贡献眼下尚未处理的已知输入，因此 prefill 贡献剩余
+    prompt，普通 decode 通常贡献 1；这里不把未来输出预算提前展开。
+    """
 
     def __init__(
         self,
@@ -112,9 +116,7 @@ class PredictiveTTFTAdmission:
         self._max_tolerable_ttft_seconds = max_tolerable_ttft_seconds
 
     def validate(self, request: GenerateRequest, stats: SchedulerStats) -> None:
-        pending_tokens = (
-            len(request.input_ids) + stats.waiting_pending_tokens + stats.running_pending_tokens
-        )
+        pending_tokens = len(request.input_ids) + stats.current_pending_tokens
         prediction = self._predictor.predict(pending_tokens)
         if prediction is not None and prediction > self._max_tolerable_ttft_seconds:
             raise GenerationOverloadedError(

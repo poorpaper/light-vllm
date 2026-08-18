@@ -204,9 +204,10 @@ light-vllm-serve \
 
 短请求按 prefix 命中后的有效 prompt 和最大总长度分类；scheduled token、KV slot 和 sequence 都有独立预留。
 首次 token 可见后，请求回到通用 round-robin。常规请求等待达到 aging 阈值后可以借用 KV 水位，避免饥饿。
-TTFT 预测使用 `新 prompt + waiting pending + running pending`，由每个真实 step 的滑窗延迟持续更新。默认取
-p90 并构造随 token 规模不下降的包络，可用 `--ttft-prediction-quantile` 调整；样本不足时放行。确定性容量不足
-返回 422，预测超过 SLO 返回可重试的 429。
+TTFT 预测使用 `新 prompt + waiting pending + running pending` 的全局当前工作量：prefill 贡献尚未计算的 prompt，
+普通 decode 通常贡献当前待算的 1 个 token，所有请求再统一求和；未来 `max_new_tokens` 不会提前展开。延迟表按
+每个 step 实际进入模型 forward 的 token 数更新，默认取 p90 并构造单调包络，可用
+`--ttft-prediction-quantile` 调整；样本不足时放行。确定性容量不足返回 422，预测超过 SLO 返回可重试的 429。
 
 实验性 `--enable-self-resubmit` 会允许常规请求 best-effort 使用 KV；撞墙者只释放自己的 KV 并从 PREFILL 重算，
 不会回滚第三方，也不会重复输出已经可见的 token。它默认关闭且仅支持 `blocks`。可用

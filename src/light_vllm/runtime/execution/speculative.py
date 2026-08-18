@@ -186,4 +186,9 @@ class NGramSpeculativeDecodeHandler:
                     num_cached_output_tokens=accepted.num_cached_output_tokens,
                 )
             )
-        return ExecutionOutput(requests=tuple(results))
+        return ExecutionOutput(
+            requests=tuple(results),
+            num_model_tokens_computed=sum(
+                len(request.input_token_ids) for request in verification_requests
+            ),
+        )

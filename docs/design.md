@@ -114,6 +114,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `GenerateRequest` / events | 协议无关的用户生成语义 |
 | `SchedulerOutput` | 本轮每请求 computed、scheduled、lookahead、输出预算和可选 block table |
 | `ExecutionBatch` | Engine 从请求状态切出的本轮真实 token |
+| `ExecutionOutput` | 每轮请求结果、实际进入模型 forward 的 token 数和可选设备耗时 |
 | `RequestOutput` | 每请求完成的输入计算量、零到多个确认输出与已缓存输出前缀 |
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
 | `ModelWorker` | 一个设备 rank 内固定模型版本并编排请求生命周期 |
@@ -177,8 +178,8 @@ sequenceDiagram
     P-->>D: token IDs
     D-->>W: RequestOutput
     W-->>X: RequestOutput(input, outputs, cached prefix)
-    X-->>E: ExecutionOutput
-    E->>T: StepObservation
+    X-->>E: ExecutionOutput(results + actual model tokens)
+    E->>T: StepObservation(actual model tokens + latency)
     E->>O: 同一 StepObservation
     E->>S: complete(committed, visible outputs)
     S->>K: commit(input + cached output prefix)
@@ -253,8 +254,9 @@ session；`LocalModelWorker` 初始化时也固定一次 session。reload 只替
 `regular_aging_steps` 的常规请求可借用短请求 KV 水位，避免持续短流量造成饥饿。
 
 可选 `PredictiveTTFTAdmission` 在请求进入队列前估算
-`prompt_len + waiting_pending_tokens + running_pending_tokens` 对应的 step 延迟。预测器按 scheduled-token 规模保存
-真实 step 延迟滑窗。每个桶默认取 p90，并构造随 token 规模不下降的包络；在已知桶之间插值，对更大负载按比例
+`prompt_len + waiting_pending_tokens + running_pending_tokens` 的全局当前工作量。prefill 贡献剩余 prompt，普通
+decode 通常贡献当前 1 个 token，未来输出预算不提前展开；预测器按实际进入模型 forward 的 token 数保存真实
+step 延迟滑窗。每个桶默认取 p90，并构造随 token 规模不下降的包络；在已知桶之间插值，对更大负载按比例
 外推，样本不足时 fail-open。预测超过全局 SLO 时 HTTP 返回可重试的 429，确定性容量拒绝仍是 422。预测器是
 会反向影响准入的控制组件，不能塞进只读
 `PerformanceObserver`；Engine 把同一个 `StepObservation` 显式喂给两者。
@@ -298,7 +300,7 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 
 观测只建立在已经生效的事实上：请求成功加入 Executor 和 Scheduler 后开始计时；输出通过校验并成为可见
 token 时记录 TTFT/可见 token 间隔；请求完成、失败或取消时记录结果。Scheduler 分开提供已知 pending 输入和
-包含最大输出预算的保守 backlog；Executor 报告按 scheduled-token 桶聚合的已完成 step 延迟。Qwen2、Qwen2.5、
+包含最大输出预算的保守 backlog；Executor 报告按实际模型 token 桶聚合的已完成 step 延迟。Qwen2、Qwen2.5、
 投机解码和普通解码复用同一路径。
 
 控制面还公开短请求首 token lane 当前请求数、KV completion claim、self-resubmit 次数与回滚的已计算进度，

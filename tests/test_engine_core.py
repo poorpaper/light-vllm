@@ -108,7 +108,14 @@ class RecordingExecutor:
                     ),
                 )
             )
-        return ExecutionOutput(requests=tuple(results))
+        return ExecutionOutput(
+            requests=tuple(results),
+            num_model_tokens_computed=sum(
+                len(request.input_token_ids)
+                + (1 if self.multiple_tokens and request.num_lookahead_tokens else 0)
+                for request in batch.requests
+            ),
+        )
 
 
 def _engine(
@@ -151,6 +158,7 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
             output = super().execute(batch)
             return ExecutionOutput(
                 requests=output.requests,
+                num_model_tokens_computed=output.num_model_tokens_computed,
                 step_elapsed_seconds=0.2,
             )
 
@@ -169,7 +177,7 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
         assert snapshot.time_to_first_token.total == pytest.approx(0.2)
         assert snapshot.inter_token_latency.total == pytest.approx(0.2)
         assert len(snapshot.step_latency) == 1
-        assert snapshot.step_latency[0].max_scheduled_tokens == 1
+        assert snapshot.step_latency[0].max_model_tokens_computed == 1
         assert snapshot.step_latency[0].latency.count == 2
         assert snapshot.step_latency[0].latency.total == pytest.approx(0.4)
         assert snapshot.prompt_tokens_total == 1
@@ -187,6 +195,7 @@ def test_engine_rejects_overload_after_step_predictor_warms_up() -> None:
             output = super().execute(batch)
             return ExecutionOutput(
                 requests=output.requests,
+                num_model_tokens_computed=output.num_model_tokens_computed,
                 step_elapsed_seconds=0.2,
             )
 
@@ -227,7 +236,11 @@ def test_ttft_predictor_failure_disables_early_rejection_without_failing_generat
     class TimedExecutor(RecordingExecutor):
         def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
             output = super().execute(batch)
-            return ExecutionOutput(requests=output.requests, step_elapsed_seconds=0.2)
+            return ExecutionOutput(
+                requests=output.requests,
+                num_model_tokens_computed=output.num_model_tokens_computed,
+                step_elapsed_seconds=0.2,
+            )
 
     async def run() -> None:
         executor = TimedExecutor()
@@ -468,6 +481,7 @@ def test_execution_failure_is_delivered_to_the_request() -> None:
         ("too_many_outputs", "more tokens than the execution budget"),
         ("cached_beyond_lookahead", "cached more output tokens"),
         ("wrong_boundary", "wrong scheduling boundary"),
+        ("model_tokens", "model-token work outside"),
     ],
 )
 def test_engine_rejects_invalid_multi_token_execution_facts(
@@ -480,6 +494,7 @@ def test_engine_rejects_invalid_multi_token_execution_facts(
             computed = len(request.input_token_ids)
             outputs: tuple[int, ...] = (2, 3)
             cached = 1
+            model_tokens = len(request.input_token_ids) + request.num_lookahead_tokens
             if case == "computed":
                 computed += 1
             elif case == "too_many_outputs":
@@ -489,6 +504,8 @@ def test_engine_rejects_invalid_multi_token_execution_facts(
             elif case == "wrong_boundary":
                 outputs = ()
                 cached = 0
+            elif case == "model_tokens":
+                model_tokens += 1
             return ExecutionOutput(
                 requests=(
                     RequestOutput(
@@ -497,7 +514,8 @@ def test_engine_rejects_invalid_multi_token_execution_facts(
                         output_token_ids=outputs,
                         num_cached_output_tokens=cached,
                     ),
-                )
+                ),
+                num_model_tokens_computed=model_tokens,
             )
 
     async def run() -> None:

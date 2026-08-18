@@ -149,8 +149,9 @@ class SchedulerOutput:
 class SchedulerStats:
     """Scheduler 对观测面公开的不可变负载快照。
 
-    pending tokens 只统计当前已知但尚未计算的输入；max remaining tokens
-    还包含请求允许生成的最大输出，是适合 HPA 的保守工作量上界。
+    pending tokens 只统计所有请求当前已知但尚未计算的输入：prefill
+    贡献剩余 prompt，普通 decode 通常贡献当前待算的 1 个 token。
+    max remaining tokens 还包含最大输出预算，是适合 HPA 的保守上界。
     """
 
     waiting_requests: int
@@ -178,6 +179,12 @@ class SchedulerStats:
         )
         if any(type(value) is not int or value < 0 for value in values):
             raise ValueError("scheduler statistics must be non-negative integers")
+
+    @property
+    def current_pending_tokens(self) -> int:
+        """返回全系统当前待处理工作，不把未来输出预算提前算入 TTFT。"""
+
+        return self.waiting_pending_tokens + self.running_pending_tokens
 
 
 class Scheduler(Protocol):

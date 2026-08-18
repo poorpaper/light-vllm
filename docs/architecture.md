@@ -245,10 +245,10 @@ model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`�
 HTTP 通过 `/capabilities` 展示这些事实，不再硬编码 prompt 长度。
 
 `CapacityAdmission` 只拒绝“即使引擎空闲也不可能完成”的请求。可选 `PredictiveTTFTAdmission` 使用
-`prompt + waiting pending + running pending` 和真实 step 延迟的保守分位数滑窗动态早拒，并对 token 规模构造
-单调包络：样本不足时 fail-open，超过全局 SLO 时由 HTTP 表达为 429。预测器会改变准入结果，因此是独立控制
-组件；`PerformanceObserver` 仍然只读。Engine 在
-step 完成后把同一个 `StepObservation` 显式交给二者。
+`prompt + waiting pending + running pending` 的全局当前工作量动态早拒：prefill 贡献剩余 prompt，普通 decode
+通常贡献当前 1 个 token，不提前展开未来输出预算。延迟表按实际进入模型 forward 的 token 数更新并构造单调包络；
+样本不足时 fail-open，超过全局 SLO 时由 HTTP 表达为 429。预测器会改变准入结果，因此是独立控制组件；
+`PerformanceObserver` 仍然只读。Engine 在 step 完成后把同一个 `StepObservation` 显式交给二者。
 
 默认路径不挑选第三方 victim。分页请求准入时领取覆盖最大可提交长度的 completion claim，逻辑管理器保持
 `used unique blocks + claims <= capacity`。可选 self-resubmit 只让常规请求 best-effort 使用 KV；撞墙者释放自己

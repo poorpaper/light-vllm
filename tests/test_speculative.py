@@ -125,7 +125,8 @@ def test_speculative_handler_verifies_and_truncates_the_draft_tail(
     )
     step = _TargetStep(targets, original_input_length=2)
 
-    result = handler.execute(object(), ExecutionBatch(requests=(request,)), step).requests[0]
+    output = handler.execute(object(), ExecutionBatch(requests=(request,)), step)
+    result = output.requests[0]
 
     assert result.output_token_ids == expected_outputs
     assert result.num_cached_output_tokens == expected_cached
@@ -135,3 +136,4 @@ def test_speculative_handler_verifies_and_truncates_the_draft_tail(
     assert verification.input_token_ids == (4, 5) + drafts
     assert verification.context_token_ids == (1, 2, 4, 5) + drafts
     assert verification.num_lookahead_tokens == 2 - len(drafts)
+    assert output.num_model_tokens_computed == len(request.input_token_ids) + len(drafts)

@@ -45,15 +45,15 @@ class HistogramSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class StepObservation:
-    """一个已经完成的设备步骤及其调度规模。"""
+    """一个已经完成的设备步骤及其真实模型计算规模。"""
 
-    num_scheduled_tokens: int
+    num_model_tokens_computed: int
     num_requests: int
     elapsed_seconds: float
 
     def __post_init__(self) -> None:
-        if type(self.num_scheduled_tokens) is not int or self.num_scheduled_tokens <= 0:
-            raise ValueError("num_scheduled_tokens must be a positive integer")
+        if type(self.num_model_tokens_computed) is not int or self.num_model_tokens_computed <= 0:
+            raise ValueError("num_model_tokens_computed must be a positive integer")
         if type(self.num_requests) is not int or self.num_requests <= 0:
             raise ValueError("num_requests must be a positive integer")
         if not isfinite(self.elapsed_seconds) or self.elapsed_seconds < 0:
@@ -62,16 +62,16 @@ class StepObservation:
 
 @dataclass(frozen=True, slots=True)
 class StepLatencySnapshot:
-    """同一 scheduled-token 桶内的 step 延迟分布。"""
+    """同一实际模型 token 桶内的 step 延迟分布。"""
 
-    max_scheduled_tokens: int | None
+    max_model_tokens_computed: int | None
     latency: HistogramSnapshot
 
     def __post_init__(self) -> None:
-        if self.max_scheduled_tokens is not None and (
-            type(self.max_scheduled_tokens) is not int or self.max_scheduled_tokens <= 0
+        if self.max_model_tokens_computed is not None and (
+            type(self.max_model_tokens_computed) is not int or self.max_model_tokens_computed <= 0
         ):
-            raise ValueError("max_scheduled_tokens must be positive or None")
+            raise ValueError("max_model_tokens_computed must be positive or None")
 
 
 @dataclass(frozen=True, slots=True)

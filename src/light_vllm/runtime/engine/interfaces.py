@@ -41,7 +41,7 @@ class RequestAdmission(Protocol):
 
 
 class StepLatencyPredictor(Protocol):
-    """根据待处理 token 量估计首 token 前的计算延迟。"""
+    """用真实模型计算样本，根据全局当前待处理 token 估计首 token 延迟。"""
 
     def predict(self, num_pending_tokens: int) -> float | None: ...
 

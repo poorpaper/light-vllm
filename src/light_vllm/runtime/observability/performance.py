@@ -165,7 +165,11 @@ class InMemoryPerformanceObserver:
         if not isinstance(observation, StepObservation):
             raise TypeError("observation must be StepObservation")
         bucket = next(
-            (bound for bound in _STEP_TOKEN_BOUNDS if observation.num_scheduled_tokens <= bound),
+            (
+                bound
+                for bound in _STEP_TOKEN_BOUNDS
+                if observation.num_model_tokens_computed <= bound
+            ),
             None,
         )
         with self._lock:
@@ -181,7 +185,7 @@ class InMemoryPerformanceObserver:
                 inter_token_latency=self._inter_token_latency.snapshot(),
                 step_latency=tuple(
                     StepLatencySnapshot(
-                        max_scheduled_tokens=bucket,
+                        max_model_tokens_computed=bucket,
                         latency=histogram.snapshot(),
                     )
                     for bucket, histogram in sorted(

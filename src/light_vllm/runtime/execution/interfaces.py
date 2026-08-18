@@ -170,9 +170,14 @@ class RequestOutput:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionOutput:
-    """一次模型执行中每个请求的独立结果与设备完成耗时。"""
+    """一次模型执行的请求结果、实际模型计算量与设备完成耗时。
+
+    ``num_model_tokens_computed`` 统计真正送入模型 forward 的 query token；
+    投机 lookahead 只预留位置，proposer 未实际产出的部分不能计入该值。
+    """
 
     requests: tuple[RequestOutput, ...]
+    num_model_tokens_computed: int
     step_elapsed_seconds: float | None = None
 
     def __post_init__(self) -> None:
@@ -182,6 +187,8 @@ class ExecutionOutput:
             raise ValueError("execution output must not be empty")
         if len(set(request_ids)) != len(request_ids):
             raise ValueError("execution output request IDs must be unique")
+        if type(self.num_model_tokens_computed) is not int or self.num_model_tokens_computed <= 0:
+            raise ValueError("num_model_tokens_computed must be a positive integer")
         if self.step_elapsed_seconds is not None and (
             not isfinite(self.step_elapsed_seconds) or self.step_elapsed_seconds < 0
         ):
