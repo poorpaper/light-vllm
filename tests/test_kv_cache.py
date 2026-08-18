@@ -85,9 +85,29 @@ def _tiny_dense_forward(model, token_ids: tuple[int, ...], *, past=None):
     return output, attention
 
 
+def _add_logical_request(
+    manager,
+    request_id: str,
+    token_ids: tuple[int, ...],
+    *,
+    cache_epoch: int = 1,
+    max_num_committed_tokens: int | None = None,
+):
+    """测试辅助：准入一个确定能放下的逻辑 KV 请求。"""
+
+    admission = manager.try_add_request(
+        request_id,
+        token_ids=token_ids,
+        max_num_committed_tokens=max_num_committed_tokens or len(token_ids),
+        cache_epoch=cache_epoch,
+    )
+    assert admission is not None
+    return admission
+
+
 def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
     manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=3, block_size=2))
-    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
+    _add_logical_request(manager, "request", (1, 2, 3))
 
     first = manager.reserve("request", 3)
     assert first.block_ids == (0, 1)
@@ -106,18 +126,83 @@ def test_logical_blocks_support_reserve_commit_and_rollback() -> None:
     assert manager.num_free_blocks == 3
 
 
-def test_logical_reservation_is_atomic_when_capacity_is_insufficient() -> None:
+def test_logical_admission_is_atomic_when_completion_capacity_is_insufficient() -> None:
     manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=1, block_size=2))
-    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
+    admission = manager.try_add_request(
+        "request",
+        token_ids=(1, 2, 3),
+        max_num_committed_tokens=3,
+        cache_epoch=1,
+    )
 
-    with pytest.raises(KVCacheCapacityError):
-        manager.reserve("request", 3)
+    assert admission is None
     assert manager.num_free_blocks == 1
+    assert manager.stats.claimed_token_slots == 0
+
+
+def test_completion_claim_keeps_an_admitted_request_progressing() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=6, block_size=1))
+    _add_logical_request(
+        manager,
+        "running",
+        (1,),
+        max_num_committed_tokens=4,
+    )
+
+    blocked = manager.try_add_request(
+        "waiting",
+        token_ids=(2,),
+        max_num_committed_tokens=3,
+        cache_epoch=1,
+    )
+
+    assert blocked is None
+    assert manager.stats.claimed_token_slots == 4
+    reservation = manager.reserve("running", 4)
+    assert reservation.block_ids == (0, 1, 2, 3)
+    manager.commit("running", 4)
+    assert manager.stats.used_token_slots == 4
+    assert manager.stats.claimed_token_slots == 0
+
+    manager.free("running")
+    assert (
+        manager.try_add_request(
+            "waiting",
+            token_ids=(2,),
+            max_num_committed_tokens=3,
+            cache_epoch=1,
+        )
+        is not None
+    )
+
+
+def test_partial_commit_turns_unused_blocks_back_into_completion_claims() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=3, block_size=1))
+    _add_logical_request(
+        manager,
+        "request",
+        (1,),
+        max_num_committed_tokens=3,
+    )
+    assert manager.stats.claimed_token_slots == 3
+
+    manager.reserve("request", 3)
+    assert manager.stats.used_token_slots == 3
+    assert manager.stats.claimed_token_slots == 0
+
+    manager.commit("request", 1)
+    assert manager.stats.used_token_slots == 1
+    assert manager.stats.claimed_token_slots == 2
+    assert manager.stats.used_token_slots + manager.stats.claimed_token_slots == 3
+
+    manager.free("request")
+    assert manager.stats.used_token_slots == 0
+    assert manager.stats.claimed_token_slots == 0
 
 
 def test_unbounded_manager_tracks_reservations_without_block_placement() -> None:
     manager = UnboundedKVCacheManager()
-    manager.add_request("request", token_ids=(1, 2, 3), cache_epoch=1)
+    _add_logical_request(manager, "request", (1, 2, 3))
 
     first = manager.reserve("request", 3)
     assert first.block_ids is None
@@ -140,17 +225,13 @@ def test_prefix_cache_reuses_only_committed_full_prompt_blocks() -> None:
         enable_prefix_caching=True,
     )
     tokens = (1, 2, 3, 4, 5)
-    assert manager.add_request("warm", token_ids=tokens, cache_epoch=1).num_cached_tokens == 0
+    assert _add_logical_request(manager, "warm", tokens).num_cached_tokens == 0
     warm = manager.reserve("warm", len(tokens))
     manager.commit("warm", len(tokens))
     assert warm.block_ids == (0, 1, 2)
     assert manager.free("warm")
 
-    match = manager.add_request(
-        "hit",
-        token_ids=(1, 2, 3, 4, 9),
-        cache_epoch=1,
-    )
+    match = _add_logical_request(manager, "hit", (1, 2, 3, 4, 9))
     assert match.num_cached_tokens == 4
     reservation = manager.reserve("hit", 1)
     assert reservation.block_ids[:2] == (0, 1)
@@ -164,12 +245,12 @@ def test_prefix_cache_leaves_the_last_full_prompt_block_for_logits() -> None:
         enable_prefix_caching=True,
     )
     tokens = (1, 2, 3, 4)
-    manager.add_request("warm", token_ids=tokens, cache_epoch=1)
+    _add_logical_request(manager, "warm", tokens)
     manager.reserve("warm", len(tokens))
     manager.commit("warm", len(tokens))
     manager.free("warm")
 
-    match = manager.add_request("hit", token_ids=tokens, cache_epoch=1)
+    match = _add_logical_request(manager, "hit", tokens)
     assert match.num_cached_tokens == 2
     manager.free("hit")
 
@@ -180,12 +261,12 @@ def test_prefix_cache_does_not_publish_reserved_or_partial_blocks() -> None:
         enable_prefix_caching=True,
     )
     tokens = (1, 2, 3)
-    manager.add_request("partial", token_ids=tokens, cache_epoch=1)
+    _add_logical_request(manager, "partial", tokens)
     manager.reserve("partial", len(tokens))
     manager.commit("partial", 1)
     manager.free("partial")
 
-    match = manager.add_request("miss", token_ids=tokens, cache_epoch=1)
+    match = _add_logical_request(manager, "miss", tokens)
     assert match.num_cached_tokens == 0
     manager.free("miss")
 
@@ -196,12 +277,12 @@ def test_prefix_cache_is_invalidated_when_the_worker_epoch_changes() -> None:
         enable_prefix_caching=True,
     )
     tokens = (1, 2, 3)
-    manager.add_request("old", token_ids=tokens, cache_epoch=1)
+    _add_logical_request(manager, "old", tokens)
     manager.reserve("old", len(tokens))
     manager.commit("old", len(tokens))
     manager.free("old")
 
-    match = manager.add_request("new", token_ids=tokens, cache_epoch=2)
+    match = _add_logical_request(manager, "new", tokens, cache_epoch=2)
     assert match.num_cached_tokens == 0
     assert manager.num_free_blocks == 2
     manager.free("new")
@@ -213,21 +294,21 @@ def test_prefix_cache_evicts_the_least_recently_used_unreferenced_block() -> Non
         enable_prefix_caching=True,
     )
     for request_id, tokens in (("a", (1, 9)), ("b", (2, 9))):
-        manager.add_request(request_id, token_ids=tokens, cache_epoch=1)
+        _add_logical_request(manager, request_id, tokens)
         manager.reserve(request_id, len(tokens))
         manager.commit(request_id, len(tokens))
         manager.free(request_id)
 
-    assert manager.add_request("touch-a", token_ids=(1, 8), cache_epoch=1).num_cached_tokens == 1
+    assert _add_logical_request(manager, "touch-a", (1, 8)).num_cached_tokens == 1
     manager.free("touch-a")
-    manager.add_request("other", token_ids=(7, 9), cache_epoch=1)
+    _add_logical_request(manager, "other", (7, 9))
     manager.reserve("other", 2)
     manager.commit("other", 2)
     manager.free("other")
 
-    assert manager.add_request("miss-b", token_ids=(2, 8), cache_epoch=1).num_cached_tokens == 0
+    assert _add_logical_request(manager, "miss-b", (2, 8)).num_cached_tokens == 0
     manager.free("miss-b")
-    assert manager.add_request("hit-a", token_ids=(1, 8), cache_epoch=1).num_cached_tokens == 1
+    assert _add_logical_request(manager, "hit-a", (1, 8)).num_cached_tokens == 1
     manager.free("hit-a")
 
 
@@ -236,21 +317,46 @@ def test_prefix_cache_never_evicts_a_block_used_by_an_active_request() -> None:
         FixedKVBlockCapacity(num_blocks=2, block_size=1),
         enable_prefix_caching=True,
     )
-    manager.add_request("warm", token_ids=(1, 9), cache_epoch=1)
+    _add_logical_request(manager, "warm", (1, 9))
     manager.reserve("warm", 2)
     manager.commit("warm", 2)
     manager.free("warm")
 
-    assert manager.add_request("hit", token_ids=(1, 8), cache_epoch=1).num_cached_tokens == 1
-    manager.add_request("blocked", token_ids=(2, 9), cache_epoch=1)
-    with pytest.raises(KVCacheCapacityError):
-        manager.reserve("blocked", 2)
-    manager.free("blocked")
+    assert _add_logical_request(manager, "hit", (1, 8)).num_cached_tokens == 1
+    blocked = manager.try_add_request(
+        "blocked",
+        token_ids=(2, 9),
+        max_num_committed_tokens=2,
+        cache_epoch=1,
+    )
+    assert blocked is None
 
     reservation = manager.reserve("hit", 1)
     assert reservation.block_ids == (0, 1)
     manager.commit("hit", 1)
     manager.free("hit")
+
+
+def test_prefix_cache_evicts_a_leaf_before_its_reachable_parent() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=4, block_size=1),
+        enable_prefix_caching=True,
+    )
+    warm_tokens = (1, 2, 3, 9)
+    _add_logical_request(manager, "warm", warm_tokens)
+    manager.reserve("warm", len(warm_tokens))
+    manager.commit("warm", len(warm_tokens))
+    manager.free("warm")
+
+    for request_id, token_id in (("first", 7), ("second", 8)):
+        _add_logical_request(manager, request_id, (token_id,))
+        manager.reserve(request_id, 1)
+        manager.commit(request_id, 1)
+    manager.free("first")
+    manager.free("second")
+
+    hit = _add_logical_request(manager, "hit", (1, 2, 6))
+    assert hit.num_cached_tokens == 2
 
 
 def test_contiguous_cache_appends_valid_prefix_and_checks_capacity() -> None:

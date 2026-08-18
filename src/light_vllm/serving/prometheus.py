@@ -138,6 +138,14 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
         )
         _metric(
             lines,
+            "light_vllm_kv_cache_claimed_token_slots",
+            "gauge",
+            "KV token slots promised to admitted requests but not allocated yet.",
+            cache.claimed_token_slots,
+            labels=labels,
+        )
+        _metric(
+            lines,
             "light_vllm_kv_cache_capacity_token_slots",
             "gauge",
             "Total KV cache capacity in token slots.",

@@ -146,7 +146,12 @@ def test_prefix_cache_counts_active_shared_pages_but_not_evictable_pages() -> No
         FixedKVBlockCapacity(num_blocks=4, block_size=2),
         enable_prefix_caching=True,
     )
-    cache.add_request("warm", token_ids=(1, 2, 3, 4, 5), cache_epoch=1)
+    cache.try_add_request(
+        "warm",
+        token_ids=(1, 2, 3, 4, 5),
+        max_num_committed_tokens=5,
+        cache_epoch=1,
+    )
     cache.reserve("warm", 5)
     cache.commit("warm", 5)
     cache.free("warm")
@@ -154,11 +159,13 @@ def test_prefix_cache_counts_active_shared_pages_but_not_evictable_pages() -> No
     # 零引用 prefix page 可以立即淘汰，因此不占可用容量。
     assert cache.stats.used_token_slots == 0
 
-    match = cache.add_request(
+    match = cache.try_add_request(
         "active",
         token_ids=(1, 2, 3, 4, 9),
+        max_num_committed_tokens=5,
         cache_epoch=1,
     )
+    assert match is not None
     assert match.num_cached_tokens == 4
     # 被活动请求引用的两个共享页此时不能回收。
     assert cache.stats.used_token_slots == 4
@@ -197,6 +204,7 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     assert 'light_vllm_requests_waiting{model="qwen2"} 1' in response.text
     assert 'light_vllm_waiting_pending_tokens{model="qwen2"} 2' in response.text
     assert 'light_vllm_waiting_max_remaining_tokens{model="qwen2"} 6' in response.text
+    assert 'light_vllm_kv_cache_claimed_token_slots{model="qwen2"} 0' in response.text
     assert "light_vllm_time_to_first_token_seconds_bucket" in response.text
     assert (
         'light_vllm_engine_step_seconds_count{model="qwen2",scheduled_tokens_le="2"} 1'

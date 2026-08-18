@@ -170,9 +170,10 @@ class TokenBudgetScheduler:
             num_reserved_tokens = num_scheduled_tokens + num_lookahead_tokens
             try:
                 reservation = self._kv_cache.reserve(request_id, num_reserved_tokens)
-            except KVCacheCapacityError:
-                # 其他运行请求可能在本轮完成并释放 block；暂时跳过即可。
-                continue
+            except KVCacheCapacityError as exc:
+                raise SchedulerError(
+                    "an admitted request lost its KV completion guarantee"
+                ) from exc
 
             scheduled.append(
                 ScheduledRequest(
@@ -222,13 +223,18 @@ class TokenBudgetScheduler:
 
     def _fill_open_slots(self) -> None:
         while self._waiting and len(self._running) < self._max_num_sequences:
-            request_id = self._waiting.popleft()
+            request_id = self._waiting[0]
             state = self._states[request_id]
-            match = self._kv_cache.add_request(
+            match = self._kv_cache.try_add_request(
                 request_id,
                 token_ids=state.prompt_token_ids,
+                # 最后一个可见输出用于结束请求，不再需要写入 KV。
+                max_num_committed_tokens=state.max_num_tokens - 1,
                 cache_epoch=state.cache_epoch,
             )
+            if match is None:
+                return
+            self._waiting.popleft()
             if not 0 <= match.num_cached_tokens < len(state.prompt_token_ids):
                 self._kv_cache.free(request_id)
                 raise SchedulerError("cached prefix must leave at least one token to compute")
