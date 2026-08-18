@@ -7,8 +7,13 @@ from threading import Event
 
 import pytest
 
-from light_vllm import GenerateRequest, GenerationError
-from light_vllm.runtime.engine import EngineCore
+from light_vllm import GenerateRequest, GenerationError, GenerationOverloadedError
+from light_vllm.runtime.engine import (
+    EngineCore,
+    PredictiveTTFTAdmission,
+    SlidingWindowStepLatencyPredictor,
+    TTFTAdmission,
+)
 from light_vllm.runtime.execution import (
     ExecutionBatch,
     ExecutionCapabilities,
@@ -102,6 +107,7 @@ def _engine(
     *,
     token_budget: int = 2,
     performance_observer: InMemoryPerformanceObserver | None = None,
+    ttft_admission: TTFTAdmission | None = None,
 ) -> EngineCore:
     scheduler = TokenBudgetScheduler(
         PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2)),
@@ -117,6 +123,7 @@ def _engine(
         executor,
         scheduler,
         performance_observer=performance_observer,
+        ttft_admission=ttft_admission,
     )
 
 
@@ -161,6 +168,63 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
         assert snapshot.finished_requests_total == 1
         assert snapshot.scheduler.waiting_requests == 0
         assert snapshot.scheduler.running_requests == 0
+
+    asyncio.run(run())
+
+
+def test_engine_rejects_overload_after_step_predictor_warms_up() -> None:
+    class TimedExecutor(RecordingExecutor):
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            output = super().execute(batch)
+            return ExecutionOutput(
+                requests=output.requests,
+                step_elapsed_seconds=0.2,
+            )
+
+    async def run() -> None:
+        executor = TimedExecutor()
+        admission = PredictiveTTFTAdmission(
+            SlidingWindowStepLatencyPredictor(min_observations=1),
+            max_tolerable_ttft_seconds=0.1,
+        )
+        engine = _engine(executor, ttft_admission=admission)
+
+        first = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
+        with pytest.raises(GenerationOverloadedError, match="exceeds the 0.100s SLO"):
+            await engine.generate(GenerateRequest(input_ids=(2,), max_new_tokens=1))
+        await engine.close()
+
+        assert first.generated_token_ids == (2,)
+        assert executor.history == [((1,),)]
+        assert not executor.active
+
+    asyncio.run(run())
+
+
+def test_ttft_predictor_failure_disables_early_rejection_without_failing_generation() -> None:
+    class FailingTTFTAdmission:
+        def validate(self, request, stats) -> None:
+            return None
+
+        def step_completed(self, observation) -> None:
+            raise RuntimeError("predictor unavailable")
+
+    class TimedExecutor(RecordingExecutor):
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            output = super().execute(batch)
+            return ExecutionOutput(requests=output.requests, step_elapsed_seconds=0.2)
+
+    async def run() -> None:
+        executor = TimedExecutor()
+        engine = _engine(executor, ttft_admission=FailingTTFTAdmission())
+
+        first = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
+        second = await engine.generate(GenerateRequest(input_ids=(2,), max_new_tokens=1))
+        await engine.close()
+
+        assert first.generated_token_ids == (2,)
+        assert second.generated_token_ids == (3,)
+        assert len(executor.history) == 2
 
     asyncio.run(run())
 

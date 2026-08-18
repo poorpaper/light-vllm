@@ -13,6 +13,7 @@ from light_vllm import (
     GenerationEvent,
     GenerationFinished,
     GenerationNotReadyError,
+    GenerationOverloadedError,
     ModelSpec,
     TokenGenerated,
 )
@@ -52,6 +53,15 @@ class FailingStreamEngineClient(StubEngineClient):
     async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
         yield TokenGenerated(token_id=7, position=0)
         raise GenerationError("failed after the response started")
+
+
+class OverloadedEngineClient(StubEngineClient):
+    async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
+        raise GenerationOverloadedError("predicted TTFT exceeds SLO")
+        yield
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        raise GenerationOverloadedError("predicted TTFT exceeds SLO")
 
 
 class CloseTrackingAsyncIterator(AsyncIterator[GenerationEvent]):
@@ -216,6 +226,17 @@ def test_not_ready_is_mapped_before_a_response_or_stream_starts() -> None:
     assert client.get("/readyz").status_code == 503
     assert client.post("/generate", json={"input_ids": [1]}).status_code == 503
     assert client.post("/generate/stream", json={"input_ids": [1]}).status_code == 503
+
+
+def test_predicted_ttft_overload_is_mapped_to_429_before_streaming() -> None:
+    client = TestClient(create_http_app(OverloadedEngineClient()))
+
+    generated = client.post("/generate", json={"input_ids": [1]})
+    streamed = client.post("/generate/stream", json={"input_ids": [1]})
+
+    assert generated.status_code == 429
+    assert streamed.status_code == 429
+    assert generated.json()["detail"] == "predicted TTFT exceeds SLO"
 
 
 def test_stream_is_closed_when_the_first_event_fails() -> None:

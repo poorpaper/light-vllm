@@ -5,7 +5,11 @@ from collections import deque
 from math import isfinite
 from threading import RLock
 
-from light_vllm.runtime.engine.interfaces import EngineCapabilities, StepLatencyPredictor
+from light_vllm.runtime.engine.interfaces import (
+    EngineCapabilities,
+    StepLatencyPredictor,
+    TTFTAdmission,
+)
 from light_vllm.runtime.generation.interfaces import (
     GenerateRequest,
     GenerationOverloadedError,
@@ -107,3 +111,33 @@ class PredictiveTTFTAdmission:
 
     def step_completed(self, observation: StepObservation) -> None:
         self._predictor.observe(observation)
+
+
+class SafeTTFTAdmission:
+    """预测器故障时禁用动态早拒，不让控制面故障打断生成。"""
+
+    def __init__(self, admission: TTFTAdmission | None) -> None:
+        self._admission = admission
+        self._lock = RLock()
+
+    def validate(self, request: GenerateRequest, stats: SchedulerStats) -> None:
+        with self._lock:
+            admission = self._admission
+            if admission is None:
+                return
+            try:
+                admission.validate(request, stats)
+            except GenerationOverloadedError:
+                raise
+            except Exception:
+                self._admission = None
+
+    def step_completed(self, observation: StepObservation) -> None:
+        with self._lock:
+            admission = self._admission
+            if admission is None:
+                return
+            try:
+                admission.step_completed(observation)
+            except Exception:
+                self._admission = None

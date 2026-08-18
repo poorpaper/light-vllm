@@ -18,6 +18,10 @@ import torch
 
 from light_vllm.bootstrap import create_runner
 from light_vllm.modeling.models.interfaces import ModelSpec
+from light_vllm.runtime.engine.admission import (
+    PredictiveTTFTAdmission,
+    SlidingWindowStepLatencyPredictor,
+)
 from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
@@ -139,6 +143,9 @@ def create_serving_app(
     speculative_ngram_min: int = 2,
     speculative_ngram_max: int = 5,
     short_request_policy: ShortRequestPolicy | None = None,
+    max_tolerable_ttft_seconds: float | None = None,
+    ttft_prediction_window_size: int = 32,
+    ttft_prediction_min_observations: int = 3,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -162,6 +169,8 @@ def create_serving_app(
     if paged_attention_backend not in ("torch", "triton"):
         raise ValueError(f"unsupported paged attention backend: {paged_attention_backend}")
     if runtime == "reference":
+        if max_tolerable_ttft_seconds is not None:
+            raise ValueError("TTFT prediction requires the engine runtime")
         if short_request_policy is not None:
             raise ValueError("short-request scheduling requires the engine runtime")
         if num_speculative_tokens:
@@ -243,11 +252,21 @@ def create_serving_app(
             decoding_budget=decoding_budget,
             short_request_policy=short_request_policy,
         )
+        ttft_admission = None
+        if max_tolerable_ttft_seconds is not None:
+            ttft_admission = PredictiveTTFTAdmission(
+                SlidingWindowStepLatencyPredictor(
+                    window_size=ttft_prediction_window_size,
+                    min_observations=ttft_prediction_min_observations,
+                ),
+                max_tolerable_ttft_seconds=max_tolerable_ttft_seconds,
+            )
         performance_observer = InMemoryPerformanceObserver(spec.architecture)
         engine_core = EngineCore(
             model_executor,
             scheduler,
             performance_observer=performance_observer,
+            ttft_admission=ttft_admission,
         )
         engine = engine_core
         close_engine = engine_core.close
@@ -374,6 +393,10 @@ def _create_parser() -> argparse.ArgumentParser:
     short.add_argument("--short-request-reserved-kv-token-slots", type=int)
     short.add_argument("--short-request-reserved-sequences", type=int, default=1)
     short.add_argument("--regular-request-aging-steps", type=int, default=8)
+    ttft = parser.add_argument_group("TTFT prediction")
+    ttft.add_argument("--max-tolerable-ttft-seconds", type=float)
+    ttft.add_argument("--ttft-prediction-window-size", type=int, default=32)
+    ttft.add_argument("--ttft-prediction-min-observations", type=int, default=3)
     return parser
 
 
@@ -412,6 +435,9 @@ def main() -> None:
                 reserved_sequences=args.short_request_reserved_sequences,
                 regular_aging_steps=args.regular_request_aging_steps,
             ),
+            max_tolerable_ttft_seconds=args.max_tolerable_ttft_seconds,
+            ttft_prediction_window_size=args.ttft_prediction_window_size,
+            ttft_prediction_min_observations=args.ttft_prediction_min_observations,
         ),
         host=args.host,
         port=args.port,
