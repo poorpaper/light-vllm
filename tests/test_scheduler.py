@@ -191,7 +191,7 @@ def test_cached_prefix_uses_effective_prompt_for_short_classification() -> None:
 def test_aged_regular_request_can_borrow_short_kv_headroom() -> None:
     scheduler = TokenBudgetScheduler(
         PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=10, block_size=1)),
-        max_num_sequences=2,
+        max_num_sequences=3,
         max_num_scheduled_tokens=3,
         short_request_policy=_short_policy(
             reserved_scheduled_tokens=2,
@@ -222,10 +222,42 @@ def test_aged_regular_request_can_borrow_short_kv_headroom() -> None:
     assert scheduler.stats.waiting_requests == 0
 
 
+def test_aged_regular_blocks_bulk_short_completion_claims() -> None:
+    scheduler = TokenBudgetScheduler(
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=23, block_size=1)),
+        max_num_sequences=2,
+        max_num_scheduled_tokens=4,
+        short_request_policy=_short_policy(regular_aging_steps=2),
+    )
+    scheduler.add("regular", token_ids=(1,), max_num_tokens=20)
+    for index in range(10):
+        scheduler.add(
+            f"short-{index}",
+            token_ids=(100 + index, 200 + index),
+            max_num_tokens=4,
+        )
+
+    first = scheduler.schedule()
+    assert first.request_ids == ("short-0",)
+    scheduler.complete("short-0", num_committed_tokens=2, num_new_tokens=1)
+
+    second = scheduler.schedule()
+    assert second.request_ids == ("short-0",)
+    assert scheduler.stats.running_requests == 1
+    assert scheduler.stats.waiting_requests == 10
+    scheduler.complete("short-0", num_committed_tokens=1, num_new_tokens=1)
+    scheduler.remove("short-0")
+
+    third = scheduler.schedule()
+    assert third.request_ids == ("short-1", "regular")
+    assert scheduler.stats.running_requests == scheduler.max_num_sequences
+    assert scheduler.stats.waiting_requests == 8
+
+
 def test_common_pool_rotates_admitted_requests() -> None:
     scheduler = TokenBudgetScheduler(
         UnboundedKVCacheManager(),
-        max_num_sequences=1,
+        max_num_sequences=2,
         max_num_scheduled_tokens=1,
     )
     scheduler.add("a", token_ids=(1, 2, 3), max_num_tokens=5)

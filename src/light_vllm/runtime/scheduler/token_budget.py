@@ -26,6 +26,7 @@ class _RequestState:
     num_computed_tokens: int = 0
     kv_attached: bool = False
     is_short: bool = False
+    uses_short_admission_slot: bool = False
     has_visible_output: bool = False
     waiting_steps: int = 0
 
@@ -143,8 +144,10 @@ class TokenBudgetScheduler:
         return True
 
     def schedule(self) -> SchedulerOutput:
-        self._age_waiting_requests()
-        self._admit_waiting_requests()
+        self._rebalance_admission_slots()
+        classifications = self._classify_waiting_requests()
+        self._age_waiting_requests(classifications)
+        self._admit_waiting_requests(classifications)
         scheduled: list[ScheduledRequest] = []
 
         policy = self._short_request_policy
@@ -288,28 +291,36 @@ class TokenBudgetScheduler:
             self._short_launch_order.remove(request_id)
             self._common_order.append(request_id)
 
-    def _age_waiting_requests(self) -> None:
-        if self._short_request_policy is None:
-            return
-        for request_id in self._waiting:
-            state = self._states[request_id]
-            if not self._is_short_request(state):
+    def _classify_waiting_requests(self) -> tuple[tuple[str, bool], ...]:
+        return tuple(
+            (request_id, self._is_short_request(self._states[request_id]))
+            for request_id in self._waiting
+        )
+
+    def _age_waiting_requests(
+        self,
+        classifications: tuple[tuple[str, bool], ...],
+    ) -> None:
+        if self._short_request_policy is not None:
+            for request_id, is_short in classifications:
+                if is_short:
+                    continue
+                state = self._states[request_id]
                 state.waiting_steps += 1
 
-    def _admit_waiting_requests(self) -> None:
+    def _admit_waiting_requests(
+        self,
+        classifications: tuple[tuple[str, bool], ...],
+    ) -> None:
         if not self._waiting:
             return
         policy = self._short_request_policy
         if policy is None:
-            while self._waiting:
+            while self._waiting and len(self._running) < self._max_num_sequences:
                 if not self._try_admit(self._waiting[0], is_short=False, min_free_tokens=0):
                     return
             return
 
-        classifications = tuple(
-            (request_id, self._is_short_request(self._states[request_id]))
-            for request_id in self._waiting
-        )
         barrier = next(
             (
                 request_id
@@ -320,12 +331,15 @@ class TokenBudgetScheduler:
             None,
         )
         # 老化的常规请求暂时不再为后来短请求让出 KV 水位。
-        if barrier is not None and not self._try_admit(
-            barrier,
-            is_short=False,
-            min_free_tokens=0,
-        ):
-            return
+        if barrier is not None:
+            if not self._has_common_admission_slot():
+                return
+            if not self._try_admit(
+                barrier,
+                is_short=False,
+                min_free_tokens=0,
+            ):
+                return
 
         for desired_short, min_free_tokens in (
             (True, 0),
@@ -337,6 +351,13 @@ class TokenBudgetScheduler:
                 if is_short is desired_short and request_id in self._waiting
             )
             for request_id in candidates:
+                has_slot = (
+                    self._has_short_admission_slot()
+                    if desired_short
+                    else self._has_common_admission_slot()
+                )
+                if not has_slot:
+                    break
                 if not self._try_admit(
                     request_id,
                     is_short=desired_short,
@@ -375,6 +396,7 @@ class TokenBudgetScheduler:
         state.num_computed_tokens = match.num_cached_tokens
         state.kv_attached = True
         state.is_short = is_short
+        state.uses_short_admission_slot = is_short
         self._running[request_id] = state
         order = self._short_launch_order if is_short else self._common_order
         order.append(request_id)
@@ -390,6 +412,31 @@ class TokenBudgetScheduler:
         )
         effective_prompt_tokens = len(state.prompt_token_ids) - match.num_cached_tokens
         return effective_prompt_tokens <= policy.max_effective_prompt_tokens
+
+    def _rebalance_admission_slots(self) -> None:
+        """有通用 slot 时，把已出首 token 的短请求迁出准入保留区。"""
+
+        if self._short_request_policy is None:
+            return
+        for request_id in self._common_order:
+            if not self._has_common_admission_slot():
+                return
+            state = self._running[request_id]
+            if state.uses_short_admission_slot:
+                state.uses_short_admission_slot = False
+
+    def _has_short_admission_slot(self) -> bool:
+        policy = self._short_request_policy
+        assert policy is not None
+        used = sum(state.uses_short_admission_slot for state in self._running.values())
+        return used < policy.reserved_sequences
+
+    def _has_common_admission_slot(self) -> bool:
+        policy = self._short_request_policy
+        assert policy is not None
+        short_slots = sum(state.uses_short_admission_slot for state in self._running.values())
+        common_slots = len(self._running) - short_slots
+        return common_slots < self._max_num_sequences - policy.reserved_sequences
 
     @staticmethod
     def _rotate_request_ids(order: deque[str]) -> tuple[str, ...]:
