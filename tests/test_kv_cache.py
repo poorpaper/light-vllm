@@ -229,6 +229,32 @@ def test_best_effort_reservation_keeps_its_kv_watermark() -> None:
     assert reservation.block_ids == (0, 1)
 
 
+def test_best_effort_can_fill_an_existing_block_below_its_watermark() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=2))
+    admitted = manager.try_add_request(
+        "best-effort",
+        token_ids=(1,),
+        max_num_committed_tokens=6,
+        cache_epoch=1,
+        min_free_token_slots=4,
+        guarantee_completion=False,
+    )
+    assert admitted is not None
+    first = manager.reserve("best-effort", 1)
+    manager.commit("best-effort", 1)
+
+    # 水位线只限制新增页；已有页里的空位可以继续写入。
+    strict = manager.try_add_request(
+        "strict",
+        token_ids=(2,),
+        max_num_committed_tokens=4,
+        cache_epoch=1,
+    )
+    assert strict is not None
+    second = manager.reserve("best-effort", 1)
+    assert second.block_ids == first.block_ids
+
+
 def test_unbounded_manager_tracks_reservations_without_block_placement() -> None:
     manager = UnboundedKVCacheManager()
     _add_logical_request(manager, "request", (1, 2, 3))

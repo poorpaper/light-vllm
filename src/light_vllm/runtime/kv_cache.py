@@ -468,7 +468,7 @@ class PagedKVCacheManager:
             available_claim = allocation.completion_block_limit - len(allocation.block_ids)
             if new_block_count > available_claim:
                 raise KVCacheError(f"request {request_id!r} exceeded its KV completion claim")
-        else:
+        elif new_block_count > 0:
             assert self._num_blocks is not None
             used_blocks = self._num_blocks - self.num_free_blocks
             if (
