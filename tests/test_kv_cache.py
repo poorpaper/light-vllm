@@ -255,6 +255,25 @@ def test_prefix_cache_leaves_the_last_full_prompt_block_for_logits() -> None:
     manager.free("hit")
 
 
+def test_prefix_preview_does_not_pin_or_allocate_blocks() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=3, block_size=2),
+        enable_prefix_caching=True,
+    )
+    tokens = (1, 2, 3)
+    _add_logical_request(manager, "warm", tokens)
+    manager.reserve("warm", len(tokens))
+    manager.commit("warm", len(tokens))
+    manager.free("warm")
+    before = manager.stats
+
+    match = manager.preview_prefix(token_ids=tokens, cache_epoch=1)
+
+    assert match.num_cached_tokens == 2
+    assert manager.stats == before
+    assert not manager.free("preview")
+
+
 def test_prefix_cache_does_not_publish_reserved_or_partial_blocks() -> None:
     manager = PagedKVCacheManager(
         FixedKVBlockCapacity(num_blocks=3, block_size=2),

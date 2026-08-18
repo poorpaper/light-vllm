@@ -143,6 +143,16 @@ class KVCacheManager(Protocol):
     @property
     def stats(self) -> KVCacheStats: ...
 
+    def preview_prefix(
+        self,
+        *,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None,
+    ) -> KVCacheMatch:
+        """只读估计当前可复用的 prompt 前缀，不固定页引用。"""
+
+        ...
+
     def try_add_request(
         self,
         request_id: str,
@@ -235,6 +245,16 @@ class UnboundedKVCacheManager:
     def stats(self) -> KVCacheStats:
         # 连续缓存按请求动态增长，没有可用于计算占用率的固定容量。
         return KVCacheStats()
+
+    def preview_prefix(
+        self,
+        *,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None,
+    ) -> KVCacheMatch:
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
+        return KVCacheMatch()
 
     def try_add_request(
         self,
@@ -340,6 +360,22 @@ class PagedKVCacheManager:
         self._sync_capacity()
         return len(self._free_blocks) + len(self._evictable_blocks)
 
+    def preview_prefix(
+        self,
+        *,
+        token_ids: tuple[int, ...],
+        cache_epoch: int | None,
+    ) -> KVCacheMatch:
+        self._sync_capacity()
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
+        if not self._enable_prefix_caching or self._cache_epoch != cache_epoch:
+            return KVCacheMatch()
+        prompt_block_keys = self._prompt_block_keys(token_ids, cache_epoch)
+        return KVCacheMatch(
+            num_cached_tokens=len(self._matched_prompt_blocks(prompt_block_keys)) * self.block_size
+        )
+
     def try_add_request(
         self,
         request_id: str,
@@ -367,13 +403,7 @@ class PagedKVCacheManager:
         self._ensure_cache_epoch(cache_epoch)
 
         prompt_block_keys = self._prompt_block_keys(token_ids, cache_epoch)
-        matched_blocks: list[int] = []
-        if self._enable_prefix_caching:
-            for block_key in prompt_block_keys:
-                block_id = self._cached_blocks.get(block_key)
-                if block_id is None:
-                    break
-                matched_blocks.append(block_id)
+        matched_blocks = self._matched_prompt_blocks(prompt_block_keys)
 
         completion_block_limit = self._blocks_for(max_num_committed_tokens)
         new_claims = completion_block_limit - len(matched_blocks)
@@ -526,6 +556,20 @@ class PagedKVCacheManager:
             )
             parent_hash = digest
         return tuple(block_keys)
+
+    def _matched_prompt_blocks(
+        self,
+        prompt_block_keys: tuple[_PrefixBlockKey, ...],
+    ) -> list[int]:
+        matched: list[int] = []
+        if not self._enable_prefix_caching:
+            return matched
+        for block_key in prompt_block_keys:
+            block_id = self._cached_blocks.get(block_key)
+            if block_id is None:
+                break
+            matched.append(block_id)
+        return matched
 
     def _publish_prompt_blocks(self, allocation: _LogicalAllocation) -> None:
         num_full_prompt_blocks = min(
