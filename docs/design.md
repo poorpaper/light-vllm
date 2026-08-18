@@ -1,4 +1,4 @@
-# light-vllm 架构设计（v0.11）
+# light-vllm 架构设计（v0.12）
 
 这份文档记录当前已经落地的设计。更细的职责说明见 [architecture.md](architecture.md)。
 
@@ -13,6 +13,7 @@
 | 高扩展性 | 模型/loader 注册；Sampler、Executor 与 attention backend 通过组合替换 |
 | 少模式分支 | 不用 prefill/decode/greedy/KV 专用 Executor |
 | 成熟实践 | 采用统一 token budget、Scheduler/KV 协作和 Step Handler 物理缓存边界 |
+| 可观测 | 独立 PerformanceObserver 记录事实，Prometheus/Grafana 只做控制面消费 |
 
 ## 2. 包结构
 
@@ -30,6 +31,7 @@ src/light_vllm/
 │   ├── scheduler/
 │   ├── execution/
 │   ├── engine/
+│   ├── observability/
 │   ├── sampling.py
 │   └── kv_cache.py
 ├── serving/
@@ -64,6 +66,10 @@ flowchart TB
     Bridge --> Reference["ReferenceGenerationService"]
 
     Core --> Scheduler["TokenBudgetScheduler"]
+    Core --> Observer["PerformanceObserver<br/>TTFT / ITL / step / outcomes"]
+    Scheduler --> Observer
+    Observer --> Metrics["Prometheus /metrics"]
+    Metrics --> Grafana["Grafana / HPA"]
     Scheduler --> LogicalKV["KVCacheManager<br/>reservation / logical blocks"]
     Core --> Executor["LocalModelExecutor"]
     Executor --> Worker["LocalModelWorker<br/>fixed model version"]
@@ -116,6 +122,9 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `AttentionContext` | 模型调用连续或分页 attention 后端的稳定边界 |
 | `EngineCapabilities` | 初始化后可发现的模型、KV、并发和单轮容量事实 |
 | `EngineClient` | serving 使用的异步生成端口和 capabilities 查询 |
+| `SchedulerStats` / `KVCacheStats` | 队列、token backlog 与 KV 容量的一次性不可变事实 |
+| `PerformanceObserver` | Engine 生命周期事实的轻量接收端，不执行 I/O 或控制运行时 |
+| `PerformanceMetricsReader` | Prometheus、日志等控制面读取不可变性能快照的端口 |
 
 `SchedulerOutput` 和 `RequestOutput` 是扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
 并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和投机验证因此共用同一循环。
@@ -131,6 +140,7 @@ Qwen 层只生成带 RoPE 的 Q/K/V 并调用 `AttentionContext`，不再保留�
 ```mermaid
 sequenceDiagram
     participant E as EngineCore
+    participant O as PerformanceObserver
     participant S as Scheduler
     participant K as Logical KV Manager
     participant X as ModelExecutor
@@ -165,6 +175,7 @@ sequenceDiagram
     E->>S: complete(committed, visible outputs)
     S->>K: commit(input + cached output prefix)
     E->>E: 更新状态并发送事件
+    E->>O: visible tokens / outcome / SchedulerStats
 ```
 
 执行失败时 Engine 移除本轮请求。连续 Step Handler 的请求级 tensor 由 lease 延迟销毁；分页页池是进程级全局
@@ -250,7 +261,21 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 `GreedyFullSequenceBatchExecutor`、`GreedyContiguousKVCacheExecutor` 和 `KVCacheBatchTokenExecutor` 已删除，
 不保留兼容 alias。
 
-## 10. 代码映射
+## 10. 性能观测
+
+观测只建立在已经生效的事实上：请求成功加入 Executor 和 Scheduler 后开始计时；输出通过校验并成为可见
+token 时记录 TTFT/可见 token 间隔；请求完成、失败或取消时记录结果。Scheduler 分开提供已知 pending 输入和
+包含最大输出预算的保守 backlog；Executor 报告按 scheduled-token 桶聚合的已完成 step 延迟。Qwen2、Qwen2.5、
+投机解码和普通解码复用同一路径。
+
+`InMemoryPerformanceObserver` 是专门的性能观察角色，只做短临界区计数。它不能调整 Scheduler 参数，也不执行
+网络或文件 I/O；`SafeCompositePerformanceObserver` 会停用首次失败的旁路实现，指标故障不能泄漏请求、同步刷屏
+或改变生成结果。
+`serving/prometheus.py` 把快照转换成标准文本；Grafana 直接消费 Prometheus，HPA 通过
+Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`。未来性能 Guardian 必须通过单独的有界控制
+端口工作，不能把策略塞进 observer 或 token 热路径。
+
+## 11. 代码映射
 
 | 角色 | 文件 |
 | --- | --- |
@@ -269,6 +294,7 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 | 执行契约 | `src/light_vllm/runtime/execution/interfaces.py` |
 | n-gram 投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
+| 执行 step 计时 | `src/light_vllm/runtime/execution/timing.py` |
 | 本地 Worker | `src/light_vllm/runtime/execution/worker.py` |
 | Dense Attention | `src/light_vllm/runtime/execution/dense_attention.py` |
 | 物理分页 KV | `src/light_vllm/runtime/execution/paged_cache.py` |
@@ -277,10 +303,14 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 | Engine Core | `src/light_vllm/runtime/engine/core.py` |
 | admission | `src/light_vllm/runtime/engine/admission.py` |
 | EngineClient | `src/light_vllm/runtime/engine/interfaces.py` |
+| 性能观察契约 | `src/light_vllm/runtime/observability/interfaces.py` |
+| 进程内性能聚合 | `src/light_vllm/runtime/observability/performance.py` |
+| 性能观察者隔离 | `src/light_vllm/runtime/observability/dispatch.py` |
 | HTTP adapter | `src/light_vllm/serving/http.py` |
+| Prometheus adapter | `src/light_vllm/serving/prometheus.py` |
 | 装配入口 | `src/light_vllm/entrypoints/http.py` |
 
-## 11. 当前完成度
+## 12. 当前完成度
 
 ```mermaid
 flowchart LR
@@ -293,13 +323,14 @@ flowchart LR
     Capacity --> Prefix["Prefix cache<br/>完成"]
     Prefix --> Spec["Speculative decoding<br/>完成"]
     Spec --> Kernel["Triton fused attention<br/>首版与 GPU 数值对照完成"]
+    Kernel --> Metrics["性能指标 + Prometheus/Grafana/HPA<br/>完成"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
 Torch 2.8.0、Triton 3.4.0 环境完成 JIT，以及 FP16/BF16、prefill/decode、GQA、共享 prefix、lookahead 的
 PyTorch 数值对照；长上下文性能和跨显卡验收仍是后续工作。
 
-## 12. 验证要求
+## 13. 验证要求
 
 提交前至少运行：
 
@@ -312,7 +343,8 @@ git diff --check
 
 测试必须覆盖固定 ModelSession、token budget、chunked prefill、多 token 与已缓存输出前缀、容量规划与 admission、
 prefix 命中/LRU/epoch、投机全接受/部分接受/首个拒绝/短候选、逻辑 block 回滚、非连续物理页、block table
-别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、执行失败和取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
+别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、TTFT/ITL、step 延迟、两种 token backlog、KV 使用率、执行失败和取消
+资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
 Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、padded GQA、decode 历史、共享
 prefix 和未使用 lookahead。
 

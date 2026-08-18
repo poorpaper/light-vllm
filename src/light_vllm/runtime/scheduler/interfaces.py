@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from light_vllm.runtime.kv_cache import KVCacheStats
+
 
 class SchedulerError(RuntimeError):
     """请求或调度状态违反契约时抛出。"""
@@ -88,6 +90,35 @@ class SchedulerOutput:
         return tuple(request.request_id for request in self.requests)
 
 
+@dataclass(frozen=True, slots=True)
+class SchedulerStats:
+    """Scheduler 对观测面公开的不可变负载快照。
+
+    pending tokens 只统计当前已知但尚未计算的输入；max remaining tokens
+    还包含请求允许生成的最大输出，是适合 HPA 的保守工作量上界。
+    """
+
+    waiting_requests: int
+    running_requests: int
+    waiting_pending_tokens: int
+    running_pending_tokens: int
+    waiting_max_remaining_tokens: int
+    running_max_remaining_tokens: int
+    kv_cache: KVCacheStats
+
+    def __post_init__(self) -> None:
+        values = (
+            self.waiting_requests,
+            self.running_requests,
+            self.waiting_pending_tokens,
+            self.running_pending_tokens,
+            self.waiting_max_remaining_tokens,
+            self.running_max_remaining_tokens,
+        )
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError("scheduler statistics must be non-negative integers")
+
+
 class Scheduler(Protocol):
     """根据单轮 token 上限和 KV cache 容量安排每次模型计算。"""
 
@@ -99,6 +130,9 @@ class Scheduler(Protocol):
 
     @property
     def max_num_scheduled_tokens(self) -> int: ...
+
+    @property
+    def stats(self) -> SchedulerStats: ...
 
     def add(
         self,

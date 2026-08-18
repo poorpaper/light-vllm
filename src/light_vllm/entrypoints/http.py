@@ -21,6 +21,7 @@ from light_vllm.modeling.models.interfaces import ModelSpec
 from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
+from light_vllm.runtime.execution.interfaces import ExecutionTimer
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionBackend,
@@ -36,6 +37,10 @@ from light_vllm.runtime.execution.speculative import (
     NGramSpeculativeDecodeHandler,
     NGramTokenProposer,
 )
+from light_vllm.runtime.execution.timing import (
+    CudaEventExecutionTimer,
+    WallClockExecutionTimer,
+)
 from light_vllm.runtime.execution.worker import (
     ContiguousStepHandler,
     LocalModelWorker,
@@ -48,6 +53,8 @@ from light_vllm.runtime.kv_cache import (
     PagedKVCacheManager,
     UnboundedKVCacheManager,
 )
+from light_vllm.runtime.observability.interfaces import PerformanceMetricsReader
+from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
 from light_vllm.runtime.sampling import GreedySampler
 from light_vllm.runtime.scheduler.interfaces import DecodingBudget
 from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
@@ -110,6 +117,12 @@ def _create_paged_attention_backend(
     return TritonPagedAttentionBackend()
 
 
+def _create_execution_timer(spec: ModelSpec) -> ExecutionTimer:
+    if torch.device(spec.device).type == "cuda":
+        return CudaEventExecutionTimer(spec.device)
+    return WallClockExecutionTimer()
+
+
 def create_serving_app(
     spec: ModelSpec,
     *,
@@ -140,6 +153,8 @@ def create_serving_app(
     # 结束时显式等待当前模型迭代完成。
     close_engine: Callable[[], Awaitable[None]] | None = None
     initialize_executor: Callable[[], None] | None = None
+    refresh_performance_metrics: Callable[[], None] | None = None
+    performance_metrics: PerformanceMetricsReader | None = None
     sampler = GreedySampler()
     if type(num_speculative_tokens) is not int or num_speculative_tokens < 0:
         raise ValueError("num_speculative_tokens must be a non-negative integer")
@@ -214,17 +229,27 @@ def create_serving_app(
             step_factory,
             decode_handler,
         )
-        model_executor = LocalModelExecutor(worker)
+        model_executor = LocalModelExecutor(
+            worker,
+            timer=_create_execution_timer(spec),
+        )
         scheduler = TokenBudgetScheduler(
             logical_cache,
             max_num_sequences=max_num_sequences,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             decoding_budget=decoding_budget,
         )
-        engine_core = EngineCore(model_executor, scheduler)
+        performance_observer = InMemoryPerformanceObserver(spec.architecture)
+        engine_core = EngineCore(
+            model_executor,
+            scheduler,
+            performance_observer=performance_observer,
+        )
         engine = engine_core
         close_engine = engine_core.close
         initialize_executor = model_executor.initialize
+        refresh_performance_metrics = engine_core.refresh_performance_metrics
+        performance_metrics = performance_observer
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -232,6 +257,9 @@ def create_serving_app(
         runner.load(spec)
         if initialize_executor is not None:
             initialize_executor()
+        if refresh_performance_metrics is not None:
+            # CUDA KV 容量直到 executor 初始化后才确定，此时发布首个真实快照。
+            refresh_performance_metrics()
         try:
             yield
         finally:
@@ -239,7 +267,11 @@ def create_serving_app(
             if close_engine is not None:
                 await close_engine()
 
-    return create_http_app(engine, lifespan=lifespan)
+    return create_http_app(
+        engine,
+        lifespan=lifespan,
+        performance_metrics=performance_metrics,
+    )
 
 
 def _json_object(value: str) -> dict[str, object]:

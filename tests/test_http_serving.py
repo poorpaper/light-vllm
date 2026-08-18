@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
 
+import pytest
 from fastapi.testclient import TestClient
 
 from light_vllm import (
@@ -301,6 +302,53 @@ def test_tiny_attention_model_serves_through_engine_core() -> None:
 
     assert response.status_code == 200
     assert len(response.json()["generated_token_ids"]) == 2
+
+
+@pytest.mark.parametrize("architecture", ("qwen2", "qwen2.5"))
+def test_qwen_engine_runtime_exposes_model_agnostic_performance_metrics(
+    architecture: str,
+) -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture=architecture,
+            model_args={
+                "model_type": "qwen2",
+                "vocab_size": 32,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "max_position_embeddings": 32,
+                "tie_word_embeddings": True,
+            },
+        ),
+        runtime="engine",
+        max_num_sequences=2,
+        max_num_scheduled_tokens=4,
+        num_kv_blocks=16,
+        kv_block_size=2,
+    )
+
+    with TestClient(app) as client:
+        generated = client.post(
+            "/generate",
+            json={"input_ids": [1, 2], "max_new_tokens": 2},
+        )
+        metrics = client.get("/metrics")
+
+    assert generated.status_code == 200
+    assert metrics.status_code == 200
+    assert (
+        f'light_vllm_time_to_first_token_seconds_count{{model="{architecture}"}} 1' in metrics.text
+    )
+    assert (
+        f'light_vllm_inter_token_latency_seconds_count{{model="{architecture}"}} 1' in metrics.text
+    )
+    assert f'light_vllm_engine_step_seconds_count{{model="{architecture}"' in metrics.text
+    assert (
+        f'light_vllm_requests_total{{model="{architecture}",outcome="finished"}} 1' in metrics.text
+    )
 
 
 def test_engine_core_serves_with_unbounded_kv_reservations() -> None:

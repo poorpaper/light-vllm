@@ -281,6 +281,25 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 进程拆分时可以新增 `ProcessEngineClient`，但不得
 改变 `EngineClient`、generation 事件或 HTTP adapter。
 
+## 性能观察者与监控控制面
+
+`PerformanceObserver` 是独立角色，不是 Scheduler、Executor 或模型的一部分。Engine 只在状态已经生效后报告：
+
+- 请求成功进入 Scheduler 后开始计时；
+- 通过执行结果校验并准备发送的 token 才计入 TTFT、可见 token 间隔和吞吐；
+- Executor 在自己的设备边界测量已经完成的 step；CPU 使用单调墙钟，CUDA 使用 event；
+- 正常结束、失败和取消各自只记录一次；
+- Scheduler/KV 每次状态变化后发布不可变快照。
+
+Scheduler 分开公开两种 token 事实：`pending_tokens` 是当前已知但尚未计算的输入，适合 TTFT 排队估算；
+`max_remaining_tokens` 还包含请求声明的最大输出预算，是偏保守的 HPA backlog。Paged KV 使用率按不能立即回收的
+block token slot 计算；可淘汰 prefix page 视为可用，无固定上限的连续缓存不输出伪容量。
+
+Prometheus renderer 只依赖 `PerformanceMetricsReader`，生成 HTTP 路由仍只依赖 `EngineClient`。Grafana 看板和
+HPA 位于仓库外控制面：前者查询 histogram/计数，后者经 Prometheus Adapter 读取每 Pod 的
+`light_vllm_waiting_max_remaining_tokens`。observer 不执行 I/O 或自动调参；安全组合器会在第三方 observer 首次
+失败后停用它，而且不在 Engine 热路径写日志。未来 Guardian 需要单独控制端口和有界安全更新点。
+
 ## 模型加载不变量
 
 1. `Catalog` 通过注册表解析 model factory 与 loader。

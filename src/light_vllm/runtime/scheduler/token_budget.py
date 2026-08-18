@@ -12,6 +12,7 @@ from light_vllm.runtime.scheduler.interfaces import (
     ScheduledRequest,
     SchedulerError,
     SchedulerOutput,
+    SchedulerStats,
 )
 
 
@@ -63,6 +64,28 @@ class TokenBudgetScheduler:
     @property
     def max_num_scheduled_tokens(self) -> int:
         return self._max_num_scheduled_tokens
+
+    @property
+    def stats(self) -> SchedulerStats:
+        """返回一次性快照，不把内部可变队列暴露给 observer。"""
+
+        return SchedulerStats(
+            waiting_requests=len(self._waiting),
+            running_requests=len(self._running),
+            waiting_pending_tokens=sum(
+                self._pending_tokens(self._states[request_id]) for request_id in self._waiting
+            ),
+            running_pending_tokens=sum(
+                self._pending_tokens(state) for state in self._running.values()
+            ),
+            waiting_max_remaining_tokens=sum(
+                self._max_remaining_tokens(self._states[request_id]) for request_id in self._waiting
+            ),
+            running_max_remaining_tokens=sum(
+                self._max_remaining_tokens(state) for state in self._running.values()
+            ),
+            kv_cache=self._kv_cache.stats,
+        )
 
     def add(
         self,
@@ -212,3 +235,11 @@ class TokenBudgetScheduler:
             state.num_computed_tokens = match.num_cached_tokens
             state.kv_attached = True
             self._running[request_id] = state
+
+    @staticmethod
+    def _pending_tokens(state: _RequestState) -> int:
+        return state.num_tokens - state.num_computed_tokens
+
+    @staticmethod
+    def _max_remaining_tokens(state: _RequestState) -> int:
+        return state.max_num_tokens - state.num_computed_tokens

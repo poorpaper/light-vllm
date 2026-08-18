@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.sse import EventSourceResponse, format_sse_event
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -26,6 +26,8 @@ from light_vllm.runtime.generation.interfaces import (
     GenerationRejectedError,
     TokenGenerated,
 )
+from light_vllm.runtime.observability.interfaces import PerformanceMetricsReader
+from light_vllm.serving.prometheus import PROMETHEUS_CONTENT_TYPE, render_prometheus
 
 TokenId = Annotated[int, Field(strict=True, ge=0)]
 Lifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
@@ -197,6 +199,7 @@ def create_http_app(
     engine: EngineClient,
     *,
     lifespan: Lifespan | None = None,
+    performance_metrics: PerformanceMetricsReader | None = None,
 ) -> FastAPI:
     """用给定的 ``EngineClient`` 创建 FastAPI 应用。
 
@@ -225,6 +228,15 @@ def create_http_app(
     @app.get("/capabilities", response_model=CapabilitiesResponse)
     def capabilities() -> CapabilitiesResponse:
         return CapabilitiesResponse.from_contract(engine.capabilities)
+
+    if performance_metrics is not None:
+
+        @app.get("/metrics", include_in_schema=False, response_class=Response)
+        def metrics() -> Response:
+            return Response(
+                render_prometheus(performance_metrics.snapshot()),
+                media_type=PROMETHEUS_CONTENT_TYPE,
+            )
 
     @app.post(
         "/generate",

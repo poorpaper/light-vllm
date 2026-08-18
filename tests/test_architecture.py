@@ -47,6 +47,9 @@ def test_interface_modules_do_not_import_their_implementations() -> None:
         SOURCE_ROOT / "runtime" / "scheduler" / "interfaces.py": (
             "light_vllm.runtime.scheduler.token_budget",
         ),
+        SOURCE_ROOT / "runtime" / "observability" / "interfaces.py": (
+            "light_vllm.runtime.observability.performance",
+        ),
     }
 
     for path, implementations in boundaries.items():
@@ -94,6 +97,13 @@ def test_speculative_strategy_stays_out_of_scheduler_and_worker() -> None:
     )
     for path in targets:
         assert "light_vllm.runtime.execution.speculative" not in _imported_modules(path), path
+
+
+def test_observability_implementation_is_not_reexported_from_root() -> None:
+    import light_vllm
+
+    assert not hasattr(light_vllm, "InMemoryPerformanceObserver")
+    assert not hasattr(light_vllm, "PerformanceSnapshot")
 
 
 def test_cacheable_models_delegate_softmax_to_attention_context() -> None:

@@ -1,0 +1,12 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: light-vllm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: light-vllm
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 5s

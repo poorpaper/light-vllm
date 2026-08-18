@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from math import isfinite
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -168,9 +170,10 @@ class RequestOutput:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionOutput:
-    """一次模型执行中每个请求的独立结果。"""
+    """一次模型执行中每个请求的独立结果与设备完成耗时。"""
 
     requests: tuple[RequestOutput, ...]
+    step_elapsed_seconds: float | None = None
 
     def __post_init__(self) -> None:
         requests = tuple(self.requests)
@@ -179,7 +182,20 @@ class ExecutionOutput:
             raise ValueError("execution output must not be empty")
         if len(set(request_ids)) != len(request_ids):
             raise ValueError("execution output request IDs must be unique")
+        if self.step_elapsed_seconds is not None and (
+            not isfinite(self.step_elapsed_seconds) or self.step_elapsed_seconds < 0
+        ):
+            raise ValueError("step_elapsed_seconds must be finite and non-negative")
         object.__setattr__(self, "requests", requests)
+
+
+class ExecutionTimer(Protocol):
+    """测量一次完整设备步骤；具体后端负责定义完成边界。"""
+
+    def measure(
+        self,
+        operation: Callable[[], ExecutionOutput],
+    ) -> tuple[ExecutionOutput, float]: ...
 
 
 class ExecutionLease(Protocol):
