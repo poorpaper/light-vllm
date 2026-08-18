@@ -29,6 +29,39 @@ class DecodingBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class ShortRequestPolicy:
+    """为首 token 工作量小且总长度受限的请求保留资源。
+
+    预留 token 和 sequence 只用于短请求的首次输出；已经产生
+    可见 token 的请求回到通用池，不长期占用 TTFT 保护资源。
+    """
+
+    max_effective_prompt_tokens: int
+    max_total_tokens: int
+    reserved_scheduled_tokens: int
+    reserved_kv_token_slots: int
+    reserved_sequences: int = 1
+    regular_aging_steps: int = 8
+
+    def __post_init__(self) -> None:
+        values = (
+            self.max_effective_prompt_tokens,
+            self.max_total_tokens,
+            self.reserved_scheduled_tokens,
+            self.reserved_sequences,
+            self.regular_aging_steps,
+        )
+        if any(type(value) is not int or value <= 0 for value in values):
+            raise ValueError("short-request limits and reserves must be positive integers")
+        if type(self.reserved_kv_token_slots) is not int or self.reserved_kv_token_slots < 0:
+            raise ValueError("reserved_kv_token_slots must be a non-negative integer")
+        if self.reserved_scheduled_tokens < self.max_effective_prompt_tokens:
+            raise ValueError("short token reserve must cover one eligible effective prompt")
+        if self.reserved_kv_token_slots < self.max_total_tokens - 1:
+            raise ValueError("short KV reserve must cover one eligible request")
+
+
+@dataclass(frozen=True, slots=True)
 class ScheduledRequest:
     """Scheduler 为一个请求安排的本轮工作量。
 

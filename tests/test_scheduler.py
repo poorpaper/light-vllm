@@ -6,7 +6,12 @@ from light_vllm.runtime.kv_cache import (
     PagedKVCacheManager,
     UnboundedKVCacheManager,
 )
-from light_vllm.runtime.scheduler import DecodingBudget, SchedulerError, TokenBudgetScheduler
+from light_vllm.runtime.scheduler import (
+    DecodingBudget,
+    SchedulerError,
+    ShortRequestPolicy,
+    TokenBudgetScheduler,
+)
 
 
 def _scheduler(*, token_budget: int = 4, num_blocks: int = 8) -> TokenBudgetScheduler:
@@ -14,6 +19,25 @@ def _scheduler(*, token_budget: int = 4, num_blocks: int = 8) -> TokenBudgetSche
         PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=num_blocks, block_size=2)),
         max_num_sequences=2,
         max_num_scheduled_tokens=token_budget,
+    )
+
+
+def _short_policy(
+    *,
+    max_effective_prompt_tokens: int = 2,
+    max_total_tokens: int = 4,
+    reserved_scheduled_tokens: int = 2,
+    reserved_kv_token_slots: int = 3,
+    reserved_sequences: int = 1,
+    regular_aging_steps: int = 3,
+) -> ShortRequestPolicy:
+    return ShortRequestPolicy(
+        max_effective_prompt_tokens=max_effective_prompt_tokens,
+        max_total_tokens=max_total_tokens,
+        reserved_scheduled_tokens=reserved_scheduled_tokens,
+        reserved_kv_token_slots=reserved_kv_token_slots,
+        reserved_sequences=reserved_sequences,
+        regular_aging_steps=regular_aging_steps,
     )
 
 
@@ -76,6 +100,142 @@ def test_scheduler_keeps_unsafe_completion_claims_waiting() -> None:
 
     scheduler.remove("a")
     second = scheduler.schedule()
+    assert second.request_ids == ("b",)
+
+
+def test_short_request_reserve_runs_beside_a_long_prefill() -> None:
+    scheduler = TokenBudgetScheduler(
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=1)),
+        max_num_sequences=2,
+        max_num_scheduled_tokens=4,
+        short_request_policy=_short_policy(),
+    )
+    scheduler.add("long", token_ids=(1, 2, 3, 4), max_num_tokens=8)
+
+    first = scheduler.schedule().requests[0]
+    assert (first.request_id, first.num_scheduled_tokens) == ("long", 2)
+    scheduler.complete("long", num_committed_tokens=2, num_new_tokens=0)
+    scheduler.add("short", token_ids=(5, 6), max_num_tokens=4)
+
+    output = scheduler.schedule()
+
+    assert [
+        (item.request_id, item.num_scheduled_tokens, item.max_output_tokens)
+        for item in output.requests
+    ] == [("short", 2, 1), ("long", 2, 1)]
+
+    for item in output.requests:
+        scheduler.complete(
+            item.request_id,
+            num_committed_tokens=item.num_scheduled_tokens,
+            num_new_tokens=1,
+        )
+
+    # 首 token 之后短请求只能进入通用池，不能继续占用预留池。
+    assert scheduler.schedule().request_ids == ("long",)
+
+
+def test_short_kv_headroom_is_not_claimed_by_regular_requests() -> None:
+    scheduler = TokenBudgetScheduler(
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=7, block_size=1)),
+        max_num_sequences=2,
+        max_num_scheduled_tokens=4,
+        short_request_policy=_short_policy(),
+    )
+    scheduler.add("regular", token_ids=(1,), max_num_tokens=6)
+    scheduler.add("short", token_ids=(2, 3), max_num_tokens=4)
+
+    output = scheduler.schedule()
+
+    assert output.request_ids == ("short",)
+    assert scheduler.stats.running_requests == 1
+    assert scheduler.stats.waiting_requests == 1
+
+
+def test_cached_prefix_uses_effective_prompt_for_short_classification() -> None:
+    cache = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=12, block_size=2),
+        enable_prefix_caching=True,
+    )
+    warm_tokens = (1, 2, 3, 4, 5)
+    cache.try_add_request(
+        "warm",
+        token_ids=warm_tokens,
+        max_num_committed_tokens=len(warm_tokens),
+        cache_epoch=1,
+    )
+    cache.reserve("warm", len(warm_tokens))
+    cache.commit("warm", len(warm_tokens))
+    cache.free("warm")
+    scheduler = TokenBudgetScheduler(
+        cache,
+        max_num_sequences=2,
+        max_num_scheduled_tokens=3,
+        short_request_policy=_short_policy(
+            max_effective_prompt_tokens=1,
+            max_total_tokens=6,
+            reserved_scheduled_tokens=1,
+            reserved_kv_token_slots=5,
+        ),
+    )
+    scheduler.add("regular", token_ids=(8, 9), max_num_tokens=7, cache_epoch=1)
+    scheduler.add("hit", token_ids=(1, 2, 3, 4, 7), max_num_tokens=6, cache_epoch=1)
+
+    output = scheduler.schedule()
+
+    assert output.request_ids == ("hit", "regular")
+    assert output.requests[0].num_computed_tokens == 4
+    assert output.requests[0].max_output_tokens == 1
+
+
+def test_aged_regular_request_can_borrow_short_kv_headroom() -> None:
+    scheduler = TokenBudgetScheduler(
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=10, block_size=1)),
+        max_num_sequences=2,
+        max_num_scheduled_tokens=3,
+        short_request_policy=_short_policy(
+            reserved_scheduled_tokens=2,
+            regular_aging_steps=3,
+        ),
+    )
+    scheduler.add("incumbent", token_ids=(1, 2, 3, 4), max_num_tokens=5)
+    first = scheduler.schedule().requests[0]
+    scheduler.complete(
+        "incumbent",
+        num_committed_tokens=first.num_scheduled_tokens,
+        num_new_tokens=0,
+    )
+    scheduler.add("aged", token_ids=(5,), max_num_tokens=5)
+
+    for _ in range(2):
+        output = scheduler.schedule()
+        assert output.request_ids == ("incumbent",)
+        scheduler.complete(
+            "incumbent",
+            num_committed_tokens=output.requests[0].num_scheduled_tokens,
+            num_new_tokens=0,
+        )
+
+    scheduler.schedule()
+
+    assert scheduler.stats.running_requests == 2
+    assert scheduler.stats.waiting_requests == 0
+
+
+def test_common_pool_rotates_admitted_requests() -> None:
+    scheduler = TokenBudgetScheduler(
+        UnboundedKVCacheManager(),
+        max_num_sequences=1,
+        max_num_scheduled_tokens=1,
+    )
+    scheduler.add("a", token_ids=(1, 2, 3), max_num_tokens=5)
+    scheduler.add("b", token_ids=(4, 5, 6), max_num_tokens=5)
+
+    first = scheduler.schedule()
+    scheduler.complete("a", num_committed_tokens=1, num_new_tokens=0)
+    second = scheduler.schedule()
+
+    assert first.request_ids == ("a",)
     assert second.request_ids == ("b",)
 
 

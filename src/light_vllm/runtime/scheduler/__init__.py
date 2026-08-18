@@ -5,6 +5,7 @@ from light_vllm.runtime.scheduler.interfaces import (
     SchedulerError,
     SchedulerOutput,
     SchedulerStats,
+    ShortRequestPolicy,
 )
 from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 
@@ -15,5 +16,6 @@ __all__ = [
     "SchedulerError",
     "SchedulerOutput",
     "SchedulerStats",
+    "ShortRequestPolicy",
     "TokenBudgetScheduler",
 ]

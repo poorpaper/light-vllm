@@ -13,6 +13,7 @@ from light_vllm.runtime.scheduler.interfaces import (
     SchedulerError,
     SchedulerOutput,
     SchedulerStats,
+    ShortRequestPolicy,
 )
 
 
@@ -24,6 +25,9 @@ class _RequestState:
     cache_epoch: int | None
     num_computed_tokens: int = 0
     kv_attached: bool = False
+    is_short: bool = False
+    has_visible_output: bool = False
+    waiting_steps: int = 0
 
 
 class TokenBudgetScheduler:
@@ -40,17 +44,26 @@ class TokenBudgetScheduler:
         max_num_sequences: int,
         max_num_scheduled_tokens: int,
         decoding_budget: DecodingBudget | None = None,
+        short_request_policy: ShortRequestPolicy | None = None,
     ) -> None:
         if type(max_num_sequences) is not int or max_num_sequences <= 0:
             raise ValueError("max_num_sequences must be a positive integer")
         if type(max_num_scheduled_tokens) is not int or max_num_scheduled_tokens <= 0:
             raise ValueError("max_num_scheduled_tokens must be a positive integer")
+        if short_request_policy is not None:
+            if short_request_policy.reserved_sequences >= max_num_sequences:
+                raise ValueError("short sequence reserve must leave a common sequence slot")
+            if short_request_policy.reserved_scheduled_tokens >= max_num_scheduled_tokens:
+                raise ValueError("short token reserve must leave a common token budget")
         self._kv_cache = kv_cache
         self._max_num_sequences = max_num_sequences
         self._max_num_scheduled_tokens = max_num_scheduled_tokens
         self._decoding_budget = decoding_budget or DecodingBudget()
+        self._short_request_policy = short_request_policy
         self._waiting: deque[str] = deque()
         self._running: dict[str, _RequestState] = {}
+        self._short_launch_order: deque[str] = deque()
+        self._common_order: deque[str] = deque()
         self._states: dict[str, _RequestState] = {}
 
     @property
@@ -122,75 +135,124 @@ class TokenBudgetScheduler:
         self._running.pop(request_id, None)
         with suppress(ValueError):
             self._waiting.remove(request_id)
+        for order in (self._short_launch_order, self._common_order):
+            with suppress(ValueError):
+                order.remove(request_id)
         if state.kv_attached:
             self._kv_cache.free(request_id)
         return True
 
     def schedule(self) -> SchedulerOutput:
-        self._fill_open_slots()
-        token_budget = self._max_num_scheduled_tokens
+        self._age_waiting_requests()
+        self._admit_waiting_requests()
         scheduled: list[ScheduledRequest] = []
 
-        for request_id, state in self._running.items():
-            if token_budget == 0:
+        policy = self._short_request_policy
+        short_token_budget = 0 if policy is None else policy.reserved_scheduled_tokens
+        short_sequence_budget = 0 if policy is None else policy.reserved_sequences
+
+        # 短请求预留池只帮助尚未产生首 token 的请求。
+        for request_id in self._rotate_request_ids(self._short_launch_order):
+            if short_token_budget == 0 or short_sequence_budget == 0:
                 break
-            # 这些 token 已经确定，但还没有算完并写入 KV cache。
-            pending_tokens = state.num_tokens - state.num_computed_tokens
-            if pending_tokens <= 0:
-                raise SchedulerError(f"request {request_id!r} has no pending tokens")
-
-            num_scheduled_tokens = min(pending_tokens, token_budget)
-            num_lookahead_tokens = 0
-            max_output_tokens = 0
-            # 只有本轮把现有 token 全部算完，才可以继续生成新 token。
-            if num_scheduled_tokens == pending_tokens:
-                remaining_output_tokens = state.max_num_tokens - state.num_tokens
-                if remaining_output_tokens <= 0:
-                    raise SchedulerError(f"request {request_id!r} reached its token limit")
-                round_max_output_tokens = min(
-                    self._decoding_budget.max_output_tokens,
-                    remaining_output_tokens,
-                )
-                # 最后一个确认 token 不会写入 KV，所以最多只需为其余输出预留位置。
-                desired_lookahead = min(
-                    self._decoding_budget.num_lookahead_tokens,
-                    round_max_output_tokens - 1,
-                )
-                if num_scheduled_tokens + desired_lookahead <= token_budget:
-                    num_lookahead_tokens = desired_lookahead
-                    max_output_tokens = round_max_output_tokens
-                elif pending_tokens == 1:
-                    # 资源紧张时退化为普通 decode，保证请求仍能前进。
-                    max_output_tokens = 1
-                else:
-                    # 当前预算不够时留一个 token 到下一轮，届时再申请投机位置。
-                    num_scheduled_tokens -= 1
-
-            # 投机位置也可能写入 KV cache，因此必须和现有输入一起预留空间。
-            num_reserved_tokens = num_scheduled_tokens + num_lookahead_tokens
-            try:
-                reservation = self._kv_cache.reserve(request_id, num_reserved_tokens)
-            except KVCacheCapacityError as exc:
-                raise SchedulerError(
-                    "an admitted request lost its KV completion guarantee"
-                ) from exc
-
-            scheduled.append(
-                ScheduledRequest(
-                    request_id=request_id,
-                    num_computed_tokens=state.num_computed_tokens,
-                    num_scheduled_tokens=num_scheduled_tokens,
-                    num_lookahead_tokens=num_lookahead_tokens,
-                    max_output_tokens=max_output_tokens,
-                    block_ids=reservation.block_ids,
-                    num_readonly_prefix_blocks=reservation.num_readonly_prefix_blocks,
-                )
+            state = self._running[request_id]
+            item, consumed = self._schedule_request(
+                request_id,
+                state,
+                short_token_budget,
+                prioritize_first_output=True,
             )
-            token_budget -= num_reserved_tokens
+            if item is None:
+                continue
+            scheduled.append(item)
+            short_token_budget -= consumed
+            short_sequence_budget -= 1
+
+        common_token_budget = self._max_num_scheduled_tokens - (
+            0 if policy is None else policy.reserved_scheduled_tokens
+        )
+        common_sequence_budget = self._max_num_sequences - (
+            0 if policy is None else policy.reserved_sequences
+        )
+
+        # 通用池使用 round-robin，避免队首长 prefill 连续吃完每轮预算。
+        for request_id in self._rotate_request_ids(self._common_order):
+            if common_token_budget == 0 or common_sequence_budget == 0:
+                break
+            state = self._running[request_id]
+            item, consumed = self._schedule_request(request_id, state, common_token_budget)
+            if item is None:
+                continue
+            scheduled.append(item)
+            common_token_budget -= consumed
+            common_sequence_budget -= 1
 
         if not scheduled:
-            raise SchedulerError("no request fits the token budget and available KV cache")
+            raise SchedulerError("no admitted request can make progress")
         return SchedulerOutput(requests=tuple(scheduled))
+
+    def _schedule_request(
+        self,
+        request_id: str,
+        state: _RequestState,
+        token_budget: int,
+        *,
+        prioritize_first_output: bool = False,
+    ) -> tuple[ScheduledRequest | None, int]:
+        if token_budget <= 0:
+            return None, 0
+
+        # 这些 token 已经确定，但还没有算完并写入 KV cache。
+        pending_tokens = state.num_tokens - state.num_computed_tokens
+        if pending_tokens <= 0:
+            raise SchedulerError(f"request {request_id!r} has no pending tokens")
+
+        num_scheduled_tokens = min(pending_tokens, token_budget)
+        num_lookahead_tokens = 0
+        max_output_tokens = 0
+        # 只有本轮把现有 token 全部算完，才可以继续生成新 token。
+        if num_scheduled_tokens == pending_tokens:
+            remaining_output_tokens = state.max_num_tokens - state.num_tokens
+            if remaining_output_tokens <= 0:
+                raise SchedulerError(f"request {request_id!r} reached its token limit")
+            round_max_output_tokens = min(
+                self._decoding_budget.max_output_tokens,
+                remaining_output_tokens,
+            )
+            # 最后一个确认 token 不会写入 KV，所以最多只需为其余输出预留位置。
+            desired_lookahead = min(
+                self._decoding_budget.num_lookahead_tokens,
+                round_max_output_tokens - 1,
+            )
+            if num_scheduled_tokens + desired_lookahead <= token_budget:
+                num_lookahead_tokens = desired_lookahead
+                max_output_tokens = round_max_output_tokens
+            elif pending_tokens == 1 or prioritize_first_output:
+                # 短请求优先在本轮产出首 token，不为投机 lookahead 多等一步。
+                max_output_tokens = 1
+            else:
+                # 当前预算不够时留一个 token 到下一轮，届时再申请投机位置。
+                num_scheduled_tokens -= 1
+
+        # 投机位置也可能写入 KV cache，因此必须和现有输入一起预留空间。
+        num_reserved_tokens = num_scheduled_tokens + num_lookahead_tokens
+        try:
+            reservation = self._kv_cache.reserve(request_id, num_reserved_tokens)
+        except KVCacheCapacityError as exc:
+            raise SchedulerError("an admitted request lost its KV completion guarantee") from exc
+
+        return (
+            ScheduledRequest(
+                request_id=request_id,
+                num_computed_tokens=state.num_computed_tokens,
+                num_scheduled_tokens=num_scheduled_tokens,
+                num_lookahead_tokens=num_lookahead_tokens,
+                max_output_tokens=max_output_tokens,
+                block_ids=reservation.block_ids,
+                num_readonly_prefix_blocks=reservation.num_readonly_prefix_blocks,
+            ),
+            num_reserved_tokens,
+        )
 
     def complete(
         self,
@@ -220,27 +282,121 @@ class TokenBudgetScheduler:
         state.num_computed_tokens = next_num_computed_tokens
         # 尚未写入缓存的新 token 会在下一轮作为普通输入继续计算。
         state.num_tokens = next_num_tokens
+        had_visible_output = state.has_visible_output
+        state.has_visible_output = had_visible_output or num_new_tokens > 0
+        if state.is_short and not had_visible_output and state.has_visible_output:
+            self._short_launch_order.remove(request_id)
+            self._common_order.append(request_id)
 
-    def _fill_open_slots(self) -> None:
-        while self._waiting and len(self._running) < self._max_num_sequences:
-            request_id = self._waiting[0]
+    def _age_waiting_requests(self) -> None:
+        if self._short_request_policy is None:
+            return
+        for request_id in self._waiting:
             state = self._states[request_id]
-            match = self._kv_cache.try_add_request(
-                request_id,
-                token_ids=state.prompt_token_ids,
-                # 最后一个可见输出用于结束请求，不再需要写入 KV。
-                max_num_committed_tokens=state.max_num_tokens - 1,
-                cache_epoch=state.cache_epoch,
+            if not self._is_short_request(state):
+                state.waiting_steps += 1
+
+    def _admit_waiting_requests(self) -> None:
+        if not self._waiting:
+            return
+        policy = self._short_request_policy
+        if policy is None:
+            while self._waiting:
+                if not self._try_admit(self._waiting[0], is_short=False, min_free_tokens=0):
+                    return
+            return
+
+        classifications = tuple(
+            (request_id, self._is_short_request(self._states[request_id]))
+            for request_id in self._waiting
+        )
+        barrier = next(
+            (
+                request_id
+                for request_id, is_short in classifications
+                if not is_short
+                and self._states[request_id].waiting_steps >= policy.regular_aging_steps
+            ),
+            None,
+        )
+        # 老化的常规请求暂时不再为后来短请求让出 KV 水位。
+        if barrier is not None and not self._try_admit(
+            barrier,
+            is_short=False,
+            min_free_tokens=0,
+        ):
+            return
+
+        for desired_short, min_free_tokens in (
+            (True, 0),
+            (False, policy.reserved_kv_token_slots),
+        ):
+            candidates = tuple(
+                request_id
+                for request_id, is_short in classifications
+                if is_short is desired_short and request_id in self._waiting
             )
-            if match is None:
-                return
-            self._waiting.popleft()
-            if not 0 <= match.num_cached_tokens < len(state.prompt_token_ids):
-                self._kv_cache.free(request_id)
-                raise SchedulerError("cached prefix must leave at least one token to compute")
-            state.num_computed_tokens = match.num_cached_tokens
-            state.kv_attached = True
-            self._running[request_id] = state
+            for request_id in candidates:
+                if not self._try_admit(
+                    request_id,
+                    is_short=desired_short,
+                    min_free_tokens=min_free_tokens,
+                ):
+                    # lane 内保持 FCFS，不让后来的小请求反复绕过队首。
+                    break
+
+        if not self._running and self._waiting:
+            # 没有可运行请求时不空转；最老请求可临时借用短请求水位。
+            self._try_admit(self._waiting[0], is_short=False, min_free_tokens=0)
+
+    def _try_admit(
+        self,
+        request_id: str,
+        *,
+        is_short: bool,
+        min_free_tokens: int,
+    ) -> bool:
+        state = self._states[request_id]
+        match = self._kv_cache.try_add_request(
+            request_id,
+            token_ids=state.prompt_token_ids,
+            # 最后一个可见输出用于结束请求，不再需要写入 KV。
+            max_num_committed_tokens=state.max_num_tokens - 1,
+            cache_epoch=state.cache_epoch,
+            min_free_token_slots=min_free_tokens,
+        )
+        if match is None:
+            return False
+        if not 0 <= match.num_cached_tokens < len(state.prompt_token_ids):
+            self._kv_cache.free(request_id)
+            raise SchedulerError("cached prefix must leave at least one token to compute")
+
+        self._waiting.remove(request_id)
+        state.num_computed_tokens = match.num_cached_tokens
+        state.kv_attached = True
+        state.is_short = is_short
+        self._running[request_id] = state
+        order = self._short_launch_order if is_short else self._common_order
+        order.append(request_id)
+        return True
+
+    def _is_short_request(self, state: _RequestState) -> bool:
+        policy = self._short_request_policy
+        if policy is None or state.max_num_tokens > policy.max_total_tokens:
+            return False
+        match = self._kv_cache.preview_prefix(
+            token_ids=state.prompt_token_ids,
+            cache_epoch=state.cache_epoch,
+        )
+        effective_prompt_tokens = len(state.prompt_token_ids) - match.num_cached_tokens
+        return effective_prompt_tokens <= policy.max_effective_prompt_tokens
+
+    @staticmethod
+    def _rotate_request_ids(order: deque[str]) -> tuple[str, ...]:
+        request_ids = tuple(order)
+        if request_ids:
+            order.rotate(-1)
+        return request_ids
 
     @staticmethod
     def _pending_tokens(state: _RequestState) -> int:
