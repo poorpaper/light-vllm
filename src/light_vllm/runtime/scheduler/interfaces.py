@@ -62,6 +62,24 @@ class ShortRequestPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class SelfResubmitPolicy:
+    """KV 撞墙时只回滚当前请求，并为重算设置明确上限。
+
+    达到任一上限后，请求下一次准入会自动恢复 completion claim，
+    从而保证策略不会无限回滚。
+    """
+
+    max_resubmits: int = 2
+    max_recomputed_tokens: int = 4096
+
+    def __post_init__(self) -> None:
+        if type(self.max_resubmits) is not int or self.max_resubmits <= 0:
+            raise ValueError("max_resubmits must be a positive integer")
+        if type(self.max_recomputed_tokens) is not int or self.max_recomputed_tokens < 0:
+            raise ValueError("max_recomputed_tokens must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
 class ScheduledRequest:
     """Scheduler 为一个请求安排的本轮工作量。
 

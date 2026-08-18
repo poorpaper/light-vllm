@@ -13,6 +13,7 @@ from light_vllm.runtime.scheduler.interfaces import (
     SchedulerError,
     SchedulerOutput,
     SchedulerStats,
+    SelfResubmitPolicy,
     ShortRequestPolicy,
 )
 
@@ -29,6 +30,10 @@ class _RequestState:
     uses_short_admission_slot: bool = False
     has_visible_output: bool = False
     waiting_steps: int = 0
+    has_completion_claim: bool = False
+    force_completion_claim: bool = False
+    num_resubmits: int = 0
+    num_recomputed_tokens: int = 0
 
 
 class TokenBudgetScheduler:
@@ -46,6 +51,7 @@ class TokenBudgetScheduler:
         max_num_scheduled_tokens: int,
         decoding_budget: DecodingBudget | None = None,
         short_request_policy: ShortRequestPolicy | None = None,
+        self_resubmit_policy: SelfResubmitPolicy | None = None,
     ) -> None:
         if type(max_num_sequences) is not int or max_num_sequences <= 0:
             raise ValueError("max_num_sequences must be a positive integer")
@@ -61,11 +67,13 @@ class TokenBudgetScheduler:
         self._max_num_scheduled_tokens = max_num_scheduled_tokens
         self._decoding_budget = decoding_budget or DecodingBudget()
         self._short_request_policy = short_request_policy
+        self._self_resubmit_policy = self_resubmit_policy
         self._waiting: deque[str] = deque()
         self._running: dict[str, _RequestState] = {}
         self._short_launch_order: deque[str] = deque()
         self._common_order: deque[str] = deque()
         self._states: dict[str, _RequestState] = {}
+        self._resubmitted_in_step: list[str] = []
 
     @property
     def has_requests(self) -> bool:
@@ -144,10 +152,33 @@ class TokenBudgetScheduler:
         return True
 
     def schedule(self) -> SchedulerOutput:
+        self._resubmitted_in_step.clear()
         self._rebalance_admission_slots()
         classifications = self._classify_waiting_requests()
         self._age_waiting_requests(classifications)
         self._admit_waiting_requests(classifications)
+        scheduled = self._schedule_admitted_requests()
+
+        if not scheduled and self._resubmitted_in_step:
+            # 全部候选都撞墙时，让最早回滚者改走 strict claim，保证下一步能前进。
+            recovery_id = self._resubmitted_in_step[0]
+            recovery = self._states[recovery_id]
+            recovery.force_completion_claim = True
+            policy = self._short_request_policy
+            if policy is not None:
+                recovery.waiting_steps = max(
+                    recovery.waiting_steps,
+                    policy.regular_aging_steps,
+                )
+            classifications = self._classify_waiting_requests()
+            self._admit_waiting_requests(classifications)
+            scheduled = self._schedule_admitted_requests()
+
+        if not scheduled:
+            raise SchedulerError("no admitted request can make progress")
+        return SchedulerOutput(requests=tuple(scheduled))
+
+    def _schedule_admitted_requests(self) -> list[ScheduledRequest]:
         scheduled: list[ScheduledRequest] = []
 
         policy = self._short_request_policy
@@ -190,9 +221,7 @@ class TokenBudgetScheduler:
             common_token_budget -= consumed
             common_sequence_budget -= 1
 
-        if not scheduled:
-            raise SchedulerError("no admitted request can make progress")
-        return SchedulerOutput(requests=tuple(scheduled))
+        return scheduled
 
     def _schedule_request(
         self,
@@ -242,6 +271,9 @@ class TokenBudgetScheduler:
         try:
             reservation = self._kv_cache.reserve(request_id, num_reserved_tokens)
         except KVCacheCapacityError as exc:
+            if self._self_resubmit_policy is not None and not state.has_completion_claim:
+                self._resubmit(request_id, state)
+                return None, 0
             raise SchedulerError("an admitted request lost its KV completion guarantee") from exc
 
         return (
@@ -378,6 +410,9 @@ class TokenBudgetScheduler:
         min_free_tokens: int,
     ) -> bool:
         state = self._states[request_id]
+        guarantee_completion = (
+            self._self_resubmit_policy is None or is_short or state.force_completion_claim
+        )
         match = self._kv_cache.try_add_request(
             request_id,
             token_ids=state.prompt_token_ids,
@@ -385,6 +420,7 @@ class TokenBudgetScheduler:
             max_num_committed_tokens=state.max_num_tokens - 1,
             cache_epoch=state.cache_epoch,
             min_free_token_slots=min_free_tokens,
+            guarantee_completion=guarantee_completion,
         )
         if match is None:
             return False
@@ -397,6 +433,7 @@ class TokenBudgetScheduler:
         state.kv_attached = True
         state.is_short = is_short
         state.uses_short_admission_slot = is_short
+        state.has_completion_claim = guarantee_completion
         self._running[request_id] = state
         order = self._short_launch_order if is_short else self._common_order
         order.append(request_id)
@@ -404,7 +441,11 @@ class TokenBudgetScheduler:
 
     def _is_short_request(self, state: _RequestState) -> bool:
         policy = self._short_request_policy
-        if policy is None or state.max_num_tokens > policy.max_total_tokens:
+        if (
+            policy is None
+            or state.has_visible_output
+            or state.max_num_tokens > policy.max_total_tokens
+        ):
             return False
         match = self._kv_cache.preview_prefix(
             token_ids=state.prompt_token_ids,
@@ -412,6 +453,36 @@ class TokenBudgetScheduler:
         )
         effective_prompt_tokens = len(state.prompt_token_ids) - match.num_cached_tokens
         return effective_prompt_tokens <= policy.max_effective_prompt_tokens
+
+    def _resubmit(self, request_id: str, state: _RequestState) -> None:
+        """释放撞墙者自己的 KV，并把完整 token 历史留给 Engine 重算。"""
+
+        self._running.pop(request_id)
+        for order in (self._short_launch_order, self._common_order):
+            with suppress(ValueError):
+                order.remove(request_id)
+        self._kv_cache.free(request_id)
+
+        state.num_resubmits += 1
+        state.num_recomputed_tokens += state.num_computed_tokens
+        state.num_computed_tokens = 0
+        state.kv_attached = False
+        state.is_short = False
+        state.uses_short_admission_slot = False
+        state.has_completion_claim = False
+
+        policy = self._self_resubmit_policy
+        assert policy is not None
+        if (
+            state.num_resubmits >= policy.max_resubmits
+            or state.num_recomputed_tokens >= policy.max_recomputed_tokens
+        ):
+            state.force_completion_claim = True
+        short_policy = self._short_request_policy
+        if short_policy is not None:
+            state.waiting_steps = max(state.waiting_steps, short_policy.regular_aging_steps)
+        self._waiting.append(request_id)
+        self._resubmitted_in_step.append(request_id)
 
     def _rebalance_admission_slots(self) -> None:
         """有通用 slot 时，把已出首 token 的短请求迁出准入保留区。"""

@@ -9,6 +9,7 @@ from light_vllm.runtime.kv_cache import (
 from light_vllm.runtime.scheduler import (
     DecodingBudget,
     SchedulerError,
+    SelfResubmitPolicy,
     ShortRequestPolicy,
     TokenBudgetScheduler,
 )
@@ -271,6 +272,39 @@ def test_common_pool_rotates_admitted_requests() -> None:
     assert second.request_ids == ("b",)
 
 
+def test_self_resubmit_recomputes_without_reemitting_and_then_falls_back_to_strict() -> None:
+    scheduler = TokenBudgetScheduler(
+        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1)),
+        max_num_sequences=2,
+        max_num_scheduled_tokens=1,
+        self_resubmit_policy=SelfResubmitPolicy(
+            max_resubmits=1,
+            max_recomputed_tokens=100,
+        ),
+    )
+    scheduler.add("a", token_ids=(1,), max_num_tokens=4)
+    scheduler.add("b", token_ids=(2,), max_num_tokens=4)
+
+    for request_id in ("a", "b", "a", "b"):
+        output = scheduler.schedule()
+        assert output.request_ids == (request_id,)
+        scheduler.complete(request_id, num_committed_tokens=1, num_new_tokens=1)
+
+    # a 撞墙后只释放自己的两页；b 使用释放出的空间完成本轮。
+    collision = scheduler.schedule()
+    assert collision.request_ids == ("b",)
+    assert scheduler.stats.waiting_requests == 1
+    scheduler.complete("b", num_committed_tokens=1, num_new_tokens=1)
+    scheduler.remove("b")
+
+    recompute = scheduler.schedule().requests[0]
+    assert recompute.request_id == "a"
+    assert recompute.num_computed_tokens == 0
+    assert recompute.max_output_tokens == 0
+    # 已达 resubmit 上限，a 重新准入时恢复了 completion claim。
+    assert scheduler.stats.kv_cache.claimed_token_slots == 2
+
+
 def test_scheduler_rejects_duplicate_request_ids() -> None:
     scheduler = _scheduler()
     scheduler.add("request", token_ids=(1,), max_num_tokens=5)
@@ -354,6 +388,7 @@ def test_scheduler_releases_an_invalid_prefix_match() -> None:
             max_num_committed_tokens,
             cache_epoch,
             min_free_token_slots=0,
+            guarantee_completion=True,
         ):
             return KVCacheMatch(num_cached_tokens=len(token_ids))
 
