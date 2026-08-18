@@ -17,7 +17,7 @@ Engine runtime 启动后直接暴露 `GET /metrics`，不需要在 token 热路�
 | --- | --- |
 | `light_vllm_time_to_first_token_seconds` | 请求准入到首个可见 token |
 | `light_vllm_inter_token_latency_seconds` | 首 token 之后，相邻可见输出 token 的间隔 |
-| `light_vllm_engine_step_seconds` | 按 scheduled-token 上界分桶的已完成设备 step 延迟 |
+| `light_vllm_engine_step_seconds` | 按实际模型 token 上界分桶的已完成设备 step 延迟 |
 | `light_vllm_requests_waiting` | 等待 Scheduler 槽位的请求数 |
 | `light_vllm_waiting_pending_tokens` | 等待请求当前已知但尚未计算的输入 |
 | `light_vllm_waiting_max_remaining_tokens` | 包含最大输出预算的保守上界，适合作为 HPA backlog |

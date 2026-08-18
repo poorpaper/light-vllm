@@ -1,4 +1,4 @@
-# light-vllm 架构设计（v0.12）
+# light-vllm 架构设计（v0.13）
 
 这份文档记录当前已经落地的设计。更细的职责说明见 [architecture.md](architecture.md)。
 
@@ -14,6 +14,7 @@
 | 少模式分支 | 不用 prefill/decode/greedy/KV 专用 Executor |
 | 成熟实践 | 采用统一 token budget、Scheduler/KV 协作和 Step Handler 物理缓存边界 |
 | 可观测 | 独立 PerformanceObserver 记录事实，Prometheus/Grafana 只做控制面消费 |
+| SLO 保护 | 短请求资源池与独立 TTFTAdmission 通过组合接入，不污染 Worker 热路径 |
 
 ## 2. 包结构
 
@@ -66,6 +67,8 @@ flowchart TB
     Bridge --> Reference["ReferenceGenerationService"]
 
     Core --> Scheduler["TokenBudgetScheduler"]
+    Core --> TTFT["TTFTAdmission<br/>predict / reject"]
+    TTFT --> Predictor["StepLatencyPredictor<br/>sliding window"]
     Core --> Observer["PerformanceObserver<br/>TTFT / ITL / step / outcomes"]
     Scheduler --> Observer
     Observer --> Metrics["Prometheus /metrics"]
@@ -111,6 +114,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `GenerateRequest` / events | 协议无关的用户生成语义 |
 | `SchedulerOutput` | 本轮每请求 computed、scheduled、lookahead、输出预算和可选 block table |
 | `ExecutionBatch` | Engine 从请求状态切出的本轮真实 token |
+| `ExecutionOutput` | 每轮请求结果、实际进入模型 forward 的 token 数和可选设备耗时 |
 | `RequestOutput` | 每请求完成的输入计算量、零到多个确认输出与已缓存输出前缀 |
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
 | `ModelWorker` | 一个设备 rank 内固定模型版本并编排请求生命周期 |
@@ -123,6 +127,8 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `EngineCapabilities` | 初始化后可发现的模型、KV、并发和单轮容量事实 |
 | `EngineClient` | serving 使用的异步生成端口和 capabilities 查询 |
 | `SchedulerStats` / `KVCacheStats` | 队列、token backlog 与 KV 容量的一次性不可变事实 |
+| `ShortRequestPolicy` / `SelfResubmitPolicy` | 可选调度策略配置，不进入 Engine、Worker 或协议契约 |
+| `StepLatencyPredictor` / `TTFTAdmission` | 用已完成 step 更新的独立延迟预测与动态准入控制端口 |
 | `PerformanceObserver` | Engine 生命周期事实的轻量接收端，不执行 I/O 或控制运行时 |
 | `PerformanceMetricsReader` | Prometheus、日志等控制面读取不可变性能快照的端口 |
 
@@ -140,6 +146,7 @@ Qwen 层只生成带 RoPE 的 Q/K/V 并调用 `AttentionContext`，不再保留�
 ```mermaid
 sequenceDiagram
     participant E as EngineCore
+    participant T as TTFTAdmission
     participant O as PerformanceObserver
     participant S as Scheduler
     participant K as Logical KV Manager
@@ -171,7 +178,9 @@ sequenceDiagram
     P-->>D: token IDs
     D-->>W: RequestOutput
     W-->>X: RequestOutput(input, outputs, cached prefix)
-    X-->>E: ExecutionOutput
+    X-->>E: ExecutionOutput(results + actual model tokens)
+    E->>T: StepObservation(actual model tokens + latency)
+    E->>O: 同一 StepObservation
     E->>S: complete(committed, visible outputs)
     S->>K: commit(input + cached output prefix)
     E->>E: 更新状态并发送事件
@@ -199,6 +208,12 @@ committed 变为 3 → 只需 2 blocks → 自动释放尾部 1 block
 bonus token 等未缓存输出仍是下一轮 pending input。取消或失败使用 `remove()` 释放整个请求，无需另外维护
 rollback API。
 
+默认非抢占路径在请求准入时领取 completion claim。逻辑管理器始终保持
+`已占用唯一页 + 未兑现 claim <= 总页数`；`reserve()` 把 claim 转成真实 block，部分提交则把不再使用的尾页
+还原为 claim。因此一个已经严格接纳的请求不会在 decode 中途因其他请求占满 KV。开启 self-resubmit 后，只有
+常规请求可以 best-effort 准入；其 KV 水位只限制申请新页，不阻止继续填充自己已经持有的半页。短请求和触发
+fallback 的请求仍使用严格 claim。
+
 分页 Step Handler 持有每层 `[block, offset, kv_head, head_size]` 的全局 K/V tensor。它把请求逻辑位置映射为
 `block_id * block_size + offset`，原位写入本轮 K/V，并按 block table 逐页完成 causal attention。不同长度
 请求会组成一个 padded forward batch，`sequence_lengths` 屏蔽 padding，`positions` 始终保存请求内绝对位置。
@@ -217,7 +232,7 @@ query program 读取到另一个 program 尚未写完的 K/V。首版一个 prog
 attention 并暂存本轮 K/V；只有模型 forward 和输出校验全部成功，Handler 才把所有层一次性追加到
 `ContiguousKVCache`。因此模型不返回 K/V，连续路径仍保持跨层原子更新。
 
-## 7. ModelSession、容量规划与准入
+## 7. ModelSession、容量规划与非抢占调度
 
 `ModelRunner.open_session()` 在短临界区内复制当前模型引用和 generation。Reference 请求在生成开始时打开一次
 session；`LocalModelWorker` 初始化时也固定一次 session。reload 只替换 Runner 的当前模型，旧 session 仍强引用旧模型，
@@ -230,7 +245,27 @@ session；`LocalModelWorker` 初始化时也固定一次 session。reload 只替
 
 `EngineCapabilities` 汇总模型最大 token、KV token 容量、并发序列数与单轮 token budget。HTTP 的
 `/capabilities` 只展示这些事实，不维护固定 prompt 上限。`CapacityAdmission` 只拒绝空闲引擎也永远无法满足的
-请求；瞬时容量、排队、公平性和未来 preemption 仍归 Scheduler。
+请求；瞬时容量、排队和公平性归 Scheduler。
+
+默认调度是严格非抢占：已接纳请求不会被第三方挑作 victim。可选 `ShortRequestPolicy` 把首次可见 token 之前的
+资源拆成通用池与短请求预留池，同时保留 scheduled-token、KV token slot 和 sequence 三个维度。短请求用 prefix
+命中后的有效 prompt 长度和最大总长度分类；首 token 产生后回到通用 round-robin。`running` 数永远不超过
+`max_num_sequences`，短请求 completion claim 也只随实际准入 slot 发放，不能批量锁死 KV。等待达到
+`regular_aging_steps` 的常规请求可借用短请求 KV 水位，避免持续短流量造成饥饿。
+
+可选 `PredictiveTTFTAdmission` 在请求进入队列前估算
+`prompt_len + waiting_pending_tokens + running_pending_tokens` 的全局当前工作量。prefill 贡献剩余 prompt，普通
+decode 通常贡献当前 1 个 token，未来输出预算不提前展开；预测器按实际进入模型 forward 的 token 数保存真实
+step 延迟滑窗。每个桶默认取 p90，并构造随 token 规模不下降的包络；在已知桶之间插值，对更大负载按比例
+外推，样本不足时 fail-open。预测超过全局 SLO 时 HTTP 返回可重试的 429，确定性容量拒绝仍是 422。预测器是
+会反向影响准入的控制组件，不能塞进只读
+`PerformanceObserver`；Engine 把同一个 `StepObservation` 显式喂给两者。
+
+`SelfResubmitPolicy` 默认关闭且只支持分页 KV。开启后，best-effort 请求撞到自己的水位时只释放自己的 KV，保留
+Engine 中已经可见的完整 token 历史，回到 PREFILL 重算；它不会回滚或打断第三方，因此不是 victim preemption。
+重算阶段不重复发出旧 token，也不会凭空获得 aging。达到回滚次数或累计回滚进度阈值后，下一次准入强制领取
+completion claim；若一整轮候选都撞墙，最早回滚者也会进入这个严格恢复路径。这样可实验较高 KV 利用率，同时
+仍有有界的活锁逃生口。代价是回滚者从位置 0 重算，prefix cache 只能尽量找回已提交的完整 prompt 页。
 
 ## 8. Sampler
 
@@ -265,8 +300,12 @@ Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSeque
 
 观测只建立在已经生效的事实上：请求成功加入 Executor 和 Scheduler 后开始计时；输出通过校验并成为可见
 token 时记录 TTFT/可见 token 间隔；请求完成、失败或取消时记录结果。Scheduler 分开提供已知 pending 输入和
-包含最大输出预算的保守 backlog；Executor 报告按 scheduled-token 桶聚合的已完成 step 延迟。Qwen2、Qwen2.5、
+包含最大输出预算的保守 backlog；Executor 报告按实际模型 token 桶聚合的已完成 step 延迟。Qwen2、Qwen2.5、
 投机解码和普通解码复用同一路径。
+
+控制面还公开短请求首 token lane 当前请求数、KV completion claim、self-resubmit 次数与回滚的已计算进度，
+并把确定性 `rejected` 和动态 `overloaded` 与已经启动后的 finished/failed/cancelled 分开计数。这样可以同时验证
+短请求保护是否生效、best-effort 是否产生过多重算，以及 TTFT 429 是否需要调参。
 
 `InMemoryPerformanceObserver` 是专门的性能观察角色，只做短临界区计数。它不能调整 Scheduler 参数，也不执行
 网络或文件 I/O；`SafeCompositePerformanceObserver` 会停用首次失败的旁路实现，指标故障不能泄漏请求、同步刷屏
@@ -290,7 +329,7 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`。未来性�
 | 采样 | `src/light_vllm/runtime/sampling.py` |
 | 逻辑 KV / 连续物理基线 | `src/light_vllm/runtime/kv_cache.py` |
 | 调度契约 | `src/light_vllm/runtime/scheduler/interfaces.py` |
-| token-budget 调度 | `src/light_vllm/runtime/scheduler/token_budget.py` |
+| 分层 token-budget 调度 | `src/light_vllm/runtime/scheduler/token_budget.py` |
 | 执行契约 | `src/light_vllm/runtime/execution/interfaces.py` |
 | n-gram 投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
@@ -301,7 +340,7 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`。未来性�
 | Paged Attention | `src/light_vllm/runtime/execution/paged_attention.py` |
 | Triton Paged Attention | `src/light_vllm/runtime/execution/triton_paged_attention.py` |
 | Engine Core | `src/light_vllm/runtime/engine/core.py` |
-| admission | `src/light_vllm/runtime/engine/admission.py` |
+| 容量与 TTFT admission | `src/light_vllm/runtime/engine/admission.py` |
 | EngineClient | `src/light_vllm/runtime/engine/interfaces.py` |
 | 性能观察契约 | `src/light_vllm/runtime/observability/interfaces.py` |
 | 进程内性能聚合 | `src/light_vllm/runtime/observability/performance.py` |
@@ -324,6 +363,7 @@ flowchart LR
     Prefix --> Spec["Speculative decoding<br/>完成"]
     Spec --> Kernel["Triton fused attention<br/>首版与 GPU 数值对照完成"]
     Kernel --> Metrics["性能指标 + Prometheus/Grafana/HPA<br/>完成"]
+    Metrics --> SLO["短请求池 + TTFT 早拒 + 可选 self-resubmit<br/>完成"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
@@ -343,8 +383,9 @@ git diff --check
 
 测试必须覆盖固定 ModelSession、token budget、chunked prefill、多 token 与已缓存输出前缀、容量规划与 admission、
 prefix 命中/LRU/epoch、投机全接受/部分接受/首个拒绝/短候选、逻辑 block 回滚、非连续物理页、block table
-别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、TTFT/ITL、step 延迟、两种 token backlog、KV 使用率、执行失败和取消
-资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
+别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、短请求 token/KV/sequence 预留与 aging、TTFT 预测/冷启动/429、
+self-resubmit 不重复输出/严格 fallback/资源归还、TTFT/ITL、step 延迟、两种 token backlog、KV 使用率、执行失败和
+取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
 Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、padded GQA、decode 历史、共享
 prefix 和未使用 lookahead。
 

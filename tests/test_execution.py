@@ -631,7 +631,8 @@ def test_worker_composes_step_and_decode_handlers_without_mode_branches() -> Non
                         output_token_ids=(2, 3, 4),
                         num_cached_output_tokens=2,
                     ),
-                )
+                ),
+                num_model_tokens_computed=3,
             )
 
     model = IncrementingForwarder()
@@ -680,7 +681,10 @@ def test_local_model_executor_delegates_without_changing_values() -> None:
         def __init__(self) -> None:
             self.calls: list[tuple] = []
             self.lease = Lease()
-            self.output = ExecutionOutput(requests=(RequestOutput("request", 1, (2,)),))
+            self.output = ExecutionOutput(
+                requests=(RequestOutput("request", 1, (2,)),),
+                num_model_tokens_computed=1,
+            )
 
         def initialize(self) -> None:
             self.calls.append(("initialize",))
@@ -726,7 +730,10 @@ def test_local_model_executor_attaches_completed_step_latency() -> None:
         capabilities = ExecutionCapabilities(None, None)
 
         def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
-            return ExecutionOutput(requests=(RequestOutput("request", 1),))
+            return ExecutionOutput(
+                requests=(RequestOutput("request", 1),),
+                num_model_tokens_computed=1,
+            )
 
     class Timer:
         def measure(self, operation):
@@ -738,3 +745,4 @@ def test_local_model_executor_attaches_completed_step_latency() -> None:
     output = executor.execute(batch)
 
     assert output.step_elapsed_seconds == pytest.approx(0.125)
+    assert output.num_model_tokens_computed == 1

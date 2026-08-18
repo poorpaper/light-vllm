@@ -7,8 +7,18 @@ from threading import Event
 
 import pytest
 
-from light_vllm import GenerateRequest, GenerationError
-from light_vllm.runtime.engine import EngineCore
+from light_vllm import (
+    GenerateRequest,
+    GenerationError,
+    GenerationOverloadedError,
+    TokenGenerated,
+)
+from light_vllm.runtime.engine import (
+    EngineCore,
+    PredictiveTTFTAdmission,
+    SlidingWindowStepLatencyPredictor,
+    TTFTAdmission,
+)
 from light_vllm.runtime.execution import (
     ExecutionBatch,
     ExecutionCapabilities,
@@ -18,7 +28,11 @@ from light_vllm.runtime.execution import (
 )
 from light_vllm.runtime.kv_cache import FixedKVBlockCapacity, PagedKVCacheManager
 from light_vllm.runtime.observability import InMemoryPerformanceObserver
-from light_vllm.runtime.scheduler import DecodingBudget, TokenBudgetScheduler
+from light_vllm.runtime.scheduler import (
+    DecodingBudget,
+    SelfResubmitPolicy,
+    TokenBudgetScheduler,
+)
 
 
 class _Lease:
@@ -94,7 +108,14 @@ class RecordingExecutor:
                     ),
                 )
             )
-        return ExecutionOutput(requests=tuple(results))
+        return ExecutionOutput(
+            requests=tuple(results),
+            num_model_tokens_computed=sum(
+                len(request.input_token_ids)
+                + (1 if self.multiple_tokens and request.num_lookahead_tokens else 0)
+                for request in batch.requests
+            ),
+        )
 
 
 def _engine(
@@ -102,6 +123,7 @@ def _engine(
     *,
     token_budget: int = 2,
     performance_observer: InMemoryPerformanceObserver | None = None,
+    ttft_admission: TTFTAdmission | None = None,
 ) -> EngineCore:
     scheduler = TokenBudgetScheduler(
         PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2)),
@@ -117,6 +139,7 @@ def _engine(
         executor,
         scheduler,
         performance_observer=performance_observer,
+        ttft_admission=ttft_admission,
     )
 
 
@@ -135,6 +158,7 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
             output = super().execute(batch)
             return ExecutionOutput(
                 requests=output.requests,
+                num_model_tokens_computed=output.num_model_tokens_computed,
                 step_elapsed_seconds=0.2,
             )
 
@@ -153,7 +177,7 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
         assert snapshot.time_to_first_token.total == pytest.approx(0.2)
         assert snapshot.inter_token_latency.total == pytest.approx(0.2)
         assert len(snapshot.step_latency) == 1
-        assert snapshot.step_latency[0].max_scheduled_tokens == 1
+        assert snapshot.step_latency[0].max_model_tokens_computed == 1
         assert snapshot.step_latency[0].latency.count == 2
         assert snapshot.step_latency[0].latency.total == pytest.approx(0.4)
         assert snapshot.prompt_tokens_total == 1
@@ -161,6 +185,74 @@ def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
         assert snapshot.finished_requests_total == 1
         assert snapshot.scheduler.waiting_requests == 0
         assert snapshot.scheduler.running_requests == 0
+
+    asyncio.run(run())
+
+
+def test_engine_rejects_overload_after_step_predictor_warms_up() -> None:
+    class TimedExecutor(RecordingExecutor):
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            output = super().execute(batch)
+            return ExecutionOutput(
+                requests=output.requests,
+                num_model_tokens_computed=output.num_model_tokens_computed,
+                step_elapsed_seconds=0.2,
+            )
+
+    async def run() -> None:
+        executor = TimedExecutor()
+        observer = InMemoryPerformanceObserver("test-model")
+        admission = PredictiveTTFTAdmission(
+            SlidingWindowStepLatencyPredictor(min_observations=1),
+            max_tolerable_ttft_seconds=0.1,
+        )
+        engine = _engine(
+            executor,
+            performance_observer=observer,
+            ttft_admission=admission,
+        )
+
+        first = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
+        with pytest.raises(GenerationOverloadedError, match="exceeds the 0.100s SLO"):
+            await engine.generate(GenerateRequest(input_ids=(2,), max_new_tokens=1))
+        await engine.close()
+
+        assert first.generated_token_ids == (2,)
+        assert executor.history == [((1,),)]
+        assert not executor.active
+        assert observer.snapshot().overloaded_requests_total == 1
+
+    asyncio.run(run())
+
+
+def test_ttft_predictor_failure_disables_early_rejection_without_failing_generation() -> None:
+    class FailingTTFTAdmission:
+        def validate(self, request, stats) -> None:
+            return None
+
+        def step_completed(self, observation) -> None:
+            raise RuntimeError("predictor unavailable")
+
+    class TimedExecutor(RecordingExecutor):
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            output = super().execute(batch)
+            return ExecutionOutput(
+                requests=output.requests,
+                num_model_tokens_computed=output.num_model_tokens_computed,
+                step_elapsed_seconds=0.2,
+            )
+
+    async def run() -> None:
+        executor = TimedExecutor()
+        engine = _engine(executor, ttft_admission=FailingTTFTAdmission())
+
+        first = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
+        second = await engine.generate(GenerateRequest(input_ids=(2,), max_new_tokens=1))
+        await engine.close()
+
+        assert first.generated_token_ids == (2,)
+        assert second.generated_token_ids == (3,)
+        assert len(executor.history) == 2
 
     asyncio.run(run())
 
@@ -204,6 +296,69 @@ def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
 
         assert executor.history == [((1, 2),), ((3,),), ((4,),)]
         assert result.generated_token_ids == (4, 5)
+        assert not executor.active
+
+    asyncio.run(run())
+
+
+def test_engine_self_resubmit_preserves_visible_history_and_releases_kv() -> None:
+    async def run() -> None:
+        executor = RecordingExecutor(block_first_step=True)
+        kv_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1))
+        scheduler = TokenBudgetScheduler(
+            kv_cache,
+            max_num_sequences=2,
+            max_num_scheduled_tokens=1,
+            self_resubmit_policy=SelfResubmitPolicy(
+                max_resubmits=1,
+                strict_fallback_rolled_back_tokens=100,
+            ),
+        )
+        engine = EngineCore(executor, scheduler)
+
+        async def collect(request: GenerateRequest):
+            return [event async for event in engine.stream(request)]
+
+        first = asyncio.create_task(collect(GenerateRequest(input_ids=(1,), max_new_tokens=4)))
+        try:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(executor.first_step_started.wait, 1.0),
+                timeout=1.5,
+            )
+            second = asyncio.create_task(
+                collect(GenerateRequest(input_ids=(10,), max_new_tokens=4))
+            )
+            for _ in range(100):
+                if len(executor.active) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(executor.active) == 2
+        finally:
+            executor.release_first_step.set()
+
+        first_events, second_events = await asyncio.wait_for(
+            asyncio.gather(first, second),
+            timeout=3.0,
+        )
+        await engine.close()
+
+        first_tokens = [event for event in first_events if isinstance(event, TokenGenerated)]
+        second_tokens = [event for event in second_events if isinstance(event, TokenGenerated)]
+        assert [(event.token_id, event.position) for event in first_tokens] == [
+            (2, 0),
+            (3, 1),
+            (4, 2),
+            (5, 3),
+        ]
+        assert [(event.token_id, event.position) for event in second_tokens] == [
+            (11, 0),
+            (12, 1),
+            (13, 2),
+            (14, 3),
+        ]
+        assert scheduler.stats.self_resubmits_total >= 1
+        assert kv_cache.num_free_blocks == 4
+        assert kv_cache.stats.claimed_token_slots == 0
         assert not executor.active
 
     asyncio.run(run())
@@ -326,6 +481,7 @@ def test_execution_failure_is_delivered_to_the_request() -> None:
         ("too_many_outputs", "more tokens than the execution budget"),
         ("cached_beyond_lookahead", "cached more output tokens"),
         ("wrong_boundary", "wrong scheduling boundary"),
+        ("model_tokens", "model-token work outside"),
     ],
 )
 def test_engine_rejects_invalid_multi_token_execution_facts(
@@ -338,6 +494,7 @@ def test_engine_rejects_invalid_multi_token_execution_facts(
             computed = len(request.input_token_ids)
             outputs: tuple[int, ...] = (2, 3)
             cached = 1
+            model_tokens = len(request.input_token_ids) + request.num_lookahead_tokens
             if case == "computed":
                 computed += 1
             elif case == "too_many_outputs":
@@ -347,6 +504,8 @@ def test_engine_rejects_invalid_multi_token_execution_facts(
             elif case == "wrong_boundary":
                 outputs = ()
                 cached = 0
+            elif case == "model_tokens":
+                model_tokens += 1
             return ExecutionOutput(
                 requests=(
                     RequestOutput(
@@ -355,7 +514,8 @@ def test_engine_rejects_invalid_multi_token_execution_facts(
                         output_token_ids=outputs,
                         num_cached_output_tokens=cached,
                     ),
-                )
+                ),
+                num_model_tokens_computed=model_tokens,
             )
 
     async def run() -> None:

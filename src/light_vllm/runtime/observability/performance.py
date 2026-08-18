@@ -9,6 +9,7 @@ from time import perf_counter
 
 from light_vllm.runtime.kv_cache import KVCacheStats
 from light_vllm.runtime.observability.interfaces import (
+    AdmissionRejection,
     HistogramSnapshot,
     PerformanceSnapshot,
     RequestOutcome,
@@ -108,6 +109,10 @@ class InMemoryPerformanceObserver:
             "failed": 0,
             "cancelled": 0,
         }
+        self._admission_rejections: dict[AdmissionRejection, int] = {
+            "capacity": 0,
+            "overloaded": 0,
+        }
 
     def request_started(self, request_id: str, *, num_prompt_tokens: int) -> None:
         if not request_id:
@@ -122,6 +127,10 @@ class InMemoryPerformanceObserver:
             )
             # 统计所有已经进入 Engine 的 prompt，包括随后失败或取消的请求。
             self._prompt_tokens_total += num_prompt_tokens
+
+    def request_rejected(self, *, reason: AdmissionRejection) -> None:
+        with self._lock:
+            self._admission_rejections[reason] += 1
 
     def tokens_generated(self, request_id: str, *, count: int) -> None:
         if type(count) is not int or count <= 0:
@@ -156,7 +165,11 @@ class InMemoryPerformanceObserver:
         if not isinstance(observation, StepObservation):
             raise TypeError("observation must be StepObservation")
         bucket = next(
-            (bound for bound in _STEP_TOKEN_BOUNDS if observation.num_scheduled_tokens <= bound),
+            (
+                bound
+                for bound in _STEP_TOKEN_BOUNDS
+                if observation.num_model_tokens_computed <= bound
+            ),
             None,
         )
         with self._lock:
@@ -172,7 +185,7 @@ class InMemoryPerformanceObserver:
                 inter_token_latency=self._inter_token_latency.snapshot(),
                 step_latency=tuple(
                     StepLatencySnapshot(
-                        max_scheduled_tokens=bucket,
+                        max_model_tokens_computed=bucket,
                         latency=histogram.snapshot(),
                     )
                     for bucket, histogram in sorted(
@@ -188,6 +201,8 @@ class InMemoryPerformanceObserver:
                 finished_requests_total=self._request_outcomes["finished"],
                 failed_requests_total=self._request_outcomes["failed"],
                 cancelled_requests_total=self._request_outcomes["cancelled"],
+                rejected_requests_total=self._admission_rejections["capacity"],
+                overloaded_requests_total=self._admission_rejections["overloaded"],
             )
 
     def _request(self, request_id: str) -> _RequestTiming:

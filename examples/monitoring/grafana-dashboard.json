@@ -133,8 +133,8 @@
       "id": 7,
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, model, scheduled_tokens_le) (rate(light_vllm_engine_step_seconds_bucket[5m])))",
-          "legendFormat": "{{model}} <= {{scheduled_tokens_le}} tokens",
+          "expr": "histogram_quantile(0.95, sum by (le, model, model_tokens_computed_le) (rate(light_vllm_engine_step_seconds_bucket[5m])))",
+          "legendFormat": "{{model}} <= {{model_tokens_computed_le}} tokens",
           "refId": "A"
         }
       ],

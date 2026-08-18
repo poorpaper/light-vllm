@@ -29,6 +29,61 @@ class DecodingBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class ShortRequestPolicy:
+    """为首 token 工作量小且总长度受限的请求保留资源。
+
+    预留 token 和 sequence 只用于短请求的首次输出；已经产生
+    可见 token 的请求回到通用池，不长期占用 TTFT 保护资源。
+    """
+
+    max_effective_prompt_tokens: int
+    max_total_tokens: int
+    reserved_scheduled_tokens: int
+    reserved_kv_token_slots: int
+    reserved_sequences: int = 1
+    regular_aging_steps: int = 8
+
+    def __post_init__(self) -> None:
+        values = (
+            self.max_effective_prompt_tokens,
+            self.max_total_tokens,
+            self.reserved_scheduled_tokens,
+            self.reserved_sequences,
+            self.regular_aging_steps,
+        )
+        if any(type(value) is not int or value <= 0 for value in values):
+            raise ValueError("short-request limits and reserves must be positive integers")
+        if type(self.reserved_kv_token_slots) is not int or self.reserved_kv_token_slots < 0:
+            raise ValueError("reserved_kv_token_slots must be a non-negative integer")
+        if self.reserved_scheduled_tokens < self.max_effective_prompt_tokens:
+            raise ValueError("short token reserve must cover one eligible effective prompt")
+        if self.reserved_kv_token_slots < self.max_total_tokens - 1:
+            raise ValueError("short KV reserve must cover one eligible request")
+
+
+@dataclass(frozen=True, slots=True)
+class SelfResubmitPolicy:
+    """KV 撞墙时只回滚当前请求，并限制重复回滚代价。
+
+    达到回滚次数或累计回滚进度阈值后，请求下一次准入会自动恢复
+    completion claim，从而保证策略不会无限回滚。最后一次回滚可能
+    跨过 token 阈值，因此该字段是 strict fallback 阈值，不是硬上限。
+    """
+
+    max_resubmits: int = 2
+    strict_fallback_rolled_back_tokens: int = 4096
+
+    def __post_init__(self) -> None:
+        if type(self.max_resubmits) is not int or self.max_resubmits <= 0:
+            raise ValueError("max_resubmits must be a positive integer")
+        if (
+            type(self.strict_fallback_rolled_back_tokens) is not int
+            or self.strict_fallback_rolled_back_tokens < 0
+        ):
+            raise ValueError("strict fallback token threshold must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
 class ScheduledRequest:
     """Scheduler 为一个请求安排的本轮工作量。
 
@@ -94,8 +149,9 @@ class SchedulerOutput:
 class SchedulerStats:
     """Scheduler 对观测面公开的不可变负载快照。
 
-    pending tokens 只统计当前已知但尚未计算的输入；max remaining tokens
-    还包含请求允许生成的最大输出，是适合 HPA 的保守工作量上界。
+    pending tokens 只统计所有请求当前已知但尚未计算的输入：prefill
+    贡献剩余 prompt，普通 decode 通常贡献当前待算的 1 个 token。
+    max remaining tokens 还包含最大输出预算，是适合 HPA 的保守上界。
     """
 
     waiting_requests: int
@@ -105,6 +161,9 @@ class SchedulerStats:
     waiting_max_remaining_tokens: int
     running_max_remaining_tokens: int
     kv_cache: KVCacheStats
+    short_launch_requests: int = 0
+    self_resubmits_total: int = 0
+    self_resubmit_rolled_back_tokens_total: int = 0
 
     def __post_init__(self) -> None:
         values = (
@@ -114,9 +173,18 @@ class SchedulerStats:
             self.running_pending_tokens,
             self.waiting_max_remaining_tokens,
             self.running_max_remaining_tokens,
+            self.short_launch_requests,
+            self.self_resubmits_total,
+            self.self_resubmit_rolled_back_tokens_total,
         )
         if any(type(value) is not int or value < 0 for value in values):
             raise ValueError("scheduler statistics must be non-negative integers")
+
+    @property
+    def current_pending_tokens(self) -> int:
+        """返回全系统当前待处理工作，不把未来输出预算提前算入 TTFT。"""
+
+        return self.waiting_pending_tokens + self.running_pending_tokens
 
 
 class Scheduler(Protocol):

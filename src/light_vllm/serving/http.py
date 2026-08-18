@@ -23,6 +23,7 @@ from light_vllm.runtime.generation.interfaces import (
     GenerationEvent,
     GenerationFinished,
     GenerationNotReadyError,
+    GenerationOverloadedError,
     GenerationRejectedError,
     TokenGenerated,
 )
@@ -96,7 +97,7 @@ class FinishedEventData(BaseModel):
 
 
 class ErrorEventData(BaseModel):
-    code: Literal["not_ready", "request_rejected", "generation_failed"]
+    code: Literal["not_ready", "overloaded", "request_rejected", "generation_failed"]
     detail: str
 
 
@@ -107,6 +108,11 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="generation service is not ready",
+        )
+    if isinstance(exc, GenerationOverloadedError):
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
         )
     if isinstance(exc, GenerationRejectedError):
         return HTTPException(
@@ -141,6 +147,8 @@ def _encode_event(event: GenerationEvent) -> bytes:
 def _stream_error_event(exc: Exception) -> bytes:
     if isinstance(exc, GenerationNotReadyError):
         data = ErrorEventData(code="not_ready", detail="generation service is not ready")
+    elif isinstance(exc, GenerationOverloadedError):
+        data = ErrorEventData(code="overloaded", detail=str(exc))
     elif isinstance(exc, GenerationRejectedError):
         data = ErrorEventData(code="request_rejected", detail=str(exc))
     else:
@@ -241,7 +249,10 @@ def create_http_app(
     @app.post(
         "/generate",
         response_model=GenerateHttpResponse,
-        responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Model is not ready"}},
+        responses={
+            status.HTTP_429_TOO_MANY_REQUESTS: {"description": "Predicted TTFT exceeds SLO"},
+            status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Model is not ready"},
+        },
     )
     async def generate(payload: GenerateHttpRequest) -> GenerateHttpResponse:
         try:
@@ -255,6 +266,7 @@ def create_http_app(
         response_model=None,
         responses={
             status.HTTP_200_OK: {"content": {"text/event-stream": {}}},
+            status.HTTP_429_TOO_MANY_REQUESTS: {"description": "Predicted TTFT exceeds SLO"},
             status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Model is not ready"},
         },
     )

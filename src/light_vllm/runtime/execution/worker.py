@@ -305,7 +305,12 @@ class StandardDecodeHandler:
             )
             for row, request in enumerate(batch.requests)
         )
-        return ExecutionOutput(requests=results)
+        return ExecutionOutput(
+            requests=results,
+            num_model_tokens_computed=sum(
+                len(request.input_token_ids) for request in batch.requests
+            ),
+        )
 
 
 class LocalModelWorker:

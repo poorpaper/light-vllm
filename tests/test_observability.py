@@ -79,6 +79,18 @@ def test_prompt_tokens_include_requests_cancelled_before_first_token() -> None:
     assert snapshot.cancelled_requests_total == 1
 
 
+def test_admission_rejections_do_not_count_as_started_requests() -> None:
+    observer = InMemoryPerformanceObserver("qwen2.5")
+
+    observer.request_rejected(reason="capacity")
+    observer.request_rejected(reason="overloaded")
+
+    snapshot = observer.snapshot()
+    assert snapshot.prompt_tokens_total == 0
+    assert snapshot.rejected_requests_total == 1
+    assert snapshot.overloaded_requests_total == 1
+
+
 def test_safe_composite_disables_only_the_failing_observer() -> None:
     class FailingObserver:
         def __init__(self) -> None:
@@ -135,6 +147,7 @@ def test_scheduler_snapshot_exposes_token_aware_queue_and_kv_usage() -> None:
     assert scheduled.waiting_max_remaining_tokens == 8
     assert scheduled.running_requests == 1
     assert scheduled.running_pending_tokens == 3
+    assert scheduled.current_pending_tokens == 5
     assert scheduled.running_max_remaining_tokens == 6
     assert scheduled.kv_cache.used_token_slots == 4
     assert scheduled.kv_cache.capacity_token_slots == 8
@@ -146,7 +159,12 @@ def test_prefix_cache_counts_active_shared_pages_but_not_evictable_pages() -> No
         FixedKVBlockCapacity(num_blocks=4, block_size=2),
         enable_prefix_caching=True,
     )
-    cache.add_request("warm", token_ids=(1, 2, 3, 4, 5), cache_epoch=1)
+    cache.try_add_request(
+        "warm",
+        token_ids=(1, 2, 3, 4, 5),
+        max_num_committed_tokens=5,
+        cache_epoch=1,
+    )
     cache.reserve("warm", 5)
     cache.commit("warm", 5)
     cache.free("warm")
@@ -154,11 +172,13 @@ def test_prefix_cache_counts_active_shared_pages_but_not_evictable_pages() -> No
     # 零引用 prefix page 可以立即淘汰，因此不占可用容量。
     assert cache.stats.used_token_slots == 0
 
-    match = cache.add_request(
+    match = cache.try_add_request(
         "active",
         token_ids=(1, 2, 3, 4, 9),
+        max_num_committed_tokens=5,
         cache_epoch=1,
     )
+    assert match is not None
     assert match.num_cached_tokens == 4
     # 被活动请求引用的两个共享页此时不能回收。
     assert cache.stats.used_token_slots == 4
@@ -176,14 +196,14 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     observer.scheduler_updated(scheduler.stats)
     observer.step_completed(
         StepObservation(
-            num_scheduled_tokens=2,
+            num_model_tokens_computed=2,
             num_requests=1,
             elapsed_seconds=0.02,
         )
     )
     observer.step_completed(
         StepObservation(
-            num_scheduled_tokens=7,
+            num_model_tokens_computed=7,
             num_requests=2,
             elapsed_seconds=0.04,
         )
@@ -195,16 +215,21 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/plain")
     assert 'light_vllm_requests_waiting{model="qwen2"} 1' in response.text
+    assert 'light_vllm_short_launch_requests{model="qwen2"} 0' in response.text
     assert 'light_vllm_waiting_pending_tokens{model="qwen2"} 2' in response.text
     assert 'light_vllm_waiting_max_remaining_tokens{model="qwen2"} 6' in response.text
+    assert 'light_vllm_kv_cache_claimed_token_slots{model="qwen2"} 0' in response.text
+    assert 'light_vllm_self_resubmits_total{model="qwen2"} 0' in response.text
+    assert 'light_vllm_self_resubmit_rolled_back_tokens_total{model="qwen2"} 0' in response.text
     assert "light_vllm_time_to_first_token_seconds_bucket" in response.text
     assert (
-        'light_vllm_engine_step_seconds_count{model="qwen2",scheduled_tokens_le="2"} 1'
+        'light_vllm_engine_step_seconds_count{model="qwen2",model_tokens_computed_le="2"} 1'
         in response.text
     )
     assert (
-        'light_vllm_engine_step_seconds_count{model="qwen2",scheduled_tokens_le="8"} 1'
+        'light_vllm_engine_step_seconds_count{model="qwen2",model_tokens_computed_le="8"} 1'
         in response.text
     )
     assert response.text.count("# HELP light_vllm_engine_step_seconds ") == 1
     assert 'light_vllm_requests_total{model="qwen2",outcome="finished"} 0' in response.text
+    assert 'light_vllm_requests_total{model="qwen2",outcome="overloaded"} 0' in response.text

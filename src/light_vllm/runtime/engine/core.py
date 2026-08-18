@@ -8,8 +8,12 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from itertools import count
 
-from light_vllm.runtime.engine.admission import CapacityAdmission
-from light_vllm.runtime.engine.interfaces import EngineCapabilities, RequestAdmission
+from light_vllm.runtime.engine.admission import CapacityAdmission, SafeTTFTAdmission
+from light_vllm.runtime.engine.interfaces import (
+    EngineCapabilities,
+    RequestAdmission,
+    TTFTAdmission,
+)
 from light_vllm.runtime.execution.interfaces import (
     ExecutionBatch,
     ExecutionError,
@@ -27,6 +31,8 @@ from light_vllm.runtime.generation.interfaces import (
     GenerationEvent,
     GenerationFinished,
     GenerationNotReadyError,
+    GenerationOverloadedError,
+    GenerationRejectedError,
     TokenGenerated,
 )
 from light_vllm.runtime.observability.dispatch import SafeCompositePerformanceObserver
@@ -70,6 +76,12 @@ def _validated_output(batch: ExecutionBatch, output: ExecutionOutput) -> dict[st
     by_request_id = {result.request_id: result for result in output.requests}
     if set(by_request_id) != set(batch.request_ids):
         raise ExecutionError("model executor must return one result for every request")
+    min_model_tokens = sum(len(request.input_token_ids) for request in batch.requests)
+    max_model_tokens = sum(
+        len(request.input_token_ids) + request.num_lookahead_tokens for request in batch.requests
+    )
+    if not min_model_tokens <= output.num_model_tokens_computed <= max_model_tokens:
+        raise ExecutionError("executor reported model-token work outside its execution budget")
     for request in batch.requests:
         result = by_request_id[request.request_id]
         if result.num_input_tokens_computed != len(request.input_token_ids):
@@ -108,10 +120,12 @@ class EngineCore:
         scheduler: Scheduler,
         admission: RequestAdmission | None = None,
         performance_observer: PerformanceObserver | None = None,
+        ttft_admission: TTFTAdmission | None = None,
     ) -> None:
         self._executor = executor
         self._scheduler = scheduler
         self._admission = admission or CapacityAdmission()
+        self._ttft_admission = SafeTTFTAdmission(ttft_admission)
         self._performance_observer = SafeCompositePerformanceObserver(performance_observer)
         self._states: dict[str, _RequestState] = {}
         self._executing_request_ids: set[str] = set()
@@ -197,7 +211,16 @@ class EngineCore:
             if not self._executor.ready:
                 raise GenerationNotReadyError("load a model before generating")
             # 请求即使独占引擎也装不下时立即拒绝；暂时没资源则进入调度等待。
-            self._admission.validate(request, self.capabilities)
+            try:
+                self._admission.validate(request, self.capabilities)
+            except GenerationRejectedError:
+                self._performance_observer.request_rejected(reason="capacity")
+                raise
+            try:
+                self._ttft_admission.validate(request, self._scheduler.stats)
+            except GenerationOverloadedError:
+                self._performance_observer.request_rejected(reason="overloaded")
+                raise
 
             request_id = f"request-{next(self._request_ids)}"
             state = _RequestState(request_id, request, list(request.input_ids))
@@ -259,16 +282,14 @@ class EngineCore:
                     # 结果完整通过检查前，不更新请求进度，也不提交 KV cache。
                     output = _validated_output(batch, raw_output)
                     if raw_output.step_elapsed_seconds is not None:
-                        self._performance_observer.step_completed(
-                            StepObservation(
-                                num_scheduled_tokens=sum(
-                                    len(request.input_token_ids) + request.num_lookahead_tokens
-                                    for request in batch.requests
-                                ),
-                                num_requests=len(batch.requests),
-                                elapsed_seconds=raw_output.step_elapsed_seconds,
-                            )
+                        observation = StepObservation(
+                            num_model_tokens_computed=raw_output.num_model_tokens_computed,
+                            num_requests=len(batch.requests),
+                            elapsed_seconds=raw_output.step_elapsed_seconds,
                         )
+                        # 控制组件和只读 Observer 消费同一个已完成 step 事实。
+                        self._ttft_admission.step_completed(observation)
+                        self._performance_observer.step_completed(observation)
                 except Exception as exc:
                     async with self._lock:
                         self._fail_batch_locked(scheduled.request_ids, exc)

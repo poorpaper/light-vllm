@@ -25,6 +25,8 @@ light_vllm/
 ```mermaid
 flowchart LR
     Request["GenerateRequest"] --> Core["EngineCore<br/>请求状态与事件"]
+    Core --> TTFT["TTFTAdmission<br/>动态早拒"]
+    TTFT --> Predictor["StepLatencyPredictor"]
     Core --> Scheduler["TokenBudgetScheduler"]
     Scheduler --> Plan["SchedulerOutput<br/>token 数 · optional block table"]
     Plan --> Core
@@ -58,8 +60,9 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | 组件 | 负责 | 不负责 |
 | --- | --- | --- |
 | `EngineCore` | 请求状态、事件、停止条件、迭代与取消 | tensor、调度策略、HTTP |
-| `CapacityAdmission` | 根据 capabilities 拒绝空闲引擎也不可能完成的请求 | 排队、公平性、preemption |
-| `TokenBudgetScheduler` | FCFS、并发槽、token budget、逻辑 KV 分配 | 模型 forward、采样、事件 |
+| `CapacityAdmission` | 根据 capabilities 拒绝空闲引擎也不可能完成的请求 | 排队、公平性、victim preemption |
+| `TTFTAdmission` | 根据待处理 token 与 step 延迟预测做动态 SLO 早拒 | Scheduler 排序、性能指标展示 |
+| `TokenBudgetScheduler` | 分层队列、并发槽、token budget、逻辑 KV、短请求保护与自回滚 | 模型 forward、采样、事件 |
 | `UnboundedKVCacheManager` | 无容量限制的 reservation、提交与回滚基线 | block、K/V tensor |
 | `PagedKVCacheManager` | 逻辑 block、prefix 索引、引用计数、LRU 与回滚 | K/V tensor、attention kernel |
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
@@ -106,6 +109,10 @@ ScheduledRequest
 `lookahead=0, max_output=1`；投机执行可以预留 lookahead 并允许返回多个输出。Engine 将未缓存输出留作下一轮
 pending input。无需在 Engine/Executor 中维护 prefill/decode 状态机，但可由这些事实看出本轮是否位于输出
 frontier。
+
+可选短请求策略在首次输出之前保留 token、KV 和 sequence 三类资源；短请求出首 token 后回到通用
+round-robin。请求分类使用 prefix 命中后的有效 prompt 长度，并用真实 waiting step aging 防止常规请求饥饿。
+默认严格请求在准入时领取 completion claim，不会在后续 decode 中因其他请求占满 KV。
 
 ## 执行输入与输出
 
@@ -230,16 +237,24 @@ model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`�
 重复、缺失、多余和形状错误。`ModelRunner` 仍然只按 Catalog 解析 `qwen2 + safetensors`，不知道快照来自哪个
 网站。Transformers 只作为可选测试 oracle，对照相同权重的 logits，不进入生产执行路径。
 
-## Capabilities、admission 与 preemption
+## Capabilities、admission 与非抢占策略
 
 容量事实从拥有它的实体向上汇总：模型声明 `max_model_tokens`，Step Handler 通过 Worker 报告
 `max_kv_cache_tokens`，Scheduler
 报告并发槽和单轮 token budget。`EngineCapabilities.max_request_tokens` 取模型与单请求可用 KV 上限的较小值。
 HTTP 通过 `/capabilities` 展示这些事实，不再硬编码 prompt 长度。
 
-`CapacityAdmission` 只拒绝“即使引擎空闲也不可能完成”的请求。当前是否有空闲 block、谁等待、是否抢占和抢占
-后如何重算都属于 Scheduler 的动态策略。这个分界避免 admission 误判瞬时负载，也避免 Executor 反向管理队列。
-当前尚未实现 preemption；未来重算式或 swap 式 preemption 仍在 Scheduler 边界内落地。
+`CapacityAdmission` 只拒绝“即使引擎空闲也不可能完成”的请求。可选 `PredictiveTTFTAdmission` 使用
+`prompt + waiting pending + running pending` 的全局当前工作量动态早拒：prefill 贡献剩余 prompt，普通 decode
+通常贡献当前 1 个 token，不提前展开未来输出预算。延迟表按实际进入模型 forward 的 token 数更新并构造单调包络；
+样本不足时 fail-open，超过全局 SLO 时由 HTTP 表达为 429。预测器会改变准入结果，因此是独立控制组件；
+`PerformanceObserver` 仍然只读。Engine 在 step 完成后把同一个 `StepObservation` 显式交给二者。
+
+默认路径不挑选第三方 victim。分页请求准入时领取覆盖最大可提交长度的 completion claim，逻辑管理器保持
+`used unique blocks + claims <= capacity`。可选 self-resubmit 只让常规请求 best-effort 使用 KV；撞墙者释放自己
+的页、保留 Engine 中的可见 token 历史并回到 PREFILL。旧 token 不重复发送，回滚不增加 aging；达到次数或累计
+回滚进度阈值后恢复 strict claim，整轮无进展时最早回滚者也走严格恢复。这是 cooperative self rollback，不是
+victim preemption。未来重算式或 swap 式第三方抢占仍只能在 Scheduler 边界内落地。
 
 ## Sampler
 
@@ -289,11 +304,13 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 - 通过执行结果校验并准备发送的 token 才计入 TTFT、可见 token 间隔和吞吐；
 - Executor 在自己的设备边界测量已经完成的 step；CPU 使用单调墙钟，CUDA 使用 event；
 - 正常结束、失败和取消各自只记录一次；
+- 容量拒绝和 TTFT 过载在请求进入 Scheduler 前分别计数；
 - Scheduler/KV 每次状态变化后发布不可变快照。
 
 Scheduler 分开公开两种 token 事实：`pending_tokens` 是当前已知但尚未计算的输入，适合 TTFT 排队估算；
 `max_remaining_tokens` 还包含请求声明的最大输出预算，是偏保守的 HPA backlog。Paged KV 使用率按不能立即回收的
-block token slot 计算；可淘汰 prefix page 视为可用，无固定上限的连续缓存不输出伪容量。
+block token slot 计算；completion claim、短请求首 token lane、self-resubmit 次数与回滚的已计算进度单独公开；
+可淘汰 prefix page 视为可用，无固定上限的连续缓存不输出伪容量。
 
 Prometheus renderer 只依赖 `PerformanceMetricsReader`，生成 HTTP 路由仍只依赖 `EngineClient`。Grafana 看板和
 HPA 位于仓库外控制面：前者查询 histogram/计数，后者经 Prometheus Adapter 读取每 Pod 的
@@ -314,7 +331,7 @@ HPA 位于仓库外控制面：前者查询 histogram/计数，后者经 Prometh
 ## 后续演进顺序
 
 1. 增加 Triton 长上下文分段并行与归并，并补充跨显卡性能验收。
-2. Scheduler-owned preemption。
+2. Scheduler-owned victim preemption。
 3. 普通随机 Sampler。
 4. 进程/分布式 Worker 与生产级 serving。
 

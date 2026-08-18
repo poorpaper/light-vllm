@@ -13,10 +13,12 @@ from light_vllm import (
     GenerationEvent,
     GenerationFinished,
     GenerationNotReadyError,
+    GenerationOverloadedError,
     ModelSpec,
     TokenGenerated,
 )
 from light_vllm.entrypoints.http import create_serving_app
+from light_vllm.runtime.scheduler import ShortRequestPolicy
 from light_vllm.serving.http import _encoded_stream, create_http_app
 
 
@@ -51,6 +53,15 @@ class FailingStreamEngineClient(StubEngineClient):
     async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
         yield TokenGenerated(token_id=7, position=0)
         raise GenerationError("failed after the response started")
+
+
+class OverloadedEngineClient(StubEngineClient):
+    async def stream(self, request: GenerateRequest) -> AsyncIterator[GenerationEvent]:
+        raise GenerationOverloadedError("predicted TTFT exceeds SLO")
+        yield
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        raise GenerationOverloadedError("predicted TTFT exceeds SLO")
 
 
 class CloseTrackingAsyncIterator(AsyncIterator[GenerationEvent]):
@@ -217,6 +228,17 @@ def test_not_ready_is_mapped_before_a_response_or_stream_starts() -> None:
     assert client.post("/generate/stream", json={"input_ids": [1]}).status_code == 503
 
 
+def test_predicted_ttft_overload_is_mapped_to_429_before_streaming() -> None:
+    client = TestClient(create_http_app(OverloadedEngineClient()))
+
+    generated = client.post("/generate", json={"input_ids": [1]})
+    streamed = client.post("/generate/stream", json={"input_ids": [1]})
+
+    assert generated.status_code == 429
+    assert streamed.status_code == 429
+    assert generated.json()["detail"] == "predicted TTFT exceeds SLO"
+
+
 def test_stream_is_closed_when_the_first_event_fails() -> None:
     engine = FirstEventFailureEngineClient()
     client = TestClient(create_http_app(engine))
@@ -302,6 +324,50 @@ def test_tiny_attention_model_serves_through_engine_core() -> None:
 
     assert response.status_code == 200
     assert len(response.json()["generated_token_ids"]) == 2
+
+
+def test_engine_runtime_accepts_short_request_policy() -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture="tiny-attention-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+        ),
+        runtime="engine",
+        max_num_sequences=2,
+        max_num_scheduled_tokens=4,
+        num_kv_blocks=32,
+        short_request_policy=ShortRequestPolicy(
+            max_effective_prompt_tokens=2,
+            max_total_tokens=4,
+            reserved_scheduled_tokens=2,
+            reserved_kv_token_slots=3,
+        ),
+        enable_self_resubmit=True,
+        max_self_resubmits=1,
+        self_resubmit_strict_fallback_rolled_back_tokens=8,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/generate",
+            json={"input_ids": [1, 2], "max_new_tokens": 2},
+        )
+
+    assert response.status_code == 200
+    assert len(response.json()["generated_token_ids"]) == 2
+
+
+def test_self_resubmit_rejects_an_unbounded_kv_backend() -> None:
+    with pytest.raises(ValueError, match="requires paged KV"):
+        create_serving_app(
+            ModelSpec(
+                architecture="tiny-attention-causal-lm",
+                model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+            ),
+            runtime="engine",
+            kv_reservation="unbounded",
+            enable_self_resubmit=True,
+        )
 
 
 @pytest.mark.parametrize("architecture", ("qwen2", "qwen2.5"))
