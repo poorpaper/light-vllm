@@ -1,4 +1,5 @@
 from light_vllm.runtime.observability.interfaces import (
+    AdmissionRejection,
     HistogramSnapshot,
     PerformanceMetricsReader,
     PerformanceObserver,
@@ -10,6 +11,7 @@ from light_vllm.runtime.observability.interfaces import (
 from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
 
 __all__ = [
+    "AdmissionRejection",
     "HistogramSnapshot",
     "InMemoryPerformanceObserver",
     "PerformanceMetricsReader",

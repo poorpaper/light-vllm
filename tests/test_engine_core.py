@@ -192,11 +192,16 @@ def test_engine_rejects_overload_after_step_predictor_warms_up() -> None:
 
     async def run() -> None:
         executor = TimedExecutor()
+        observer = InMemoryPerformanceObserver("test-model")
         admission = PredictiveTTFTAdmission(
             SlidingWindowStepLatencyPredictor(min_observations=1),
             max_tolerable_ttft_seconds=0.1,
         )
-        engine = _engine(executor, ttft_admission=admission)
+        engine = _engine(
+            executor,
+            performance_observer=observer,
+            ttft_admission=admission,
+        )
 
         first = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
         with pytest.raises(GenerationOverloadedError, match="exceeds the 0.100s SLO"):
@@ -206,6 +211,7 @@ def test_engine_rejects_overload_after_step_predictor_warms_up() -> None:
         assert first.generated_token_ids == (2,)
         assert executor.history == [((1,),)]
         assert not executor.active
+        assert observer.snapshot().overloaded_requests_total == 1
 
     asyncio.run(run())
 

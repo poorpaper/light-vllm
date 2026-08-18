@@ -7,6 +7,7 @@ from typing import Literal, Protocol, TypeAlias
 from light_vllm.runtime.scheduler.interfaces import SchedulerStats
 
 RequestOutcome: TypeAlias = Literal["finished", "failed", "cancelled"]
+AdmissionRejection: TypeAlias = Literal["capacity", "overloaded"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,8 @@ class PerformanceSnapshot:
     finished_requests_total: int
     failed_requests_total: int
     cancelled_requests_total: int
+    rejected_requests_total: int
+    overloaded_requests_total: int
 
     def __post_init__(self) -> None:
         if not self.model_name:
@@ -100,6 +103,8 @@ class PerformanceSnapshot:
                 self.finished_requests_total,
                 self.failed_requests_total,
                 self.cancelled_requests_total,
+                self.rejected_requests_total,
+                self.overloaded_requests_total,
             )
         ):
             raise ValueError("performance counters must be non-negative integers")
@@ -120,6 +125,8 @@ class PerformanceObserver(Protocol):
     """
 
     def request_started(self, request_id: str, *, num_prompt_tokens: int) -> None: ...
+
+    def request_rejected(self, *, reason: AdmissionRejection) -> None: ...
 
     def tokens_generated(self, request_id: str, *, count: int) -> None: ...
 

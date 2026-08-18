@@ -5,6 +5,7 @@ from __future__ import annotations
 from threading import Lock
 
 from light_vllm.runtime.observability.interfaces import (
+    AdmissionRejection,
     PerformanceObserver,
     RequestOutcome,
     StepObservation,
@@ -21,6 +22,9 @@ class SafeCompositePerformanceObserver:
 
     def request_started(self, request_id: str, *, num_prompt_tokens: int) -> None:
         self._notify("request_started", request_id, num_prompt_tokens=num_prompt_tokens)
+
+    def request_rejected(self, *, reason: AdmissionRejection) -> None:
+        self._notify("request_rejected", reason=reason)
 
     def tokens_generated(self, request_id: str, *, count: int) -> None:
         self._notify("tokens_generated", request_id, count=count)

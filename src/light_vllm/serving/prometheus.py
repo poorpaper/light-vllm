@@ -87,6 +87,14 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
     )
     _metric(
         lines,
+        "light_vllm_short_launch_requests",
+        "gauge",
+        "Admitted short requests still waiting for their first visible token.",
+        scheduler.short_launch_requests,
+        labels=labels,
+    )
+    _metric(
+        lines,
         "light_vllm_waiting_pending_tokens",
         "gauge",
         "Known input tokens not yet computed for waiting requests.",
@@ -153,6 +161,23 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
             labels=labels,
         )
 
+    _metric(
+        lines,
+        "light_vllm_self_resubmits_total",
+        "counter",
+        "Requests that released their own KV and re-entered scheduling.",
+        scheduler.self_resubmits_total,
+        labels=labels,
+    )
+    _metric(
+        lines,
+        "light_vllm_self_resubmit_recomputed_tokens_total",
+        "counter",
+        "Computed-token prefixes discarded by self-resubmit.",
+        scheduler.self_resubmit_recomputed_tokens_total,
+        labels=labels,
+    )
+
     _histogram(
         lines,
         "light_vllm_time_to_first_token_seconds",
@@ -205,6 +230,8 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
         ("finished", snapshot.finished_requests_total),
         ("failed", snapshot.failed_requests_total),
         ("cancelled", snapshot.cancelled_requests_total),
+        ("rejected", snapshot.rejected_requests_total),
+        ("overloaded", snapshot.overloaded_requests_total),
     ):
         lines.append(f"light_vllm_requests_total{_labels(**labels, outcome=outcome)} {value}")
     return "\n".join(lines) + "\n"

@@ -79,6 +79,18 @@ def test_prompt_tokens_include_requests_cancelled_before_first_token() -> None:
     assert snapshot.cancelled_requests_total == 1
 
 
+def test_admission_rejections_do_not_count_as_started_requests() -> None:
+    observer = InMemoryPerformanceObserver("qwen2.5")
+
+    observer.request_rejected(reason="capacity")
+    observer.request_rejected(reason="overloaded")
+
+    snapshot = observer.snapshot()
+    assert snapshot.prompt_tokens_total == 0
+    assert snapshot.rejected_requests_total == 1
+    assert snapshot.overloaded_requests_total == 1
+
+
 def test_safe_composite_disables_only_the_failing_observer() -> None:
     class FailingObserver:
         def __init__(self) -> None:
@@ -202,9 +214,11 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/plain")
     assert 'light_vllm_requests_waiting{model="qwen2"} 1' in response.text
+    assert 'light_vllm_short_launch_requests{model="qwen2"} 0' in response.text
     assert 'light_vllm_waiting_pending_tokens{model="qwen2"} 2' in response.text
     assert 'light_vllm_waiting_max_remaining_tokens{model="qwen2"} 6' in response.text
     assert 'light_vllm_kv_cache_claimed_token_slots{model="qwen2"} 0' in response.text
+    assert 'light_vllm_self_resubmits_total{model="qwen2"} 0' in response.text
     assert "light_vllm_time_to_first_token_seconds_bucket" in response.text
     assert (
         'light_vllm_engine_step_seconds_count{model="qwen2",scheduled_tokens_le="2"} 1'
@@ -216,3 +230,4 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     )
     assert response.text.count("# HELP light_vllm_engine_step_seconds ") == 1
     assert 'light_vllm_requests_total{model="qwen2",outcome="finished"} 0' in response.text
+    assert 'light_vllm_requests_total{model="qwen2",outcome="overloaded"} 0' in response.text

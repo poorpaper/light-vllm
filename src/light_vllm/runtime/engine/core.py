@@ -31,6 +31,8 @@ from light_vllm.runtime.generation.interfaces import (
     GenerationEvent,
     GenerationFinished,
     GenerationNotReadyError,
+    GenerationOverloadedError,
+    GenerationRejectedError,
     TokenGenerated,
 )
 from light_vllm.runtime.observability.dispatch import SafeCompositePerformanceObserver
@@ -203,8 +205,16 @@ class EngineCore:
             if not self._executor.ready:
                 raise GenerationNotReadyError("load a model before generating")
             # 请求即使独占引擎也装不下时立即拒绝；暂时没资源则进入调度等待。
-            self._admission.validate(request, self.capabilities)
-            self._ttft_admission.validate(request, self._scheduler.stats)
+            try:
+                self._admission.validate(request, self.capabilities)
+            except GenerationRejectedError:
+                self._performance_observer.request_rejected(reason="capacity")
+                raise
+            try:
+                self._ttft_admission.validate(request, self._scheduler.stats)
+            except GenerationOverloadedError:
+                self._performance_observer.request_rejected(reason="overloaded")
+                raise
 
             request_id = f"request-{next(self._request_ids)}"
             state = _RequestState(request_id, request, list(request.input_ids))
