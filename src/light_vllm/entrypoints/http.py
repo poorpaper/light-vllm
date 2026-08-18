@@ -56,7 +56,7 @@ from light_vllm.runtime.kv_cache import (
 from light_vllm.runtime.observability.interfaces import PerformanceMetricsReader
 from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
 from light_vllm.runtime.sampling import GreedySampler
-from light_vllm.runtime.scheduler.interfaces import DecodingBudget
+from light_vllm.runtime.scheduler.interfaces import DecodingBudget, ShortRequestPolicy
 from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 
 if TYPE_CHECKING:
@@ -138,6 +138,7 @@ def create_serving_app(
     num_speculative_tokens: int = 0,
     speculative_ngram_min: int = 2,
     speculative_ngram_max: int = 5,
+    short_request_policy: ShortRequestPolicy | None = None,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -161,6 +162,8 @@ def create_serving_app(
     if paged_attention_backend not in ("torch", "triton"):
         raise ValueError(f"unsupported paged attention backend: {paged_attention_backend}")
     if runtime == "reference":
+        if short_request_policy is not None:
+            raise ValueError("short-request scheduling requires the engine runtime")
         if num_speculative_tokens:
             raise ValueError("speculative decoding requires the engine runtime")
         if paged_attention_backend != "torch":
@@ -238,6 +241,7 @@ def create_serving_app(
             max_num_sequences=max_num_sequences,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             decoding_budget=decoding_budget,
+            short_request_policy=short_request_policy,
         )
         performance_observer = InMemoryPerformanceObserver(spec.architecture)
         engine_core = EngineCore(
@@ -282,6 +286,40 @@ def _json_object(value: str) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("model args must be a JSON object")
     return parsed
+
+
+def _create_short_request_policy(
+    *,
+    max_effective_prompt_tokens: int | None,
+    max_total_tokens: int | None,
+    reserved_scheduled_tokens: int | None,
+    reserved_kv_token_slots: int | None,
+    reserved_sequences: int,
+    regular_aging_steps: int,
+) -> ShortRequestPolicy | None:
+    if max_effective_prompt_tokens is None:
+        if any(
+            value is not None
+            for value in (
+                max_total_tokens,
+                reserved_scheduled_tokens,
+                reserved_kv_token_slots,
+            )
+        ):
+            raise ValueError("short-request max effective prompt tokens must also be set")
+        return None
+    if max_total_tokens is None or reserved_scheduled_tokens is None:
+        raise ValueError("short-request token limits and scheduled reserve must all be set")
+    if reserved_kv_token_slots is None:
+        raise ValueError("short-request KV reserve must be set")
+    return ShortRequestPolicy(
+        max_effective_prompt_tokens=max_effective_prompt_tokens,
+        max_total_tokens=max_total_tokens,
+        reserved_scheduled_tokens=reserved_scheduled_tokens,
+        reserved_kv_token_slots=reserved_kv_token_slots,
+        reserved_sequences=reserved_sequences,
+        regular_aging_steps=regular_aging_steps,
+    )
 
 
 def _create_parser() -> argparse.ArgumentParser:
@@ -329,6 +367,13 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--speculative-ngram-min", type=int, default=2)
     parser.add_argument("--speculative-ngram-max", type=int, default=5)
+    short = parser.add_argument_group("short-request scheduling")
+    short.add_argument("--short-request-max-effective-prompt-tokens", type=int)
+    short.add_argument("--short-request-max-total-tokens", type=int)
+    short.add_argument("--short-request-reserved-scheduled-tokens", type=int)
+    short.add_argument("--short-request-reserved-kv-token-slots", type=int)
+    short.add_argument("--short-request-reserved-sequences", type=int, default=1)
+    short.add_argument("--regular-request-aging-steps", type=int, default=8)
     return parser
 
 
@@ -359,6 +404,14 @@ def main() -> None:
             num_speculative_tokens=args.num_speculative_tokens,
             speculative_ngram_min=args.speculative_ngram_min,
             speculative_ngram_max=args.speculative_ngram_max,
+            short_request_policy=_create_short_request_policy(
+                max_effective_prompt_tokens=(args.short_request_max_effective_prompt_tokens),
+                max_total_tokens=args.short_request_max_total_tokens,
+                reserved_scheduled_tokens=(args.short_request_reserved_scheduled_tokens),
+                reserved_kv_token_slots=args.short_request_reserved_kv_token_slots,
+                reserved_sequences=args.short_request_reserved_sequences,
+                regular_aging_steps=args.regular_request_aging_steps,
+            ),
         ),
         host=args.host,
         port=args.port,

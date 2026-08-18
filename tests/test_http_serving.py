@@ -17,6 +17,7 @@ from light_vllm import (
     TokenGenerated,
 )
 from light_vllm.entrypoints.http import create_serving_app
+from light_vllm.runtime.scheduler import ShortRequestPolicy
 from light_vllm.serving.http import _encoded_stream, create_http_app
 
 
@@ -292,6 +293,34 @@ def test_tiny_attention_model_serves_through_engine_core() -> None:
         max_num_sequences=2,
         max_num_scheduled_tokens=2,
         num_kv_blocks=256,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/generate",
+            json={"input_ids": [1, 2], "max_new_tokens": 2},
+        )
+
+    assert response.status_code == 200
+    assert len(response.json()["generated_token_ids"]) == 2
+
+
+def test_engine_runtime_accepts_short_request_policy() -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture="tiny-attention-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+        ),
+        runtime="engine",
+        max_num_sequences=2,
+        max_num_scheduled_tokens=4,
+        num_kv_blocks=32,
+        short_request_policy=ShortRequestPolicy(
+            max_effective_prompt_tokens=2,
+            max_total_tokens=4,
+            reserved_scheduled_tokens=2,
+            reserved_kv_token_slots=3,
+        ),
     )
 
     with TestClient(app) as client:
