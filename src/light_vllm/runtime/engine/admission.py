@@ -2,7 +2,7 @@
 
 from bisect import bisect_left
 from collections import deque
-from math import isfinite
+from math import ceil, isfinite
 from threading import RLock
 
 from light_vllm.runtime.engine.interfaces import (
@@ -33,19 +33,29 @@ class CapacityAdmission:
 
 
 class SlidingWindowStepLatencyPredictor:
-    """用 scheduled-token 表和滑动窗口估计负载延迟。
+    """用 scheduled-token 表和滑动窗口保守估计负载延迟。
 
-    未见过的中间负载做线性插值；超过最大样本时按 token 比例外推。
-    样本不足时返回 ``None``，让冷启动阶段保持 fail-open。
+    每个桶使用上分位数，再构造随 token 数不下降的包络。未见过的
+    中间负载做线性插值；超过最大样本时按 token 比例外推。样本不足
+    时返回 ``None``，让冷启动阶段保持 fail-open。
     """
 
-    def __init__(self, *, window_size: int = 32, min_observations: int = 3) -> None:
+    def __init__(
+        self,
+        *,
+        window_size: int = 32,
+        min_observations: int = 3,
+        prediction_quantile: float = 0.9,
+    ) -> None:
         if type(window_size) is not int or window_size <= 0:
             raise ValueError("window_size must be a positive integer")
         if type(min_observations) is not int or min_observations <= 0:
             raise ValueError("min_observations must be a positive integer")
+        if not isfinite(prediction_quantile) or not 0 < prediction_quantile <= 1:
+            raise ValueError("prediction_quantile must be in (0, 1]")
         self._window_size = window_size
         self._min_observations = min_observations
+        self._prediction_quantile = prediction_quantile
         self._samples: dict[int, deque[float]] = {}
         self._lock = RLock()
 
@@ -65,10 +75,13 @@ class SlidingWindowStepLatencyPredictor:
         with self._lock:
             if sum(len(samples) for samples in self._samples.values()) < self._min_observations:
                 return None
-            table = tuple(
-                (tokens, sum(samples) / len(samples))
-                for tokens, samples in sorted(self._samples.items())
-            )
+            table: list[tuple[int, float]] = []
+            monotonic_latency = 0.0
+            for tokens, samples in sorted(self._samples.items()):
+                ordered = sorted(samples)
+                rank = ceil(self._prediction_quantile * len(ordered)) - 1
+                monotonic_latency = max(monotonic_latency, ordered[rank])
+                table.append((tokens, monotonic_latency))
 
         token_sizes = tuple(tokens for tokens, _ in table)
         index = bisect_left(token_sizes, num_pending_tokens)

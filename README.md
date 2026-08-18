@@ -204,12 +204,13 @@ light-vllm-serve \
 
 短请求按 prefix 命中后的有效 prompt 和最大总长度分类；scheduled token、KV slot 和 sequence 都有独立预留。
 首次 token 可见后，请求回到通用 round-robin。常规请求等待达到 aging 阈值后可以借用 KV 水位，避免饥饿。
-TTFT 预测使用 `新 prompt + waiting pending + running pending`，由每个真实 step 的滑窗延迟持续更新；样本不足时
-放行。确定性容量不足返回 422，预测超过 SLO 返回可重试的 429。
+TTFT 预测使用 `新 prompt + waiting pending + running pending`，由每个真实 step 的滑窗延迟持续更新。默认取
+p90 并构造随 token 规模不下降的包络，可用 `--ttft-prediction-quantile` 调整；样本不足时放行。确定性容量不足
+返回 422，预测超过 SLO 返回可重试的 429。
 
 实验性 `--enable-self-resubmit` 会允许常规请求 best-effort 使用 KV；撞墙者只释放自己的 KV 并从 PREFILL 重算，
 不会回滚第三方，也不会重复输出已经可见的 token。它默认关闭且仅支持 `blocks`。可用
-`--max-self-resubmits` 和 `--self-resubmit-strict-fallback-recomputed-tokens` 控制何时恢复严格 completion claim，
+`--max-self-resubmits` 和 `--self-resubmit-strict-fallback-rolled-back-tokens` 控制何时恢复严格 completion claim，
 从而给活锁一个有界退出路径。
 
 当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
@@ -239,7 +240,7 @@ curl http://127.0.0.1:8000/metrics
 ```
 
 它包含 TTFT、可见 token 间隔、真实完成的 step 延迟、waiting/running 请求、短请求首 token lane、两种 token
-backlog、KV cache 使用率/claim、self-resubmit 重算代价、准入拒绝和 token 吞吐。`pending_tokens` 只统计当前
+backlog、KV cache 使用率/claim、self-resubmit 回滚进度、准入拒绝和 token 吞吐。`pending_tokens` 只统计当前
 已知输入；`max_remaining_tokens` 还包含最大输出预算，适合保守扩缩容，二者不会混用。
 指标来自同一套 Engine/Scheduler/KV 事实，与 `qwen2`、`qwen2.5` 或具体模型尺寸无关；`reference`
 runtime 没有 Scheduler 和固定 KV 容量，因此不伪造这些指标。

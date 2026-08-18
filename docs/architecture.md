@@ -245,14 +245,15 @@ model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`�
 HTTP 通过 `/capabilities` 展示这些事实，不再硬编码 prompt 长度。
 
 `CapacityAdmission` 只拒绝“即使引擎空闲也不可能完成”的请求。可选 `PredictiveTTFTAdmission` 使用
-`prompt + waiting pending + running pending` 和真实 step 延迟滑窗动态早拒：样本不足时 fail-open，超过全局 SLO
-时由 HTTP 表达为 429。预测器会改变准入结果，因此是独立控制组件；`PerformanceObserver` 仍然只读。Engine 在
+`prompt + waiting pending + running pending` 和真实 step 延迟的保守分位数滑窗动态早拒，并对 token 规模构造
+单调包络：样本不足时 fail-open，超过全局 SLO 时由 HTTP 表达为 429。预测器会改变准入结果，因此是独立控制
+组件；`PerformanceObserver` 仍然只读。Engine 在
 step 完成后把同一个 `StepObservation` 显式交给二者。
 
 默认路径不挑选第三方 victim。分页请求准入时领取覆盖最大可提交长度的 completion claim，逻辑管理器保持
 `used unique blocks + claims <= capacity`。可选 self-resubmit 只让常规请求 best-effort 使用 KV；撞墙者释放自己
 的页、保留 Engine 中的可见 token 历史并回到 PREFILL。旧 token 不重复发送，回滚不增加 aging；达到次数或累计
-重算阈值后恢复 strict claim，整轮无进展时最早回滚者也走严格恢复。这是 cooperative self rollback，不是
+回滚进度阈值后恢复 strict claim，整轮无进展时最早回滚者也走严格恢复。这是 cooperative self rollback，不是
 victim preemption。未来重算式或 swap 式第三方抢占仍只能在 Scheduler 边界内落地。
 
 ## Sampler
@@ -308,7 +309,7 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 
 Scheduler 分开公开两种 token 事实：`pending_tokens` 是当前已知但尚未计算的输入，适合 TTFT 排队估算；
 `max_remaining_tokens` 还包含请求声明的最大输出预算，是偏保守的 HPA backlog。Paged KV 使用率按不能立即回收的
-block token slot 计算；completion claim、短请求首 token lane、self-resubmit 次数与丢弃的已计算 token 单独公开；
+block token slot 计算；completion claim、短请求首 token lane、self-resubmit 次数与回滚的已计算进度单独公开；
 可淘汰 prefix page 视为可用，无固定上限的连续缓存不输出伪容量。
 
 Prometheus renderer 只依赖 `PerformanceMetricsReader`，生成 HTTP 路由仍只依赖 `EngineClient`。Grafana 看板和

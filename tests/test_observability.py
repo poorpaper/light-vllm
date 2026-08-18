@@ -219,6 +219,7 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     assert 'light_vllm_waiting_max_remaining_tokens{model="qwen2"} 6' in response.text
     assert 'light_vllm_kv_cache_claimed_token_slots{model="qwen2"} 0' in response.text
     assert 'light_vllm_self_resubmits_total{model="qwen2"} 0' in response.text
+    assert 'light_vllm_self_resubmit_rolled_back_tokens_total{model="qwen2"} 0' in response.text
     assert "light_vllm_time_to_first_token_seconds_bucket" in response.text
     assert (
         'light_vllm_engine_step_seconds_count{model="qwen2",scheduled_tokens_le="2"} 1'

@@ -33,7 +33,7 @@ class _RequestState:
     has_completion_claim: bool = False
     force_completion_claim: bool = False
     num_resubmits: int = 0
-    num_recomputed_tokens: int = 0
+    num_rolled_back_tokens: int = 0
 
 
 class TokenBudgetScheduler:
@@ -76,7 +76,7 @@ class TokenBudgetScheduler:
         self._states: dict[str, _RequestState] = {}
         self._resubmitted_in_step: list[str] = []
         self._self_resubmits_total = 0
-        self._self_resubmit_recomputed_tokens_total = 0
+        self._self_resubmit_rolled_back_tokens_total = 0
 
     @property
     def has_requests(self) -> bool:
@@ -112,7 +112,7 @@ class TokenBudgetScheduler:
             kv_cache=self._kv_cache.stats,
             short_launch_requests=len(self._short_launch_order),
             self_resubmits_total=self._self_resubmits_total,
-            self_resubmit_recomputed_tokens_total=self._self_resubmit_recomputed_tokens_total,
+            self_resubmit_rolled_back_tokens_total=self._self_resubmit_rolled_back_tokens_total,
         )
 
     def add(
@@ -470,9 +470,9 @@ class TokenBudgetScheduler:
         self._kv_cache.free(request_id)
 
         state.num_resubmits += 1
-        state.num_recomputed_tokens += state.num_computed_tokens
+        state.num_rolled_back_tokens += state.num_computed_tokens
         self._self_resubmits_total += 1
-        self._self_resubmit_recomputed_tokens_total += state.num_computed_tokens
+        self._self_resubmit_rolled_back_tokens_total += state.num_computed_tokens
         state.num_computed_tokens = 0
         state.kv_attached = False
         state.is_short = False
@@ -483,7 +483,7 @@ class TokenBudgetScheduler:
         assert policy is not None
         if (
             state.num_resubmits >= policy.max_resubmits
-            or state.num_recomputed_tokens >= policy.strict_fallback_recomputed_tokens
+            or state.num_rolled_back_tokens >= policy.strict_fallback_rolled_back_tokens
         ):
             state.force_completion_claim = True
         self._waiting.append(request_id)

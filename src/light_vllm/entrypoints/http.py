@@ -150,9 +150,10 @@ def create_serving_app(
     max_tolerable_ttft_seconds: float | None = None,
     ttft_prediction_window_size: int = 32,
     ttft_prediction_min_observations: int = 3,
+    ttft_prediction_quantile: float = 0.9,
     enable_self_resubmit: bool = False,
     max_self_resubmits: int = 2,
-    self_resubmit_strict_fallback_recomputed_tokens: int = 4096,
+    self_resubmit_strict_fallback_rolled_back_tokens: int = 4096,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -265,8 +266,8 @@ def create_serving_app(
             self_resubmit_policy=(
                 SelfResubmitPolicy(
                     max_resubmits=max_self_resubmits,
-                    strict_fallback_recomputed_tokens=(
-                        self_resubmit_strict_fallback_recomputed_tokens
+                    strict_fallback_rolled_back_tokens=(
+                        self_resubmit_strict_fallback_rolled_back_tokens
                     ),
                 )
                 if enable_self_resubmit
@@ -279,6 +280,7 @@ def create_serving_app(
                 SlidingWindowStepLatencyPredictor(
                     window_size=ttft_prediction_window_size,
                     min_observations=ttft_prediction_min_observations,
+                    prediction_quantile=ttft_prediction_quantile,
                 ),
                 max_tolerable_ttft_seconds=max_tolerable_ttft_seconds,
             )
@@ -418,11 +420,12 @@ def _create_parser() -> argparse.ArgumentParser:
     ttft.add_argument("--max-tolerable-ttft-seconds", type=float)
     ttft.add_argument("--ttft-prediction-window-size", type=int, default=32)
     ttft.add_argument("--ttft-prediction-min-observations", type=int, default=3)
+    ttft.add_argument("--ttft-prediction-quantile", type=float, default=0.9)
     resubmit = parser.add_argument_group("self-resubmit")
     resubmit.add_argument("--enable-self-resubmit", action="store_true")
     resubmit.add_argument("--max-self-resubmits", type=int, default=2)
     resubmit.add_argument(
-        "--self-resubmit-strict-fallback-recomputed-tokens",
+        "--self-resubmit-strict-fallback-rolled-back-tokens",
         type=int,
         default=4096,
     )
@@ -467,10 +470,11 @@ def main() -> None:
             max_tolerable_ttft_seconds=args.max_tolerable_ttft_seconds,
             ttft_prediction_window_size=args.ttft_prediction_window_size,
             ttft_prediction_min_observations=args.ttft_prediction_min_observations,
+            ttft_prediction_quantile=args.ttft_prediction_quantile,
             enable_self_resubmit=args.enable_self_resubmit,
             max_self_resubmits=args.max_self_resubmits,
-            self_resubmit_strict_fallback_recomputed_tokens=(
-                args.self_resubmit_strict_fallback_recomputed_tokens
+            self_resubmit_strict_fallback_rolled_back_tokens=(
+                args.self_resubmit_strict_fallback_rolled_back_tokens
             ),
         ),
         host=args.host,

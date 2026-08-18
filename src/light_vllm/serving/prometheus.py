@@ -171,10 +171,10 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
     )
     _metric(
         lines,
-        "light_vllm_self_resubmit_recomputed_tokens_total",
+        "light_vllm_self_resubmit_rolled_back_tokens_total",
         "counter",
-        "Computed-token prefixes discarded by self-resubmit.",
-        scheduler.self_resubmit_recomputed_tokens_total,
+        "Computed-token progress rolled back by self-resubmit.",
+        scheduler.self_resubmit_rolled_back_tokens_total,
         labels=labels,
     )
 

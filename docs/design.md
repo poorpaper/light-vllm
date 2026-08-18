@@ -254,13 +254,14 @@ session；`LocalModelWorker` 初始化时也固定一次 session。reload 只替
 
 可选 `PredictiveTTFTAdmission` 在请求进入队列前估算
 `prompt_len + waiting_pending_tokens + running_pending_tokens` 对应的 step 延迟。预测器按 scheduled-token 规模保存
-真实 step 延迟滑窗，在已知桶之间插值，对更大负载按比例外推；样本不足时 fail-open。预测超过全局 SLO 时 HTTP
-返回可重试的 429，确定性容量拒绝仍是 422。预测器是会反向影响准入的控制组件，不能塞进只读
+真实 step 延迟滑窗。每个桶默认取 p90，并构造随 token 规模不下降的包络；在已知桶之间插值，对更大负载按比例
+外推，样本不足时 fail-open。预测超过全局 SLO 时 HTTP 返回可重试的 429，确定性容量拒绝仍是 422。预测器是
+会反向影响准入的控制组件，不能塞进只读
 `PerformanceObserver`；Engine 把同一个 `StepObservation` 显式喂给两者。
 
 `SelfResubmitPolicy` 默认关闭且只支持分页 KV。开启后，best-effort 请求撞到自己的水位时只释放自己的 KV，保留
 Engine 中已经可见的完整 token 历史，回到 PREFILL 重算；它不会回滚或打断第三方，因此不是 victim preemption。
-重算阶段不重复发出旧 token，也不会凭空获得 aging。达到回滚次数或累计重算阈值后，下一次准入强制领取
+重算阶段不重复发出旧 token，也不会凭空获得 aging。达到回滚次数或累计回滚进度阈值后，下一次准入强制领取
 completion claim；若一整轮候选都撞墙，最早回滚者也会进入这个严格恢复路径。这样可实验较高 KV 利用率，同时
 仍有有界的活锁逃生口。代价是回滚者从位置 0 重算，prefix cache 只能尽量找回已提交的完整 prompt 页。
 
@@ -300,7 +301,7 @@ token 时记录 TTFT/可见 token 间隔；请求完成、失败或取消时记�
 包含最大输出预算的保守 backlog；Executor 报告按 scheduled-token 桶聚合的已完成 step 延迟。Qwen2、Qwen2.5、
 投机解码和普通解码复用同一路径。
 
-控制面还公开短请求首 token lane 当前请求数、KV completion claim、self-resubmit 次数与丢弃的已计算 token，
+控制面还公开短请求首 token lane 当前请求数、KV completion claim、self-resubmit 次数与回滚的已计算进度，
 并把确定性 `rejected` 和动态 `overloaded` 与已经启动后的 finished/failed/cancelled 分开计数。这样可以同时验证
 短请求保护是否生效、best-effort 是否产生过多重算，以及 TTFT 429 是否需要调参。
 

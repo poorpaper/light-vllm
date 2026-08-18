@@ -298,7 +298,7 @@ def test_engine_self_resubmit_preserves_visible_history_and_releases_kv() -> Non
             max_num_scheduled_tokens=1,
             self_resubmit_policy=SelfResubmitPolicy(
                 max_resubmits=1,
-                strict_fallback_recomputed_tokens=100,
+                strict_fallback_rolled_back_tokens=100,
             ),
         )
         engine = EngineCore(executor, scheduler)

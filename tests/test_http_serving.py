@@ -344,7 +344,7 @@ def test_engine_runtime_accepts_short_request_policy() -> None:
         ),
         enable_self_resubmit=True,
         max_self_resubmits=1,
-        self_resubmit_strict_fallback_recomputed_tokens=8,
+        self_resubmit_strict_fallback_rolled_back_tokens=8,
     )
 
     with TestClient(app) as client:

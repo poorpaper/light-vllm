@@ -281,7 +281,7 @@ def test_self_resubmit_recomputes_without_reemitting_and_then_falls_back_to_stri
         max_num_scheduled_tokens=1,
         self_resubmit_policy=SelfResubmitPolicy(
             max_resubmits=1,
-            strict_fallback_recomputed_tokens=100,
+            strict_fallback_rolled_back_tokens=100,
         ),
     )
     scheduler.add("a", token_ids=(1,), max_num_tokens=4)
@@ -297,7 +297,7 @@ def test_self_resubmit_recomputes_without_reemitting_and_then_falls_back_to_stri
     assert collision.request_ids == ("b",)
     assert scheduler.stats.waiting_requests == 1
     assert scheduler.stats.self_resubmits_total == 1
-    assert scheduler.stats.self_resubmit_recomputed_tokens_total == 2
+    assert scheduler.stats.self_resubmit_rolled_back_tokens_total == 2
     scheduler.complete("b", num_committed_tokens=1, num_new_tokens=1)
     scheduler.remove("b")
 
@@ -323,7 +323,7 @@ def test_self_resubmit_does_not_borrow_short_headroom_without_real_aging() -> No
         ),
         self_resubmit_policy=SelfResubmitPolicy(
             max_resubmits=1,
-            strict_fallback_recomputed_tokens=100,
+            strict_fallback_rolled_back_tokens=100,
         ),
     )
     scheduler.add("a", token_ids=(1,), max_num_tokens=4)
