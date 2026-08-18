@@ -342,6 +342,9 @@ def test_engine_runtime_accepts_short_request_policy() -> None:
             reserved_scheduled_tokens=2,
             reserved_kv_token_slots=3,
         ),
+        enable_self_resubmit=True,
+        max_self_resubmits=1,
+        max_self_resubmit_recomputed_tokens=8,
     )
 
     with TestClient(app) as client:
@@ -352,6 +355,19 @@ def test_engine_runtime_accepts_short_request_policy() -> None:
 
     assert response.status_code == 200
     assert len(response.json()["generated_token_ids"]) == 2
+
+
+def test_self_resubmit_rejects_an_unbounded_kv_backend() -> None:
+    with pytest.raises(ValueError, match="requires paged KV"):
+        create_serving_app(
+            ModelSpec(
+                architecture="tiny-attention-causal-lm",
+                model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+            ),
+            runtime="engine",
+            kv_reservation="unbounded",
+            enable_self_resubmit=True,
+        )
 
 
 @pytest.mark.parametrize("architecture", ("qwen2", "qwen2.5"))

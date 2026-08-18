@@ -60,7 +60,11 @@ from light_vllm.runtime.kv_cache import (
 from light_vllm.runtime.observability.interfaces import PerformanceMetricsReader
 from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
 from light_vllm.runtime.sampling import GreedySampler
-from light_vllm.runtime.scheduler.interfaces import DecodingBudget, ShortRequestPolicy
+from light_vllm.runtime.scheduler.interfaces import (
+    DecodingBudget,
+    SelfResubmitPolicy,
+    ShortRequestPolicy,
+)
 from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 
 if TYPE_CHECKING:
@@ -146,6 +150,9 @@ def create_serving_app(
     max_tolerable_ttft_seconds: float | None = None,
     ttft_prediction_window_size: int = 32,
     ttft_prediction_min_observations: int = 3,
+    enable_self_resubmit: bool = False,
+    max_self_resubmits: int = 2,
+    max_self_resubmit_recomputed_tokens: int = 4096,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -169,6 +176,8 @@ def create_serving_app(
     if paged_attention_backend not in ("torch", "triton"):
         raise ValueError(f"unsupported paged attention backend: {paged_attention_backend}")
     if runtime == "reference":
+        if enable_self_resubmit:
+            raise ValueError("self-resubmit requires the engine runtime")
         if max_tolerable_ttft_seconds is not None:
             raise ValueError("TTFT prediction requires the engine runtime")
         if short_request_policy is not None:
@@ -184,6 +193,8 @@ def create_serving_app(
     else:
         if runtime != "engine":
             raise ValueError(f"unsupported runtime mode: {runtime}")
+        if enable_self_resubmit and kv_reservation != "blocks":
+            raise ValueError("self-resubmit requires paged KV reservation")
         if kv_reservation == "blocks":
             cache_planner = _create_paged_cache_planner(
                 spec,
@@ -251,6 +262,14 @@ def create_serving_app(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             decoding_budget=decoding_budget,
             short_request_policy=short_request_policy,
+            self_resubmit_policy=(
+                SelfResubmitPolicy(
+                    max_resubmits=max_self_resubmits,
+                    max_recomputed_tokens=max_self_resubmit_recomputed_tokens,
+                )
+                if enable_self_resubmit
+                else None
+            ),
         )
         ttft_admission = None
         if max_tolerable_ttft_seconds is not None:
@@ -397,6 +416,14 @@ def _create_parser() -> argparse.ArgumentParser:
     ttft.add_argument("--max-tolerable-ttft-seconds", type=float)
     ttft.add_argument("--ttft-prediction-window-size", type=int, default=32)
     ttft.add_argument("--ttft-prediction-min-observations", type=int, default=3)
+    resubmit = parser.add_argument_group("self-resubmit")
+    resubmit.add_argument("--enable-self-resubmit", action="store_true")
+    resubmit.add_argument("--max-self-resubmits", type=int, default=2)
+    resubmit.add_argument(
+        "--max-self-resubmit-recomputed-tokens",
+        type=int,
+        default=4096,
+    )
     return parser
 
 
@@ -438,6 +465,9 @@ def main() -> None:
             max_tolerable_ttft_seconds=args.max_tolerable_ttft_seconds,
             ttft_prediction_window_size=args.ttft_prediction_window_size,
             ttft_prediction_min_observations=args.ttft_prediction_min_observations,
+            enable_self_resubmit=args.enable_self_resubmit,
+            max_self_resubmits=args.max_self_resubmits,
+            max_self_resubmit_recomputed_tokens=(args.max_self_resubmit_recomputed_tokens),
         ),
         host=args.host,
         port=args.port,

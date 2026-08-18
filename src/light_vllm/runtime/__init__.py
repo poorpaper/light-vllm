@@ -68,6 +68,8 @@ from light_vllm.runtime.scheduler import (
     Scheduler,
     SchedulerError,
     SchedulerOutput,
+    SelfResubmitPolicy,
+    ShortRequestPolicy,
     TokenBudgetScheduler,
 )
 
@@ -125,6 +127,8 @@ __all__ = [
     "Scheduler",
     "SchedulerError",
     "SchedulerOutput",
+    "SelfResubmitPolicy",
+    "ShortRequestPolicy",
     "SlidingWindowStepLatencyPredictor",
     "StepLatencyPredictor",
     "TTFTAdmission",
