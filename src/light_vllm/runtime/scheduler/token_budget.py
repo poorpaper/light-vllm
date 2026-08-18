@@ -164,6 +164,8 @@ class TokenBudgetScheduler:
             recovery_id = self._resubmitted_in_step[0]
             recovery = self._states[recovery_id]
             recovery.force_completion_claim = True
+            self._waiting.remove(recovery_id)
+            self._waiting.appendleft(recovery_id)
             policy = self._short_request_policy
             if policy is not None:
                 recovery.waiting_steps = max(
@@ -400,7 +402,11 @@ class TokenBudgetScheduler:
 
         if not self._running and self._waiting:
             # 没有可运行请求时不空转；最老请求可临时借用短请求水位。
-            self._try_admit(self._waiting[0], is_short=False, min_free_tokens=0)
+            oldest = self._waiting[0]
+            is_short = next(
+                is_short for request_id, is_short in classifications if request_id == oldest
+            )
+            self._try_admit(oldest, is_short=is_short, min_free_tokens=0)
 
     def _try_admit(
         self,
