@@ -8,6 +8,8 @@ import torch
 pytest.importorskip("triton")
 
 from light_vllm.modeling.attention import AttentionLayerSpec, ModelKVCacheSpec
+from light_vllm.runtime.execution.interfaces import QueryLayout
+from light_vllm.runtime.execution.layout import linear_query_layout
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionMetadata,
     TorchPagedAttention,
@@ -17,6 +19,10 @@ from light_vllm.runtime.execution.triton_paged_attention import TritonPagedAtten
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 _DEVICE = torch.device("cuda:0")
+
+
+def _layouts(*lengths: int):
+    return tuple(linear_query_layout(length) for length in lengths)
 
 
 def _caches(
@@ -99,11 +105,29 @@ def test_triton_paged_attention_matches_padded_gqa_prefill(
     metadata = PagedAttentionMetadata(
         block_tables=((7, 1), (4,)),
         num_computed_tokens=(0, 0),
-        query_lengths=(6, 3),
+        query_layouts=_layouts(6, 3),
     )
     query = torch.randn(2, 6, 4, head_size, device=_DEVICE, dtype=dtype)
     key = torch.randn(2, 6, 2, head_size, device=_DEVICE, dtype=dtype)
     value = torch.randn(2, 6, 2, head_size, device=_DEVICE, dtype=dtype)
+
+    _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)
+
+
+def test_triton_paged_attention_matches_padded_tree_visibility() -> None:
+    torch.manual_seed(20260819)
+    torch_cache, triton_cache = _caches(64, torch.float16)
+    metadata = PagedAttentionMetadata(
+        block_tables=((7, 1), (4, 6)),
+        num_computed_tokens=(0, 0),
+        query_layouts=(
+            QueryLayout((-1, 0, 0, 2)),
+            QueryLayout((-1, 0, 0)),
+        ),
+    )
+    query = torch.randn(2, 4, 4, 64, device=_DEVICE, dtype=torch.float16)
+    key = torch.randn(2, 4, 2, 64, device=_DEVICE, dtype=torch.float16)
+    value = torch.randn(2, 4, 2, 64, device=_DEVICE, dtype=torch.float16)
 
     _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)
 
@@ -114,7 +138,7 @@ def test_triton_paged_attention_matches_decode_after_prefill() -> None:
     prefill_metadata = PagedAttentionMetadata(
         block_tables=((3, 0, 5), (2, 6)),
         num_computed_tokens=(0, 0),
-        query_lengths=(5, 3),
+        query_layouts=_layouts(5, 3),
     )
     prefill_query = torch.randn(2, 5, 4, 64, device=_DEVICE, dtype=torch.float16)
     prefill_key = torch.randn(2, 5, 2, 64, device=_DEVICE, dtype=torch.float16)
@@ -131,7 +155,7 @@ def test_triton_paged_attention_matches_decode_after_prefill() -> None:
     decode_metadata = PagedAttentionMetadata(
         block_tables=((3, 0, 5), (2, 6)),
         num_computed_tokens=(5, 3),
-        query_lengths=(1, 1),
+        query_layouts=_layouts(1, 1),
     )
     decode_query = torch.randn(2, 1, 4, 64, device=_DEVICE, dtype=torch.float16)
     decode_key = torch.randn(2, 1, 2, 64, device=_DEVICE, dtype=torch.float16)
@@ -158,7 +182,7 @@ def test_triton_paged_attention_reads_a_shared_readonly_prefix() -> None:
     metadata = PagedAttentionMetadata(
         block_tables=((0, 5), (0, 7)),
         num_computed_tokens=(2, 2),
-        query_lengths=(1, 1),
+        query_layouts=_layouts(1, 1),
         num_readonly_prefix_blocks=(1, 1),
     )
     query = torch.randn(2, 1, 4, 64, device=_DEVICE, dtype=torch.float16)
@@ -174,8 +198,8 @@ def test_triton_paged_attention_ignores_unused_lookahead_slots() -> None:
     metadata = PagedAttentionMetadata(
         block_tables=((8, 3, 12), (10, 14)),
         num_computed_tokens=(0, 0),
-        query_lengths=(3, 1),
-        num_lookahead_tokens=(2, 3),
+        query_layouts=_layouts(3, 1),
+        num_reserved_query_tokens=(5, 4),
     )
     query = torch.randn(2, 3, 4, 64, device=_DEVICE, dtype=torch.float16)
     key = torch.randn(2, 3, 2, 64, device=_DEVICE, dtype=torch.float16)

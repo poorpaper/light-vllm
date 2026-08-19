@@ -17,22 +17,28 @@ from light_vllm.modeling.models.tiny_attention import (
 from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
     DenseAttentionMetadata,
+    DraftTree,
     ExecutionBatch,
     ExecutionCapabilities,
     ExecutionError,
     ExecutionNotReadyError,
     ExecutionOutput,
     ExecutionRequest,
-    GreedyAcceptanceSampler,
+    GreedyTreeAcceptanceSampler,
     LocalModelExecutor,
     LocalModelWorker,
     LocalTokenExecutor,
-    NGramSpeculativeDecodeHandler,
-    NGramTokenProposer,
+    ModelStepBatch,
+    NGramChainProposer,
     PagedKVCacheConfig,
     RequestOutput,
+    SpeculativeDecodeHandler,
     TorchDenseAttention,
     TorchPagedAttentionBackend,
+)
+from light_vllm.runtime.execution.layout import (
+    linear_model_step_request,
+    linear_query_layout,
 )
 from light_vllm.runtime.execution.worker import (
     ContiguousStepHandler,
@@ -236,7 +242,7 @@ def _dense_tiny_logits(model, token_ids: tuple[int, ...]) -> torch.Tensor:
         model.kv_cache_spec,
         DenseAttentionMetadata(
             positions=positions,
-            query_lengths=(len(token_ids),),
+            query_layouts=(linear_query_layout(len(token_ids)),),
         ),
     )
     return model(
@@ -354,10 +360,10 @@ def test_engine_ngram_speculation_matches_target_generation(
 
         forwarder = RecordingIncrementingForwarder()
         provider = StaticSessionProvider(forwarder)
-        decode_handler = NGramSpeculativeDecodeHandler(
-            NGramTokenProposer(min_match_length=2, max_match_length=4),
+        decode_handler = SpeculativeDecodeHandler(
+            NGramChainProposer(min_match_length=2, max_match_length=4),
             GreedySampler(),
-            GreedyAcceptanceSampler(),
+            GreedyTreeAcceptanceSampler(),
         )
         if paged:
             worker = _paged_worker(
@@ -390,6 +396,70 @@ def test_engine_ngram_speculation_matches_target_generation(
 
         assert result.generated_token_ids == expected_outputs
         assert forwarder.queries == list(expected_queries)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+def test_engine_tree_speculation_compacts_a_non_contiguous_root(
+    paged: bool,
+) -> None:
+    async def run() -> None:
+        class FixedTreeProposer:
+            def propose(self, token_ids: tuple[int, ...], *, max_nodes: int) -> DraftTree:
+                tokens = (9, 6)[:max_nodes]
+                return DraftTree(tokens, (-1,) * len(tokens))
+
+        class RecordingForwarder(IncrementingForwarder):
+            def __init__(self) -> None:
+                super().__init__(vocab_size=16)
+                self.queries: list[tuple[int, ...]] = []
+
+            def forward(self, batch: ForwardBatch) -> ModelOutput:
+                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
+                self.queries.append(
+                    tuple(int(value) for value in batch.input_ids[0, :query_length])
+                )
+                return super().forward(batch)
+
+        forwarder = RecordingForwarder()
+        provider = StaticSessionProvider(forwarder)
+        decode_handler = SpeculativeDecodeHandler(
+            FixedTreeProposer(),
+            GreedySampler(),
+            GreedyTreeAcceptanceSampler(),
+        )
+        if paged:
+            worker = _paged_worker(
+                provider,
+                num_blocks=8,
+                block_size=2,
+                decode_handler=decode_handler,
+            )
+            logical_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=8, block_size=2))
+        else:
+            worker = _contiguous_worker(provider, decode_handler=decode_handler)
+            logical_cache = UnboundedKVCacheManager()
+        executor = LocalModelExecutor(worker)
+        executor.initialize()
+        engine = EngineCore(
+            executor,
+            TokenBudgetScheduler(
+                logical_cache,
+                max_num_sequences=1,
+                max_num_scheduled_tokens=8,
+                decoding_budget=DecodingBudget(
+                    num_lookahead_tokens=2,
+                    max_output_tokens=3,
+                ),
+            ),
+        )
+
+        result = await engine.generate(GenerateRequest(input_ids=(5,), max_new_tokens=3))
+        await engine.close()
+
+        assert result.generated_token_ids == (6, 7, 8)
+        assert forwarder.queries == [(5, 9, 6), (7,)]
 
     asyncio.run(run())
 
@@ -539,20 +609,16 @@ def test_contiguous_step_can_resume_after_a_speculative_suffix_is_rejected() -> 
     model = IncrementingForwarder()
     step = ContiguousStepHandler(model, ContiguousKVCacheConfig())
     step.add_request("request", capacity=3)
-    step.forward(
-        model,
-        ExecutionBatch(
-            requests=(_execution_request("request", (1, 2), 0, None, max_output_tokens=0),)
-        ),
+    first = linear_model_step_request(
+        _execution_request("request", (1, 2), 0, None, max_output_tokens=0)
     )
+    step.forward(model, ModelStepBatch((first,)))
 
-    step.truncate("request", 1)
-    logits = step.forward(
-        model,
-        ExecutionBatch(
-            requests=(_execution_request("request", (3,), 1, None, max_output_tokens=0),)
-        ),
+    step.compact(first, (0,))
+    second = linear_model_step_request(
+        _execution_request("request", (3,), 1, None, max_output_tokens=0)
     )
+    logits = step.forward(model, ModelStepBatch((second,)))
 
     assert logits[0].shape == (1, model.vocab_size)
 
@@ -614,8 +680,8 @@ def test_worker_composes_step_and_decode_handlers_without_mode_branches() -> Non
         def forward(self, model, batch):
             raise AssertionError("decode handler controls when a model step runs")
 
-        def truncate(self, request_id: str, num_cached_tokens: int) -> None:
-            return
+        def compact(self, request, retained_query_indices: tuple[int, ...]) -> int:
+            return 0
 
     class MultiTokenDecode:
         def __init__(self) -> None:

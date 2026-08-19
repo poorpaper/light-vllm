@@ -15,15 +15,16 @@ from light_vllm.modeling.models.tiny_attention import (
 from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
     DenseAttentionMetadata,
-    GreedyAcceptanceSampler,
+    GreedyTreeAcceptanceSampler,
     LocalModelExecutor,
     LocalModelWorker,
-    NGramSpeculativeDecodeHandler,
-    NGramTokenProposer,
+    NGramChainProposer,
     PagedKVCacheConfig,
+    SpeculativeDecodeHandler,
     TorchDenseAttention,
     TorchPagedAttentionBackend,
 )
+from light_vllm.runtime.execution.layout import linear_query_layout
 from light_vllm.runtime.execution.worker import (
     PagedStepHandler,
     StandardDecodeHandler,
@@ -71,7 +72,7 @@ def _tiny_dense_forward(model, token_ids: tuple[int, ...], *, past=None):
         model.kv_cache_spec,
         DenseAttentionMetadata(
             positions=positions,
-            query_lengths=(len(token_ids),),
+            query_layouts=(linear_query_layout(len(token_ids)),),
         ),
         past,
     )
@@ -457,6 +458,28 @@ def test_contiguous_cache_can_truncate_a_rejected_suffix() -> None:
         cache.truncate("request", 2)
 
 
+def test_contiguous_cache_compacts_a_non_contiguous_overlapping_path() -> None:
+    cache = ContiguousKVCache(_model_kv_spec(), ContiguousKVCacheConfig())
+    cache.allocate("request", capacity=7)
+    cache.append("request", _updates(1, 2))
+    cache.append("request", _updates(10, 20, 30, 40, 50))
+
+    cache.compact(
+        "request",
+        num_computed_tokens=2,
+        retained_query_indices=(0, 2, 4),
+    )
+
+    assert cache.cached_tokens("request") == 5
+    assert cache.view("request").layers[0].keys.flatten().tolist() == [
+        1,
+        2,
+        10,
+        30,
+        50,
+    ]
+
+
 def test_cache_lease_defers_physical_release_until_execution_finishes() -> None:
     cache = ContiguousKVCache(_model_kv_spec(), ContiguousKVCacheConfig())
     cache.allocate("request", capacity=1)
@@ -686,10 +709,10 @@ def test_engine_speculates_after_reusing_a_shared_prompt_prefix() -> None:
                 cache_planner=cache_config,
                 attention_backend=TorchPagedAttentionBackend(),
             ),
-            NGramSpeculativeDecodeHandler(
-                NGramTokenProposer(min_match_length=2, max_match_length=4),
+            SpeculativeDecodeHandler(
+                NGramChainProposer(min_match_length=2, max_match_length=4),
                 GreedySampler(),
-                GreedyAcceptanceSampler(),
+                GreedyTreeAcceptanceSampler(),
             ),
         )
         executor = LocalModelExecutor(worker)

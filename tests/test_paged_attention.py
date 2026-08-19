@@ -6,6 +6,15 @@ import pytest
 import torch
 
 from light_vllm.modeling.attention import AttentionLayerSpec, ModelKVCacheSpec
+from light_vllm.runtime.execution.dense_attention import (
+    DenseAttentionMetadata,
+    TorchDenseAttention,
+)
+from light_vllm.runtime.execution.interfaces import QueryLayout
+from light_vllm.runtime.execution.layout import (
+    linear_query_layout,
+    semantic_positions,
+)
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionMetadata,
     TorchPagedAttention,
@@ -17,6 +26,10 @@ from light_vllm.runtime.execution.paged_cache import (
     kv_cache_bytes_per_block,
 )
 from light_vllm.runtime.kv_cache import KVCacheError, PagedKVCacheManager
+
+
+def _layouts(*lengths: int):
+    return tuple(linear_query_layout(length) for length in lengths)
 
 
 def _cache(*, num_query_heads: int = 2, num_kv_heads: int = 2) -> PagedKVCache:
@@ -68,16 +81,107 @@ def _dense_attention(query: torch.Tensor, keys: torch.Tensor, values: torch.Tens
     return torch.einsum("ht,thd->hd", probabilities, values)
 
 
+def test_tree_layout_hides_siblings_in_dense_and_paged_attention() -> None:
+    torch.manual_seed(20260819)
+    cache = _cache()
+    layout = QueryLayout((-1, 0, 0, 2))
+    positions = torch.tensor([semantic_positions(layout, prefix_length=0)])
+    query = torch.randn(1, 4, 2, 4)
+    key = torch.randn(1, 4, 2, 4)
+    value = torch.randn(1, 4, 2, 4)
+    scale = 0.5
+
+    dense_output = TorchDenseAttention(
+        cache.model_spec,
+        DenseAttentionMetadata(
+            positions=positions,
+            query_layouts=(layout,),
+        ),
+    ).forward("attention", query, key, value, scale=scale)
+    paged_output = TorchPagedAttention(
+        cache,
+        PagedAttentionMetadata(
+            block_tables=((2, 0),),
+            num_computed_tokens=(0,),
+            query_layouts=(layout,),
+        ),
+    ).forward("attention", query, key, value, scale=scale)
+
+    visible_indices = ((0,), (0, 1), (0, 2), (0, 2, 3))
+    for query_offset, indices in enumerate(visible_indices):
+        expected = _dense_attention(
+            query[0, query_offset],
+            key[0, list(indices)],
+            value[0, list(indices)],
+        )
+        torch.testing.assert_close(dense_output[0, query_offset], expected)
+        torch.testing.assert_close(paged_output[0, query_offset], expected)
+
+
 def test_slot_mapping_uses_non_contiguous_physical_blocks() -> None:
     metadata = PagedAttentionMetadata(
         block_tables=((2, 0), (1, 3)),
         num_computed_tokens=(0, 1),
-        query_lengths=(3, 2),
+        query_layouts=_layouts(3, 2),
     )
 
     mapping = metadata.slot_mapping(block_size=2, query_width=3, device=torch.device("cpu"))
 
     assert mapping.tolist() == [[4, 5, 0], [3, 6, -1]]
+
+
+def test_paged_cache_compacts_a_non_contiguous_path_across_blocks() -> None:
+    cache = _cache()
+    prefix_keys = torch.arange(16, dtype=torch.float32).reshape(1, 2, 2, 4)
+    prefix_values = prefix_keys + 100
+    cache.write(
+        "attention",
+        prefix_keys,
+        prefix_values,
+        torch.tensor([[2, 3]]),
+    )
+    layout = QueryLayout((-1, 0, 0, 2, 3))
+    metadata = PagedAttentionMetadata(
+        block_tables=((1, 3, 0, 2),),
+        num_computed_tokens=(2,),
+        query_layouts=(layout,),
+        num_readonly_prefix_blocks=(1,),
+    )
+    query_keys = torch.arange(40, dtype=torch.float32).reshape(1, 5, 2, 4) + 20
+    query_values = query_keys + 100
+    cache.write(
+        "attention",
+        query_keys,
+        query_values,
+        metadata.slot_mapping(
+            block_size=2,
+            query_width=5,
+            device=torch.device("cpu"),
+        ),
+    )
+
+    cache.compact(
+        metadata.block_tables[0],
+        num_computed_tokens=2,
+        num_query_tokens=5,
+        num_reserved_query_tokens=5,
+        retained_query_indices=(0, 2, 4),
+        num_readonly_prefix_blocks=1,
+    )
+
+    layer = cache.layer("attention")
+    torch.testing.assert_close(layer.keys[1], prefix_keys[0])
+    destination_slots = (6, 7, 0)
+    flat_keys = layer.keys.view(8, 2, 4)
+    flat_values = layer.values.view(8, 2, 4)
+    torch.testing.assert_close(
+        flat_keys[list(destination_slots)],
+        query_keys[0, [0, 2, 4]],
+    )
+    torch.testing.assert_close(
+        flat_values[list(destination_slots)],
+        query_values[0, [0, 2, 4]],
+    )
 
 
 def test_paged_attention_matches_dense_attention_across_blocks_and_requests() -> None:
@@ -86,7 +190,7 @@ def test_paged_attention_matches_dense_attention_across_blocks_and_requests() ->
     first_metadata = PagedAttentionMetadata(
         block_tables=((2, 0), (1,)),
         num_computed_tokens=(0, 0),
-        query_lengths=(3, 2),
+        query_layouts=_layouts(3, 2),
     )
     first_query = torch.randn(2, 3, 2, 4)
     first_key = torch.randn(2, 3, 2, 4)
@@ -113,7 +217,7 @@ def test_paged_attention_matches_dense_attention_across_blocks_and_requests() ->
     decode_metadata = PagedAttentionMetadata(
         block_tables=((2, 0), (1, 3)),
         num_computed_tokens=(3, 2),
-        query_lengths=(1, 1),
+        query_layouts=_layouts(1, 1),
     )
     decode_query = torch.randn(2, 1, 2, 4)
     decode_key = torch.randn(2, 1, 2, 4)
@@ -140,7 +244,7 @@ def test_paged_attention_supports_grouped_query_heads() -> None:
     metadata = PagedAttentionMetadata(
         block_tables=((3, 0),),
         num_computed_tokens=(0,),
-        query_lengths=(3,),
+        query_layouts=_layouts(3),
     )
     query = torch.randn(1, 3, 4, 4)
     key = torch.randn(1, 3, 2, 4)
@@ -163,7 +267,7 @@ def test_slot_mapping_rejects_a_block_table_that_does_not_cover_the_query() -> N
     metadata = PagedAttentionMetadata(
         block_tables=((0,),),
         num_computed_tokens=(1,),
-        query_lengths=(2,),
+        query_layouts=_layouts(2),
     )
 
     with pytest.raises(KVCacheError, match="block table does not cover"):
@@ -176,7 +280,7 @@ def test_paged_attention_rejects_an_out_of_range_history_block() -> None:
         # 当前 token 写入 block 0，但 attention 也会读取越界的历史 block 4。
         block_tables=((4, 0),),
         num_computed_tokens=(2,),
-        query_lengths=(1,),
+        query_layouts=_layouts(1),
     )
 
     with pytest.raises(KVCacheError, match="out-of-range physical block"):
@@ -194,7 +298,7 @@ def test_paged_attention_rejects_an_aliased_block_within_one_request() -> None:
     metadata = PagedAttentionMetadata(
         block_tables=((0, 0),),
         num_computed_tokens=(2,),
-        query_lengths=(1,),
+        query_layouts=_layouts(1),
     )
 
     with pytest.raises(KVCacheError, match="aliases a physical block within one request"):
@@ -213,7 +317,7 @@ def test_paged_attention_rejects_aliased_blocks_across_requests() -> None:
         # 两行写不同 offset，单靠重复 slot 校验无法发现它们共享同一物理页。
         block_tables=((0,), (0,)),
         num_computed_tokens=(0, 1),
-        query_lengths=(1, 1),
+        query_layouts=_layouts(1, 1),
     )
 
     with pytest.raises(KVCacheError, match="alias a physical block across requests"):
@@ -235,7 +339,7 @@ def test_paged_attention_allows_the_same_readonly_prefix_position() -> None:
     metadata = PagedAttentionMetadata(
         block_tables=((0, 1), (0, 2)),
         num_computed_tokens=(2, 2),
-        query_lengths=(1, 1),
+        query_layouts=_layouts(1, 1),
         num_readonly_prefix_blocks=(1, 1),
     )
     query = torch.randn(2, 1, 2, 4)
@@ -265,13 +369,13 @@ def test_paged_attention_allows_the_same_readonly_prefix_position() -> None:
         PagedAttentionMetadata(
             block_tables=((0, 1), (0, 2)),
             num_computed_tokens=(2, 2),
-            query_lengths=(1, 1),
+            query_layouts=_layouts(1, 1),
             num_readonly_prefix_blocks=(1, 0),
         ),
         PagedAttentionMetadata(
             block_tables=((0, 1, 2), (3, 0, 4)),
             num_computed_tokens=(4, 4),
-            query_lengths=(1, 1),
+            query_layouts=_layouts(1, 1),
             num_readonly_prefix_blocks=(1, 2),
         ),
     ],
@@ -287,7 +391,7 @@ def test_paged_attention_rejects_readonly_blocks_beyond_the_computed_prefix() ->
     metadata = PagedAttentionMetadata(
         block_tables=((0,),),
         num_computed_tokens=(1,),
-        query_lengths=(1,),
+        query_layouts=_layouts(1),
         num_readonly_prefix_blocks=(1,),
     )
 
@@ -299,8 +403,8 @@ def test_paged_attention_keeps_unused_lookahead_as_an_explicit_reservation() -> 
     metadata = PagedAttentionMetadata(
         block_tables=((0, 1, 2),),
         num_computed_tokens=(0,),
-        query_lengths=(1,),
-        num_lookahead_tokens=(2,),
+        query_layouts=_layouts(1),
+        num_reserved_query_tokens=(3,),
     )
 
     metadata.validate_block_tables(num_blocks=3, block_size=1)
@@ -329,7 +433,7 @@ def test_paged_attention_rejects_unused_trailing_blocks(
     metadata = PagedAttentionMetadata(
         block_tables=block_tables,
         num_computed_tokens=num_computed_tokens,
-        query_lengths=(1,) * batch_size,
+        query_layouts=_layouts(*((1,) * batch_size)),
     )
 
     with pytest.raises(KVCacheError, match="unused physical blocks"):

@@ -13,6 +13,7 @@ from light_vllm.runtime.execution.dense_attention import (
     DenseAttentionMetadata,
     TorchDenseAttention,
 )
+from light_vllm.runtime.execution.layout import linear_query_layout
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionMetadata,
     TorchPagedAttentionBackend,
@@ -85,7 +86,9 @@ def _dense_forward(session, input_ids: torch.Tensor, *, past=None):
         session.kv_cache_spec,
         DenseAttentionMetadata(
             positions=positions,
-            query_lengths=(input_ids.shape[1],) * input_ids.shape[0],
+            query_layouts=tuple(
+                linear_query_layout(input_ids.shape[1]) for _ in range(input_ids.shape[0])
+            ),
         ),
         past,
     )
@@ -170,7 +173,7 @@ def test_qwen2_paged_attention_matches_full_sequence() -> None:
         PagedAttentionMetadata(
             block_tables=((3, 1),),
             num_computed_tokens=(0,),
-            query_lengths=(4,),
+            query_layouts=(linear_query_layout(4),),
         ),
     )
 

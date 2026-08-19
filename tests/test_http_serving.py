@@ -326,6 +326,49 @@ def test_tiny_attention_model_serves_through_engine_core() -> None:
     assert len(response.json()["generated_token_ids"]) == 2
 
 
+def test_engine_runtime_composes_ngram_trie_speculation() -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture="tiny-attention-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+        ),
+        runtime="engine",
+        max_num_sequences=1,
+        max_num_scheduled_tokens=8,
+        num_kv_blocks=256,
+        num_speculative_tokens=2,
+        speculative_proposer="trie",
+        speculative_ngram_min=2,
+        speculative_ngram_max=2,
+        speculative_max_depth=2,
+        speculative_max_branching=2,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/generate",
+            json={"input_ids": [1, 2, 3, 1, 2], "max_new_tokens": 2},
+        )
+        metrics = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert len(response.json()["generated_token_ids"]) == 2
+    assert "light_vllm_speculation_attempts_total" in metrics.text
+
+
+def test_engine_runtime_rejects_an_unknown_speculative_proposer() -> None:
+    with pytest.raises(ValueError, match="unsupported speculative proposer"):
+        create_serving_app(
+            ModelSpec(
+                architecture="tiny-attention-causal-lm",
+                model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+            ),
+            runtime="engine",
+            num_kv_blocks=4,
+            speculative_proposer="unknown",
+        )
+
+
 def test_engine_runtime_accepts_short_request_policy() -> None:
     app = create_serving_app(
         ModelSpec(
