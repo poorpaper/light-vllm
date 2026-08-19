@@ -189,6 +189,78 @@ class PagedKVCache:
         flat_keys.index_copy_(0, slots, key[active])
         flat_values.index_copy_(0, slots, value[active])
 
+    @torch.inference_mode()
+    def compact(
+        self,
+        block_ids: tuple[int, ...],
+        *,
+        num_computed_tokens: int,
+        num_query_tokens: int,
+        num_reserved_query_tokens: int,
+        retained_query_indices: tuple[int, ...],
+        num_readonly_prefix_blocks: int = 0,
+    ) -> int:
+        """把命中路径从展平 query slots 搬到连续正式尾部。"""
+
+        block_ids = tuple(block_ids)
+        retained = tuple(retained_query_indices)
+        values = (
+            num_computed_tokens,
+            num_query_tokens,
+            num_reserved_query_tokens,
+            num_readonly_prefix_blocks,
+        )
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError("paged compact counts must be non-negative integers")
+        if num_reserved_query_tokens < num_query_tokens:
+            raise ValueError("reserved query tokens must cover every actual query")
+        if any(type(index) is not int or index < 0 for index in retained):
+            raise ValueError("retained query indices must be non-negative integers")
+        if len(set(retained)) != len(retained):
+            raise ValueError("retained query indices must be unique")
+        if any(index >= num_query_tokens for index in retained):
+            raise KVCacheError("retained query index exceeds the paged KV tail")
+
+        config = self._config
+        required_blocks = (
+            num_computed_tokens + num_reserved_query_tokens + config.block_size - 1
+        ) // config.block_size
+        if len(block_ids) != required_blocks:
+            raise KVCacheError("block table does not exactly cover the reserved query slots")
+        if any(
+            type(block_id) is not int or not 0 <= block_id < config.num_blocks
+            for block_id in block_ids
+        ):
+            raise KVCacheError("block table contains an invalid physical block")
+        if len(set(block_ids)) != len(block_ids):
+            raise KVCacheError("block table aliases a physical block within one request")
+        if num_readonly_prefix_blocks * config.block_size > num_computed_tokens:
+            raise KVCacheError("readonly prefix blocks exceed the computed prefix")
+
+        def physical_slot(logical_position: int) -> int:
+            block_id = block_ids[logical_position // config.block_size]
+            return block_id * config.block_size + logical_position % config.block_size
+
+        source_slots = tuple(physical_slot(num_computed_tokens + index) for index in retained)
+        target_slots = tuple(
+            physical_slot(num_computed_tokens + index) for index in range(len(retained))
+        )
+        if source_slots == target_slots:
+            return 0
+
+        source = torch.tensor(source_slots, dtype=torch.long, device=config.device)
+        target = torch.tensor(target_slots, dtype=torch.long, device=config.device)
+        num_slots = config.num_blocks * config.block_size
+        for layer in self._layers.values():
+            flat_keys = layer.keys.view(num_slots, *layer.keys.shape[2:])
+            flat_values = layer.values.view(num_slots, *layer.values.shape[2:])
+            # 所有 source 先复制完成，再写 target，保证跨页重叠搬运正确。
+            keys = flat_keys.index_select(0, source).clone()
+            values = flat_values.index_select(0, source).clone()
+            flat_keys.index_copy_(0, target, keys)
+            flat_values.index_copy_(0, target, values)
+        return sum(left != right for left, right in zip(source_slots, target_slots, strict=True))
+
     def _allocate_layer(self, spec: AttentionLayerSpec) -> PagedLayerCache:
         shape = (
             self._config.num_blocks,

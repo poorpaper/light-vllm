@@ -26,8 +26,14 @@ from light_vllm.runtime.execution.interfaces import (
     ExecutionLease,
     ExecutionNotReadyError,
     ExecutionOutput,
+    ModelStepBatch,
     ModelStepHandler,
+    ModelStepRequest,
     RequestOutput,
+)
+from light_vllm.runtime.execution.layout import (
+    linear_model_step_request,
+    semantic_positions,
 )
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionBackend,
@@ -82,7 +88,7 @@ class ContiguousStepHandler:
     def forward(
         self,
         model: ModelSession,
-        batch: ExecutionBatch,
+        batch: ModelStepBatch,
     ) -> tuple[torch.Tensor, ...]:
         # 连续缓存按请求独立存放，因此逐请求前向，不为凑 batch 改变缓存布局。
         logits: list[torch.Tensor] = []
@@ -90,31 +96,32 @@ class ContiguousStepHandler:
             if request.block_ids is not None:
                 raise ExecutionError("contiguous model step does not accept a block table")
             try:
-                # Scheduler 的逻辑进度必须和物理 KV 一致，否则 position 会错位。
+                # Scheduler 的逻辑进度必须和物理 KV 一致，否则 prefix 会错位。
                 cached_tokens = self._cache.cached_tokens(request.request_id)
                 if cached_tokens != request.num_computed_tokens:
                     raise ExecutionError(
                         "physical KV length must match the scheduled computed-token count"
                     )
                 input_ids = torch.tensor(
-                    [request.input_token_ids],
+                    [request.query_token_ids],
                     dtype=torch.long,
                     device=self._device,
                 )
-                # position 是请求内的绝对位置，从已缓存长度继续递增。
-                positions = torch.arange(
-                    cached_tokens,
-                    cached_tokens + len(request.input_token_ids),
+                positions = torch.tensor(
+                    [
+                        semantic_positions(
+                            request.query_layout,
+                            prefix_length=request.num_computed_tokens,
+                        )
+                    ],
                     dtype=torch.long,
                     device=self._device,
-                ).unsqueeze(0)
-                # 连续与分页路径都向模型提供同一个 AttentionContext。
-                # 区别只留在上下文如何读取和写入物理 K/V。
+                )
                 attention = TorchDenseAttention(
                     self._cache.model_spec,
                     DenseAttentionMetadata(
                         positions=positions,
-                        query_lengths=(len(request.input_token_ids),),
+                        query_layouts=(request.query_layout,),
                     ),
                     self._cache.view(request.request_id),
                 )
@@ -128,7 +135,7 @@ class ContiguousStepHandler:
                 )
                 # AttentionContext 先暂存各层 K/V；整个 forward 成功后再统一追加。
                 updates = attention.cache_updates
-                if updates.num_tokens != len(request.input_token_ids):
+                if updates.num_tokens != len(request.query_token_ids):
                     raise ExecutionError("attention returned the wrong number of KV cache updates")
                 self._cache.append(request.request_id, updates)
             except KVCacheError as exc:
@@ -136,10 +143,17 @@ class ContiguousStepHandler:
             logits.append(output.logits[0])
         return tuple(logits)
 
-    def truncate(self, request_id: str, num_cached_tokens: int) -> None:
-        # 只保留 Engine 已确认提交的前缀，丢掉取消或未接受部分的物理 KV。
+    def compact(
+        self,
+        request: ModelStepRequest,
+        retained_query_indices: tuple[int, ...],
+    ) -> int:
         try:
-            self._cache.truncate(request_id, num_cached_tokens)
+            return self._cache.compact(
+                request.request_id,
+                num_computed_tokens=request.num_computed_tokens,
+                retained_query_indices=retained_query_indices,
+            )
         except KVCacheError as exc:
             raise ExecutionError(str(exc)) from exc
 
@@ -190,15 +204,14 @@ class PagedStepHandler:
     def forward(
         self,
         model: ModelSession,
-        batch: ExecutionBatch,
+        batch: ModelStepBatch,
     ) -> tuple[torch.Tensor, ...]:
-        # 分页路径必须靠 Scheduler 给出的页表完成“逻辑位置 -> 物理页”映射。
         for request in batch.requests:
             if request.block_ids is None:
                 raise ExecutionError("paged model step requires a block table for every request")
 
-        # 不同请求的 query 长度可以不同；补零后组成矩形 tensor，再用长度屏蔽 padding。
-        query_width = max(len(request.input_token_ids) for request in batch.requests)
+        # 不同请求的 query 长度可以不同；补零后用 layout 长度屏蔽 padding。
+        query_width = max(len(request.query_token_ids) for request in batch.requests)
         input_ids = torch.zeros(
             (len(batch.requests), query_width),
             dtype=torch.long,
@@ -207,17 +220,18 @@ class PagedStepHandler:
         positions = torch.zeros_like(input_ids)
         query_lengths: list[int] = []
         for row, request in enumerate(batch.requests):
-            query_length = len(request.input_token_ids)
+            query_length = len(request.query_token_ids)
             query_lengths.append(query_length)
             input_ids[row, :query_length] = torch.tensor(
-                request.input_token_ids,
+                request.query_token_ids,
                 dtype=torch.long,
                 device=self._device,
             )
-            # padding 不占位置；有效 token 仍使用各自请求内的绝对位置。
-            positions[row, :query_length] = torch.arange(
-                request.num_computed_tokens,
-                request.num_computed_tokens + query_length,
+            positions[row, :query_length] = torch.tensor(
+                semantic_positions(
+                    request.query_layout,
+                    prefix_length=request.num_computed_tokens,
+                ),
                 dtype=torch.long,
                 device=self._device,
             )
@@ -225,13 +239,14 @@ class PagedStepHandler:
         metadata = PagedAttentionMetadata(
             block_tables=tuple(request.block_ids or () for request in batch.requests),
             num_computed_tokens=tuple(request.num_computed_tokens for request in batch.requests),
-            query_lengths=tuple(query_lengths),
-            num_lookahead_tokens=tuple(request.num_lookahead_tokens for request in batch.requests),
+            query_layouts=tuple(request.query_layout for request in batch.requests),
+            num_reserved_query_tokens=tuple(
+                request.num_reserved_query_tokens for request in batch.requests
+            ),
             num_readonly_prefix_blocks=tuple(
                 request.num_readonly_prefix_blocks for request in batch.requests
             ),
         )
-        # Handler 选择具体 attention 实现，模型只通过统一接口调用它。
         attention = self._attention_backend.create(self._cache, metadata)
         output = _forward(
             model,
@@ -242,18 +257,31 @@ class PagedStepHandler:
                 attention=attention,
             ),
         )
-        # 每层都应经过 AttentionContext；缺层通常意味着模型漏写了该层 KV。
         expected_layers = frozenset(layer.layer_id for layer in self._cache.model_spec.layers)
         if attention.layer_ids != expected_layers:
             raise ExecutionError("model did not execute every configured paged attention layer")
-        # 下游只接收有效 query 的 logits，不暴露为对齐 batch 而补出的行尾。
         return tuple(
             output.logits[row, :query_length] for row, query_length in enumerate(query_lengths)
         )
 
-    def truncate(self, request_id: str, num_cached_tokens: int) -> None:
-        # 分页页池没有请求级有效长度；被拒绝的位置会在下次写入时覆盖。
-        return
+    def compact(
+        self,
+        request: ModelStepRequest,
+        retained_query_indices: tuple[int, ...],
+    ) -> int:
+        if request.block_ids is None:
+            raise ExecutionError("paged model step requires a block table for compact")
+        try:
+            return self._cache.compact(
+                request.block_ids,
+                num_computed_tokens=request.num_computed_tokens,
+                num_query_tokens=len(request.query_token_ids),
+                num_reserved_query_tokens=request.num_reserved_query_tokens,
+                retained_query_indices=retained_query_indices,
+                num_readonly_prefix_blocks=request.num_readonly_prefix_blocks,
+            )
+        except KVCacheError as exc:
+            raise ExecutionError(str(exc)) from exc
 
 
 class StandardDecodeHandler:
@@ -275,7 +303,10 @@ class StandardDecodeHandler:
             if request.max_output_tokens > 1:
                 raise ExecutionError("standard decode returns at most one output token")
 
-        logits_by_request = step.forward(model, batch)
+        model_step = ModelStepBatch(
+            requests=tuple(linear_model_step_request(request) for request in batch.requests)
+        )
+        logits_by_request = step.forward(model, model_step)
         # 即使本轮不采样，也必须完成已调度输入的模型计算和 KV 写入。
         if len(logits_by_request) != len(batch.requests):
             raise ExecutionError("model step must return one logits tensor per request")

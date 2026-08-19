@@ -789,6 +789,47 @@ class ContiguousKVCache:
                 raise KVCacheError("cannot extend contiguous KV cache while truncating")
             entry.length = num_cached_tokens
 
+    @torch.inference_mode()
+    def compact(
+        self,
+        request_id: str,
+        *,
+        num_computed_tokens: int,
+        retained_query_indices: tuple[int, ...],
+    ) -> int:
+        """按给定顺序把本轮 query K/V 压实到连续尾部。"""
+
+        retained = tuple(retained_query_indices)
+        if type(num_computed_tokens) is not int or num_computed_tokens < 0:
+            raise ValueError("computed token count must be a non-negative integer")
+        if any(type(index) is not int or index < 0 for index in retained):
+            raise ValueError("retained query indices must be non-negative integers")
+        if len(set(retained)) != len(retained):
+            raise ValueError("retained query indices must be unique")
+        with self._lock:
+            entry = self._get_entry(request_id)
+            if num_computed_tokens > entry.length:
+                raise KVCacheError("computed token count exceeds the contiguous KV length")
+            query_count = entry.length - num_computed_tokens
+            if any(index >= query_count for index in retained):
+                raise KVCacheError("retained query index exceeds the appended KV tail")
+            new_length = num_computed_tokens + len(retained)
+            if retained == tuple(range(len(retained))):
+                entry.length = new_length
+                return 0
+
+            source = [num_computed_tokens + index for index in retained]
+            destination = list(range(num_computed_tokens, new_length))
+            target = slice(num_computed_tokens, new_length)
+            # 先 gather 再覆盖，避免 source 和 target 重叠时破坏后续数据。
+            for layer in entry.layers:
+                keys = layer.keys[source].clone()
+                values = layer.values[source].clone()
+                layer.keys[target].copy_(keys)
+                layer.values[target].copy_(values)
+            entry.length = new_length
+            return sum(left != right for left, right in zip(source, destination, strict=True))
+
     def view(self, request_id: str) -> ContiguousKVCacheState:
         """返回当前有效前缀的语义视图，不复制 K/V。"""
 

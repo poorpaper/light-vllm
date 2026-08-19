@@ -8,6 +8,8 @@ import torch
 from torch import Tensor
 
 from light_vllm.modeling.attention.interfaces import AttentionContext, ModelKVCacheSpec
+from light_vllm.runtime.execution.interfaces import QueryLayout
+from light_vllm.runtime.execution.layout import query_visibility
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCacheState,
     ContiguousLayerKV,
@@ -17,27 +19,24 @@ from light_vllm.runtime.kv_cache import (
 
 @dataclass(frozen=True, slots=True)
 class DenseAttentionMetadata:
-    """dense attention 需要的 query 位置和有效长度。"""
+    """dense attention 需要的 query 位置和父链布局。"""
 
     positions: Tensor
-    query_lengths: tuple[int, ...]
+    query_layouts: tuple[QueryLayout, ...]
 
     def __post_init__(self) -> None:
-        lengths = tuple(self.query_lengths)
+        layouts = tuple(self.query_layouts)
         if self.positions.ndim != 2:
             raise ValueError("dense attention positions must have two dimensions")
         if self.positions.dtype != torch.long:
             raise ValueError("dense attention positions must use torch.long")
         if bool(torch.any(self.positions < 0)):
             raise ValueError("dense attention positions must not be negative")
-        if len(lengths) != self.positions.shape[0]:
-            raise ValueError("dense attention needs one query length per batch row")
-        if any(
-            type(length) is not int or length <= 0 or length > self.positions.shape[1]
-            for length in lengths
-        ):
-            raise ValueError("dense attention query lengths must fit the padded width")
-        object.__setattr__(self, "query_lengths", lengths)
+        if len(layouts) != self.positions.shape[0]:
+            raise ValueError("dense attention needs one query layout per batch row")
+        if any(len(layout) > self.positions.shape[1] for layout in layouts):
+            raise ValueError("dense attention query layouts must fit the padded width")
+        object.__setattr__(self, "query_layouts", layouts)
 
     @property
     def batch_size(self) -> int:
@@ -46,6 +45,10 @@ class DenseAttentionMetadata:
     @property
     def query_width(self) -> int:
         return self.positions.shape[1]
+
+    @property
+    def query_lengths(self) -> tuple[int, ...]:
+        return tuple(len(layout) for layout in self.query_layouts)
 
 
 class TorchDenseAttention(AttentionContext):
@@ -133,30 +136,33 @@ class TorchDenseAttention(AttentionContext):
         return torch.einsum("bhqk,bkhd->bqhd", probabilities, values)
 
     def _causal_mask(self, past_length: int, device: torch.device) -> Tensor:
-        positions = self._metadata.positions
-        past_positions = torch.arange(
-            past_length,
-            dtype=torch.long,
-            device=device,
-        ).expand(self._metadata.batch_size, -1)
-        key_positions = torch.cat((past_positions, positions), dim=1)
-        query_offsets = torch.arange(self._metadata.query_width, device=device)
-        lengths = torch.tensor(self._metadata.query_lengths, device=device).unsqueeze(1)
-        valid_new_keys = query_offsets.unsqueeze(0) < lengths
-        valid_keys = torch.cat(
+        visibility = torch.zeros(
             (
-                torch.ones(
-                    (self._metadata.batch_size, past_length),
-                    dtype=torch.bool,
-                    device=device,
-                ),
-                valid_new_keys,
+                self._metadata.batch_size,
+                self._metadata.query_width,
+                self._metadata.query_width,
             ),
-            dim=1,
+            dtype=torch.bool,
+            device=device,
         )
-        # padding 位置可以经过模型其他层，但不能成为有效 query 的历史。
-        causal = key_positions.unsqueeze(1) <= positions.unsqueeze(2)
-        return causal & valid_keys.unsqueeze(1)
+        for row, layout in enumerate(self._metadata.query_layouts):
+            length = len(layout)
+            visibility[row, :length, :length] = torch.tensor(
+                query_visibility(layout),
+                dtype=torch.bool,
+                device=device,
+            )
+        # 已提交 prefix 对全部有效 query 可见；新 query 只读取自身和祖先。
+        prefix = torch.ones(
+            (
+                self._metadata.batch_size,
+                self._metadata.query_width,
+                past_length,
+            ),
+            dtype=torch.bool,
+            device=device,
+        )
+        return torch.cat((prefix, visibility), dim=2)
 
     def _validate_inputs(self, query, key, value, layer_spec) -> None:
         if query.ndim != 4:

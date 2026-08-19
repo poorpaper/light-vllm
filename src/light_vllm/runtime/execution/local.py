@@ -25,6 +25,7 @@ from light_vllm.runtime.execution.interfaces import (
     ModelWorker,
     TokenExecutionSession,
 )
+from light_vllm.runtime.execution.layout import linear_query_layout
 from light_vllm.runtime.execution.worker import _forward
 from light_vllm.runtime.sampling import Sampler
 
@@ -60,7 +61,7 @@ class _LocalTokenExecutionSession:
                 model_spec,
                 DenseAttentionMetadata(
                     positions=positions,
-                    query_lengths=(len(token_ids),),
+                    query_layouts=(linear_query_layout(len(token_ids)),),
                 ),
             )
         batch = ForwardBatch(
