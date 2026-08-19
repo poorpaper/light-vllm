@@ -37,9 +37,10 @@ from light_vllm.runtime.execution.paged_cache import (
     PagedKVCachePlanner,
 )
 from light_vllm.runtime.execution.speculative import (
-    GreedyAcceptanceSampler,
-    NGramSpeculativeDecodeHandler,
-    NGramTokenProposer,
+    GreedyTreeAcceptanceSampler,
+    NGramChainProposer,
+    NGramTrieProposer,
+    SpeculativeDecodeHandler,
 )
 from light_vllm.runtime.execution.timing import (
     CudaEventExecutionTimer,
@@ -79,6 +80,7 @@ _DTYPES = {
 RuntimeMode = Literal["reference", "engine"]
 KVReservationMode = Literal["blocks", "unbounded"]
 PagedAttentionBackendName = Literal["torch", "triton"]
+SpeculativeProposerName = Literal["chain", "trie"]
 
 
 def _create_paged_cache_planner(
@@ -144,8 +146,11 @@ def create_serving_app(
     kv_cache_memory_fraction: float = 0.8,
     enable_prefix_caching: bool = False,
     num_speculative_tokens: int = 0,
+    speculative_proposer: SpeculativeProposerName = "chain",
     speculative_ngram_min: int = 2,
     speculative_ngram_max: int = 5,
+    speculative_max_depth: int = 4,
+    speculative_max_branching: int = 4,
     short_request_policy: ShortRequestPolicy | None = None,
     max_tolerable_ttft_seconds: float | None = None,
     ttft_prediction_window_size: int = 32,
@@ -176,6 +181,8 @@ def create_serving_app(
         raise ValueError("num_speculative_tokens must be a non-negative integer")
     if paged_attention_backend not in ("torch", "triton"):
         raise ValueError(f"unsupported paged attention backend: {paged_attention_backend}")
+    if speculative_proposer not in ("chain", "trie"):
+        raise ValueError(f"unsupported speculative proposer: {speculative_proposer}")
     if runtime == "reference":
         if enable_self_resubmit:
             raise ValueError("self-resubmit requires the engine runtime")
@@ -196,6 +203,7 @@ def create_serving_app(
             raise ValueError(f"unsupported runtime mode: {runtime}")
         if enable_self_resubmit and kv_reservation != "blocks":
             raise ValueError("self-resubmit requires paged KV reservation")
+        performance_observer = InMemoryPerformanceObserver(spec.architecture)
         if kv_reservation == "blocks":
             cache_planner = _create_paged_cache_planner(
                 spec,
@@ -233,13 +241,23 @@ def create_serving_app(
         else:
             raise ValueError(f"unsupported KV reservation mode: {kv_reservation}")
         if num_speculative_tokens:
-            decode_handler = NGramSpeculativeDecodeHandler(
-                NGramTokenProposer(
+            if speculative_proposer == "chain":
+                proposer = NGramChainProposer(
                     min_match_length=speculative_ngram_min,
                     max_match_length=speculative_ngram_max,
-                ),
+                )
+            else:
+                proposer = NGramTrieProposer(
+                    min_match_length=speculative_ngram_min,
+                    max_match_length=speculative_ngram_max,
+                    max_depth=speculative_max_depth,
+                    max_branching=speculative_max_branching,
+                )
+            decode_handler = SpeculativeDecodeHandler(
+                proposer,
                 sampler,
-                GreedyAcceptanceSampler(),
+                GreedyTreeAcceptanceSampler(),
+                performance_observer,
             )
             decoding_budget = DecodingBudget(
                 num_lookahead_tokens=num_speculative_tokens,
@@ -284,7 +302,6 @@ def create_serving_app(
                 ),
                 max_tolerable_ttft_seconds=max_tolerable_ttft_seconds,
             )
-        performance_observer = InMemoryPerformanceObserver(spec.architecture)
         engine_core = EngineCore(
             model_executor,
             scheduler,
@@ -405,10 +422,28 @@ def _create_parser() -> argparse.ArgumentParser:
         "--num-speculative-tokens",
         type=int,
         default=0,
-        help="maximum n-gram draft tokens per engine step",
+        help="maximum draft-tree node slots per engine step",
+    )
+    parser.add_argument(
+        "--speculative-proposer",
+        choices=("chain", "trie"),
+        default="chain",
+        help="draft proposer used when speculative decoding is enabled",
     )
     parser.add_argument("--speculative-ngram-min", type=int, default=2)
     parser.add_argument("--speculative-ngram-max", type=int, default=5)
+    parser.add_argument(
+        "--speculative-max-depth",
+        type=int,
+        default=4,
+        help="maximum depth of an n-gram trie proposal",
+    )
+    parser.add_argument(
+        "--speculative-max-branching",
+        type=int,
+        default=4,
+        help="maximum children retained per n-gram trie node",
+    )
     short = parser.add_argument_group("short-request scheduling")
     short.add_argument("--short-request-max-effective-prompt-tokens", type=int)
     short.add_argument("--short-request-max-total-tokens", type=int)
@@ -457,8 +492,11 @@ def main() -> None:
             kv_cache_memory_fraction=args.kv_cache_memory_fraction,
             enable_prefix_caching=args.enable_prefix_caching,
             num_speculative_tokens=args.num_speculative_tokens,
+            speculative_proposer=args.speculative_proposer,
             speculative_ngram_min=args.speculative_ngram_min,
             speculative_ngram_max=args.speculative_ngram_max,
+            speculative_max_depth=args.speculative_max_depth,
+            speculative_max_branching=args.speculative_max_branching,
             short_request_policy=_create_short_request_policy(
                 max_effective_prompt_tokens=(args.short_request_max_effective_prompt_tokens),
                 max_total_tokens=args.short_request_max_total_tokens,

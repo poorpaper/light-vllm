@@ -90,6 +90,14 @@ class PerformanceSnapshot:
     cancelled_requests_total: int
     rejected_requests_total: int
     overloaded_requests_total: int
+    speculation_attempts_total: int
+    speculation_hits_total: int
+    speculative_proposed_nodes_total: int
+    speculative_accepted_nodes_total: int
+    speculative_draft_roots_total: int
+    speculative_branching_parents_total: int
+    speculative_compacted_tokens_total: int
+    speculative_max_draft_depth: int
 
     def __post_init__(self) -> None:
         if not self.model_name:
@@ -105,6 +113,14 @@ class PerformanceSnapshot:
                 self.cancelled_requests_total,
                 self.rejected_requests_total,
                 self.overloaded_requests_total,
+                self.speculation_attempts_total,
+                self.speculation_hits_total,
+                self.speculative_proposed_nodes_total,
+                self.speculative_accepted_nodes_total,
+                self.speculative_draft_roots_total,
+                self.speculative_branching_parents_total,
+                self.speculative_compacted_tokens_total,
+                self.speculative_max_draft_depth,
             )
         ):
             raise ValueError("performance counters must be non-negative integers")
