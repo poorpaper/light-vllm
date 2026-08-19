@@ -34,6 +34,7 @@ if triton is not None:
         block_table_ptr,
         computed_ptr,
         query_length_ptr,
+        query_visibility_ptr,
         output_ptr,
         stride_query_batch,
         stride_query_token,
@@ -48,6 +49,9 @@ if triton is not None:
         stride_value_head,
         stride_value_dim,
         stride_table_batch,
+        stride_visibility_batch,
+        stride_visibility_query,
+        stride_visibility_key,
         stride_output_batch,
         stride_output_token,
         stride_output_head,
@@ -69,7 +73,7 @@ if triton is not None:
         query_offset = query_index % QUERY_WIDTH
         query_length = tl.load(query_length_ptr + batch_index)
         active_query = query_offset < query_length
-        sequence_length = tl.load(computed_ptr + batch_index) + query_offset + 1
+        computed = tl.load(computed_ptr + batch_index)
         kv_head = query_head // GROUP_SIZE
 
         dim_offsets = tl.arange(0, BLOCK_D)
@@ -94,7 +98,21 @@ if triton is not None:
         # 每次读一小段分页历史，并在线更新 softmax，避免创建中间分数张量。
         for block_start in tl.range(0, max_sequence_length, BLOCK_N):
             positions = block_start + token_offsets
-            token_mask = active_query & (positions < sequence_length)
+            key_query_offsets = positions - computed
+            query_key_mask = (key_query_offsets >= 0) & (key_query_offsets < query_length)
+            safe_key_query_offsets = tl.maximum(key_query_offsets, 0)
+            visibility_offsets = (
+                batch_index * stride_visibility_batch
+                + query_offset * stride_visibility_query
+                + safe_key_query_offsets * stride_visibility_key
+            )
+            query_key_visible = tl.load(
+                query_visibility_ptr + visibility_offsets,
+                mask=active_query & query_key_mask,
+                other=0,
+            ).to(tl.int1)
+            # committed prefix 全部可见；本轮 query 只读取父链上的祖先和自身。
+            token_mask = active_query & ((positions < computed) | query_key_visible)
             logical_blocks = positions // PAGE_SIZE
             offsets_in_page = positions % PAGE_SIZE
             physical_blocks = tl.load(
@@ -162,6 +180,7 @@ class TritonPagedAttention:
         self._metadata = metadata
         self._layer_ids: set[str] = set()
         self._slot_mapping: Tensor | None = None
+        self._query_visibility: Tensor | None = None
         self._query_width: int | None = None
 
         config = cache.config
@@ -240,6 +259,11 @@ class TritonPagedAttention:
                 query_width=query_width,
                 device=config.device,
             )
+            self._query_visibility = self._metadata.visibility_tensor(
+                query_width=query_width,
+                device=config.device,
+            )
+        assert self._query_visibility is not None
 
         # KV 写入和 attention 分成两个顺序步骤；同一 CUDA stream 保证读取前写入完成。
         self._cache.write(layer_id, key, value, self._slot_mapping)
@@ -255,11 +279,13 @@ class TritonPagedAttention:
             self._block_tables,
             self._num_computed_tokens,
             self._query_lengths,
+            self._query_visibility,
             output,
             *query.stride(),
             *layer.keys.stride(),
             *layer.values.stride(),
             self._block_tables.stride(0),
+            *self._query_visibility.stride(),
             *output.stride(),
             self._max_sequence_length,
             scale,
