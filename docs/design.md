@@ -1,4 +1,4 @@
-# light-vllm 架构设计（v0.13）
+# light-vllm 架构设计（v0.14）
 
 这份文档记录当前已经落地的设计。更细的职责说明见 [architecture.md](architecture.md)。
 
@@ -114,6 +114,8 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `GenerateRequest` / events | 协议无关的用户生成语义 |
 | `SchedulerOutput` | 本轮每请求 computed、scheduled、lookahead、输出预算和可选 block table |
 | `ExecutionBatch` | Engine 从请求状态切出的本轮真实 token |
+| `DraftTree` / `QueryLayout` | 有界候选父链，以及一次 model step 的 query 依赖事实 |
+| `ModelStepRequest` / `ModelStepBatch` | Decode Handler 已确定的 query、reservation、布局和 block table |
 | `ExecutionOutput` | 每轮请求结果、实际进入模型 forward 的 token 数和可选设备耗时 |
 | `RequestOutput` | 每请求完成的输入计算量、零到多个确认输出与已缓存输出前缀 |
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
@@ -130,6 +132,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ShortRequestPolicy` / `SelfResubmitPolicy` | 可选调度策略配置，不进入 Engine、Worker 或协议契约 |
 | `StepLatencyPredictor` / `TTFTAdmission` | 用已完成 step 更新的独立延迟预测与动态准入控制端口 |
 | `PerformanceObserver` | Engine 生命周期事实的轻量接收端，不执行 I/O 或控制运行时 |
+| `SpeculationObserver` | 成功树验证的候选、命中、深度和 KV 搬运事实旁路 |
 | `PerformanceMetricsReader` | Prometheus、日志等控制面读取不可变性能快照的端口 |
 
 `SchedulerOutput` 和 `RequestOutput` 是扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
@@ -166,7 +169,7 @@ sequenceDiagram
     E->>X: execute(ExecutionBatch)
     X->>W: execute(ExecutionBatch)
     W->>D: execute(model, batch, step)
-    D->>H: forward(model, batch)
+    D->>H: forward(model, ModelStepBatch)
     H->>A: create(cache + batch metadata)
     H->>M: forward(ForwardBatch + AttentionContext)
     M->>A: forward(layer_id, Q, K, V)
@@ -174,8 +177,10 @@ sequenceDiagram
     M-->>H: logits
     H->>H: finalize physical KV updates
     H-->>D: per-request logits
-    D->>P: sample(last valid logits)
+    D->>P: sample(target logits)
     P-->>D: token IDs
+    D->>H: compact(accepted query path, speculative only)
+    H-->>D: actual moved tokens
     D-->>W: RequestOutput
     W-->>X: RequestOutput(input, outputs, cached prefix)
     X-->>E: ExecutionOutput(results + actual model tokens)
@@ -218,7 +223,9 @@ fallback 的请求仍使用严格 claim。
 `block_id * block_size + offset`，原位写入本轮 K/V，并按 block table 逐页完成 causal attention。不同长度
 请求会组成一个 padded forward batch，`sequence_lengths` 屏蔽 padding，`positions` 始终保存请求内绝对位置。
 连续与分页 Step Handler 都从模型唯一的 `ModelKVCacheSpec` 获取逐层 KV 形状，装配层不再重复配置层数、KV head 或
-head size。模型只调用 `AttentionContext`，不依赖具体 page layout。block table 必须精确覆盖当前有效前缀、
+head size。`QueryLayout` 将每个 query 的语义位置与物理 slot 分开：兄弟节点可以有相同 RoPE position，但只能读取
+已提交前缀、祖先和自身，并写入不同 slot。验收路径不是展平前缀时，Step Handler 先 gather/clone/scatter 压实 KV，
+再向 Engine 返回结果。模型只调用 `AttentionContext`，不依赖具体 page layout。block table 必须精确覆盖当前有效前缀、
 query 与显式 lookahead reservation，不携带未预留尾页。可选 prefix cache 只索引已经提交的完整 prompt 页；
 哈希链保留父摘要和本页精确 token，零引用页进入 LRU。跨请求只允许在相同逻辑位置共享双方都声明为只读的前缀页，
 query 与未填满尾页始终独占。命中时至少留一个 token 重新计算 logits；prompt 恰好整页时会重算最后一整页。
@@ -284,9 +291,10 @@ model_executor = LocalModelExecutor(worker)
 ```
 
 新增 top-k/top-p 时实现新的 Sampler 并装配。投机解码的 acceptance sampler 不等同于普通 Sampler：
-`NGramSpeculativeDecodeHandler` 先从完整请求历史提出候选，把“本轮输入 + 候选”交给目标模型，再从原输入最后一行
-开始读取验证结果。第一次不同时返回已接受前缀和目标 token；全部相同时额外返回一个 bonus token。被拒绝的物理
-KV 尾部立即截断，Scheduler 只提交真实接受的候选前缀。
+`NGramChainProposer` 和 `NGramTrieProposer` 都返回 `DraftTree`，通用 `SpeculativeDecodeHandler` 将正式输入和草稿
+降为 `QueryLayout`，交给目标模型一次验证。`GreedyTreeAcceptanceSampler` 沿目标 token 命中的唯一分支前进；第一次
+不命中时返回已接受路径和目标 token，命中叶子时再返回 bonus token。Handler 在返回前 compact 非连续路径，
+Scheduler 只提交真实接受的草稿节点。
 
 ## 9. Reference 与 Engine Core
 
@@ -304,7 +312,8 @@ token 时记录 TTFT/可见 token 间隔；请求完成、失败或取消时记�
 投机解码和普通解码复用同一路径。
 
 控制面还公开短请求首 token lane 当前请求数、KV completion claim、self-resubmit 次数与回滚的已计算进度，
-并把确定性 `rejected` 和动态 `overloaded` 与已经启动后的 finished/failed/cancelled 分开计数。这样可以同时验证
+并通过独立 `SpeculationObserver` 记录尝试/命中节点、草稿根、真实分支父节点、最大深度和 compact 搬运量；
+确定性 `rejected` 和动态 `overloaded` 与已经启动后的 finished/failed/cancelled 分开计数。这样可以同时验证
 短请求保护是否生效、best-effort 是否产生过多重算，以及 TTFT 429 是否需要调参。
 
 `InMemoryPerformanceObserver` 是专门的性能观察角色，只做短临界区计数。它不能调整 Scheduler 参数，也不执行
@@ -331,7 +340,8 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`。未来性�
 | 调度契约 | `src/light_vllm/runtime/scheduler/interfaces.py` |
 | 分层 token-budget 调度 | `src/light_vllm/runtime/scheduler/token_budget.py` |
 | 执行契约 | `src/light_vllm/runtime/execution/interfaces.py` |
-| n-gram 投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
+| query 布局推导 | `src/light_vllm/runtime/execution/layout.py` |
+| chain/trie 树形投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
 | 执行 step 计时 | `src/light_vllm/runtime/execution/timing.py` |
 | 本地 Worker | `src/light_vllm/runtime/execution/worker.py` |
@@ -360,15 +370,15 @@ flowchart LR
     Sampling --> Paged["物理 Paged Attention<br/>PyTorch correctness 完成"]
     Paged --> Capacity["capacity discovery + admission<br/>完成"]
     Capacity --> Prefix["Prefix cache<br/>完成"]
-    Prefix --> Spec["Speculative decoding<br/>完成"]
-    Spec --> Kernel["Triton fused attention<br/>首版与 GPU 数值对照完成"]
+    Prefix --> Spec["Tree speculative decoding<br/>CPU 正确性完成"]
+    Spec --> Kernel["Triton tree mask<br/>代码/测试完成 · GPU 待验收"]
     Kernel --> Metrics["性能指标 + Prometheus/Grafana/HPA<br/>完成"]
     Metrics --> SLO["短请求池 + TTFT 早拒 + 可选 self-resubmit<br/>完成"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
-Torch 2.8.0、Triton 3.4.0 环境完成 JIT，以及 FP16/BF16、prefill/decode、GQA、共享 prefix、lookahead 的
-PyTorch 数值对照；长上下文性能和跨显卡验收仍是后续工作。
+Torch 2.8.0、Triton 3.4.0 环境完成既有线性场景的 JIT 和数值对照；树形 visibility kernel 与 padded parity
+测试已经加入，但仍需 CUDA 环境验收。长上下文性能、跨显卡和 chain/trie 端到端收益也仍是后续工作。
 
 ## 13. 验证要求
 
@@ -382,12 +392,13 @@ git diff --check
 ```
 
 测试必须覆盖固定 ModelSession、token budget、chunked prefill、多 token 与已缓存输出前缀、容量规划与 admission、
-prefix 命中/LRU/epoch、投机全接受/部分接受/首个拒绝/短候选、逻辑 block 回滚、非连续物理页、block table
+prefix 命中/LRU/epoch、草稿树约束/兄弟隔离/非连续路径验收/compact、无候选退化、逻辑 block 回滚、
+非连续物理页、block table
 别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、短请求 token/KV/sequence 预留与 aging、TTFT 预测/冷启动/429、
 self-resubmit 不重复输出/严格 fallback/资源归还、TTFT/ITL、step 延迟、两种 token backlog、KV 使用率、执行失败和
 取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
 Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、padded GQA、decode 历史、共享
-prefix 和未使用 lookahead。
+prefix、未使用 lookahead 和 padded mixed tree visibility。
 
 边界命名与职责参考 [vLLM Architecture Overview](https://docs.vllm.ai/en/latest/design/arch_overview/)；分页布局与
 按需读取原则参考 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)。完整页哈希与 LRU 参考

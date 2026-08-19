@@ -1,6 +1,6 @@
 # Tree Speculative Decoding 设计提案
 
-> 状态：Proposal，尚未实现。
+> 状态：核心实现与 CPU 正确性测试已完成；Triton 树形测试已加入，GPU 数值与性能验收待完成。
 >
 > 目标：在不污染 Engine、Scheduler 和 Worker 热路径的前提下，为 light-vllm
 > 增加 N-Gram Trie 多分支草稿与单次目标模型并行验证能力。
@@ -14,7 +14,7 @@
 - `RequestOutput` 可以一次返回多个确认 token，并单独报告已写入 KV 的连续前缀；
 - Engine 只按事实提交实际算完的输入和已缓存输出，不理解具体投机算法。
 
-现有实现仍假设草稿是一条线性链：
+改造前的实现假设草稿是一条线性链：
 
 1. `TokenProposer` 返回 `tuple[int, ...]`；
 2. 投机 Handler 通过 `input + drafts` 构造线性验证序列；
@@ -74,7 +74,7 @@ class DraftTree:
 
 约束：
 
-- 节点按父节点优先顺序展平，首版使用稳定的 BFS 顺序；
+- 节点只要求 parent 先于 child；当前 `NGramTrieProposer` 使用稳定 BFS 生成顺序；
 - `parent_indices[i] == -1` 表示节点直接从当前正式 token 尾部生长；
 - 其他 parent 必须满足 `0 <= parent < i`；
 - 同一 parent 下不能出现重复 token，否则目标 token 无法唯一选择子节点；
@@ -229,10 +229,11 @@ KV 写入和 attention 继续使用同一 CUDA stream 上的两个顺序步骤�
 ModelStepHandler.compact(
     request: ModelStepRequest,
     retained_query_indices: tuple[int, ...],
-) -> None
+) -> int
 ```
 
-`retained_query_indices` 按最终正式 token 顺序包含：
+返回值是 source/destination 物理位置不同、实际发生搬运的 token 数。`retained_query_indices` 按最终正式 token
+顺序包含：
 
 1. 本轮全部正式输入 query；
 2. acceptance 选中的草稿路径 query。
@@ -281,9 +282,8 @@ speculative workspace claim；在此之前不扩大 Scheduler/KV 协议。
 
 - 只读取当前请求完整历史，不保存跨请求可变状态；
 - 找到最长匹配后缀后，收集历史中所有匹配位置的后续 token；
-- 按频次构造 Trie；
+- 按频次构造 Trie；同分时依次比较最近 occurrence 和 token ID；
 - 使用 `max_nodes`、`max_depth` 和 `max_branching` 做确定性裁剪；
-- 同分时采用固定顺序，保证测试可复现；
 - 无匹配时返回空树，自动退化为普通单 token 解码。
 
 组合根可以装配：
@@ -301,6 +301,7 @@ ngram trie proposer ──┘
 | 文件 | 改造 |
 | --- | --- |
 | `runtime/execution/interfaces.py` | 增加 `DraftTree`、`QueryLayout`、`ModelStepRequest/Batch` 与通用 compact 契约 |
+| `runtime/execution/layout.py` | 从父链推导线性/树形 layout、语义 position 与 ancestor visibility |
 | `runtime/execution/speculative.py` | 通用树形 Handler、N-Gram chain/trie proposer、greedy tree acceptance |
 | `runtime/execution/worker.py` | Step Handler 消费 `ModelStepBatch`，按 layout 生成 position/metadata |
 | `runtime/execution/dense_attention.py` | 使用 prefix + ancestor visibility |
@@ -339,32 +340,32 @@ mask 是 backend 表达，不是核心事实。稳定契约只保留 `O(Q)` pare
 
 ## 13. 分阶段实施
 
-### Phase 1：拆清 model-step 契约，不改变行为
+### Phase 1：拆清 model-step 契约，不改变行为（已完成）
 
 - 引入 `ModelStepRequest/Batch` 和线性 `QueryLayout`；
 - Standard/现有 N-Gram 路径全部迁移；
 - 输出、KV 和调度测试必须与当前 main 完全一致。
 
-### Phase 2：PyTorch 树验证正确性
+### Phase 2：PyTorch 树验证正确性（已完成）
 
 - 引入 `DraftTree` 和固定树 proposer；
 - Dense/Paged backend 支持 ancestor visibility；
 - 连续和分页缓存实现 compact；
 - 使用 tiny model 与 greedy 基线做端到端输出对照。
 
-### Phase 3：N-Gram Trie
+### Phase 3：N-Gram Trie（已完成）
 
 - 实现历史匹配、频次 Trie 和有界裁剪；
 - 接入通用 speculative Handler；
 - 增加 chain/trie 装配选择和可观测计数。
 
-### Phase 4：Triton tree mask
+### Phase 4：Triton tree mask（代码与测试已完成，GPU 验收待完成）
 
 - 增加 visibility tensor 和 kernel mask；
 - 在 RTX 5090 上覆盖 FP16/BF16、GQA、padded batch、跨页和 prefix cache；
 - 比较 Torch/Triton 数值与 greedy 输出。
 
-### Phase 5：性能验收与默认策略
+### Phase 5：性能验收与默认策略（待完成）
 
 - 对代码、RAG/模板、普通对话分别测试；
 - 比较 chain N-Gram、Trie N-Gram 和关闭投机三组；
@@ -415,7 +416,7 @@ mask 是 backend 表达，不是核心事实。稳定契约只保留 `O(Q)` pare
 并行验证不天然等于加速。Trie 在重复结构明显的代码、RAG 引用和模板生成中更可能有效；普通对话或高并发场景可能因
 额外 query、mask 和 KV compact 降低吞吐。
 
-至少记录：
+实现通过独立 `SpeculationObserver` 上报这些事实；观察端首次失败后停用，不能改变生成结果。至少记录：
 
 - proposed/accepted node count；
 - accepted path length；

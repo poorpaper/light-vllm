@@ -71,7 +71,7 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
 | `PagedStepHandler` | padded batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
 | `StandardDecodeHandler` | 普通 prefill/单 token decode 的结果转换与采样 | KV 布局、调度 |
-| `NGramSpeculativeDecodeHandler` | 历史候选、目标验证、验收与拒绝尾部截断 | KV 布局、调度 |
+| `SpeculativeDecodeHandler` | 草稿树提议、目标验证、路径验收与 KV 压实 | KV 布局、调度 |
 | `PagedKVCachePlanner` | 模型加载后把固定页数或空闲显存预算解析为容量 | 请求调度、page ownership |
 | `TorchDenseAttention` | 读取连续历史、dense causal attention、暂存本轮 K/V | 模型结构、物理分页 |
 | `PagedAttentionBackend` | 为页池和批次事实创建 `AttentionContext` | 模型分发、调度 |
@@ -129,6 +129,22 @@ ExecutionRequest
 ├── block_ids: tuple[int, ...] | None
 └── num_readonly_prefix_blocks
 ```
+
+Decode Handler 再把正式输入降为具体 model step；普通路径使用线性父链，投机路径追加草稿树：
+
+```text
+ModelStepRequest
+├── request_id
+├── query_token_ids
+├── num_computed_tokens
+├── num_reserved_query_tokens
+├── query_layout: QueryLayout
+├── block_ids: tuple[int, ...] | None
+└── num_readonly_prefix_blocks
+```
+
+`num_reserved_query_tokens` 覆盖正式输入和所有投机槽；未使用槽位不进入 forward。`QueryLayout` 只保存
+`O(Q)` 父关系，position、ancestor visibility 和物理 slot 由 Step Handler/backend 推导。
 
 Executor 返回：
 
@@ -269,9 +285,11 @@ class Sampler(Protocol):
 argmax；以后增加 temperature、top-k 或 top-p 时，不修改 Engine、Scheduler、ModelRunner 或 Executor
 接口。
 
-投机解码的 acceptance sampling 与普通 Sampler 是不同职责。当前 n-gram 实现只读单请求完整 token 历史，
-优先续写最长且最近的重复后缀；目标模型一次验证实际候选，验收器返回同一个事实型 `RequestOutput`。候选不足
-lookahead 时，剩余预留仍显式留在分页 metadata 中，因此 block table 继续严格覆盖最坏情况，不增加模式枚举。
+投机解码的 acceptance sampling 与普通 Sampler 是不同职责。`NGramChainProposer` 保留最近命中的线性续写，
+`NGramTrieProposer` 将最长重复后缀的所有历史续写按频次、最近位置和 token ID 确定性裁剪为有界 BFS 树。二者只
+返回 `DraftTree`，由 `SpeculativeDecodeHandler` 统一构造 `QueryLayout`、执行目标验证、沿命中分支验收，并在返回
+`RequestOutput` 前 compact 非连续 KV 路径。候选不足 lookahead 时，剩余预留仍留在 metadata 中，因此 block table
+继续严格覆盖最坏情况，不增加模式枚举。
 
 ## Reference 与 serving 边界
 
@@ -312,7 +330,9 @@ Scheduler 分开公开两种 token 事实：`pending_tokens` 是当前已知但�
 block token slot 计算；completion claim、短请求首 token lane、self-resubmit 次数与回滚的已计算进度单独公开；
 可淘汰 prefix page 视为可用，无固定上限的连续缓存不输出伪容量。
 
-Prometheus renderer 只依赖 `PerformanceMetricsReader`，生成 HTTP 路由仍只依赖 `EngineClient`。Grafana 看板和
+投机树的 proposed/accepted、root、branching parent、max depth 与 compact 搬运量经独立 `SpeculationObserver`
+进入同一快照；旁路首次失败后停用，不影响输出。Prometheus renderer 只依赖 `PerformanceMetricsReader`，
+生成 HTTP 路由仍只依赖 `EngineClient`。Grafana 看板和
 HPA 位于仓库外控制面：前者查询 histogram/计数，后者经 Prometheus Adapter 读取每 Pod 的
 `light_vllm_waiting_max_remaining_tokens`。observer 不执行 I/O 或自动调参；安全组合器会在第三方 observer 首次
 失败后停用它，而且不在 Engine 热路径写日志。未来 Guardian 需要单独控制端口和有界安全更新点。

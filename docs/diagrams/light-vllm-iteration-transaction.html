@@ -35,7 +35,7 @@
 
     <svg viewBox="0 0 1280 920" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="light-vllm-iteration-transaction-title light-vllm-iteration-transaction-desc">
       <title id="light-vllm-iteration-transaction-title">light-vllm 普通解码与投机解码的共同执行契约</title>
-      <desc id="light-vllm-iteration-transaction-desc">展示 Engine、Scheduler、Executor、解码策略和事件流之间的单轮时序，并对比普通解码和 n-gram 投机解码如何使用相同的 ExecutionRequest 与 RequestOutput，最后按实际缓存前缀提交 KV。</desc>
+      <desc id="light-vllm-iteration-transaction-desc">展示 Engine、Scheduler、Executor、解码策略和事件流之间的单轮时序，并对比普通解码和 chain/trie 树形投机解码如何从相同 ExecutionRequest 生成 ModelStepRequest 与 RequestOutput，最后按实际缓存路径提交 KV。</desc>
       <defs>
         <marker id="lvtx-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f5d75"/></marker>
         <marker id="lvtx-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#eb6c36"/></marker>
@@ -58,7 +58,7 @@
       <text x="624" y="300" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing=".12em">ALT</text>
       <text x="620" y="320" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">[当前实现：StandardDecodeHandler，lookahead = 0]</text>
       <line x1="612" y1="400" x2="948" y2="400" stroke="rgba(45,49,66,.20)" stroke-width="1" stroke-dasharray="4,3"/>
-      <text x="620" y="432" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace">[当前实现：NGramSpeculativeDecodeHandler，lookahead &gt; 0]</text>
+      <text x="620" y="432" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace">[当前实现：SpeculativeDecodeHandler + DraftTree，lookahead &gt; 0]</text>
 
       <!-- Messages, all drawn before actors -->
       <line x1="120" y1="136" x2="360" y2="136" stroke="#4f5d75" stroke-width="1" marker-end="url(#lvtx-arrow)"/>
@@ -128,7 +128,7 @@
       <g>
         <rect x="836" y="44" width="168" height="52" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
         <text x="920" y="64" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist',sans-serif" text-anchor="middle">Decode + Step Handlers</text>
-        <text x="920" y="84" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">ordinary · n-gram speculative</text>
+        <text x="920" y="84" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">ordinary · chain/trie tree speculative</text>
       </g>
       <g>
         <rect x="1080" y="44" width="160" height="52" rx="6" fill="rgba(46,90,168,.06)" stroke="#2e5aa8" stroke-width="1"/>
