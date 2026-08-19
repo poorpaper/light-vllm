@@ -200,6 +200,11 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
             snapshot.speculative_accepted_nodes_total,
         ),
         (
+            "light_vllm_speculative_verified_tokens_total",
+            "Tokens produced by speculative target verification, including the final target token.",
+            snapshot.speculative_verified_tokens_total,
+        ),
+        (
             "light_vllm_speculative_draft_roots_total",
             "Root nodes across proposed draft trees.",
             snapshot.speculative_draft_roots_total,

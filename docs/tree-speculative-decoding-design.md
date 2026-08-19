@@ -419,13 +419,23 @@ mask 是 backend 表达，不是核心事实。稳定契约只保留 `O(Q)` pare
 实现通过独立 `SpeculationObserver` 上报这些事实；观察端首次失败后停用，不能改变生成结果。至少记录：
 
 - proposed/accepted node count；
-- accepted path length；
+- accepted path length，以及包含最终 target token 的 verified token count；
 - tree hit/miss 和平均 branching factor；
 - 每个可见 token 的目标模型 forward 次数；
 - TTFT、TPOT、吞吐和 p50/p95 step latency；
 - speculative workspace 峰值和 compact 搬运量。
 
 只有在目标 workload 上端到端 TPOT 或吞吐优于 chain N-Gram，并且不破坏短请求与非抢占保证时，才宣称性能收益。
+
+树验证的主要算法指标采用 Mean Verified Tokens：
+
+```text
+mean_verified_tokens = speculative_verified_tokens_total / speculation_attempts_total
+```
+
+一次 greedy 验证的 verified tokens 等于接受的草稿节点数加 target model 最终补出的一个 token。该指标衡量一次
+target verification 平均让请求前进多少 token；`accepted / proposed` 只作为草稿节点利用率诊断。最终性能仍以
+TPOT、吞吐和端到端 speedup 为准，因为更大的树也会增加 attention 与 KV compact 开销。
 
 ## 16. 参考
 

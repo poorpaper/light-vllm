@@ -213,6 +213,7 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
         SpeculativeDecodeObservation(
             num_proposed_nodes=4,
             num_accepted_nodes=2,
+            num_verified_tokens=3,
             num_draft_roots=2,
             num_branching_parents=1,
             max_draft_depth=3,
@@ -236,6 +237,7 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     assert 'light_vllm_speculation_hits_total{model="qwen2"} 1' in response.text
     assert 'light_vllm_speculative_proposed_nodes_total{model="qwen2"} 4' in response.text
     assert 'light_vllm_speculative_accepted_nodes_total{model="qwen2"} 2' in response.text
+    assert 'light_vllm_speculative_verified_tokens_total{model="qwen2"} 3' in response.text
     assert 'light_vllm_speculative_compacted_tokens_total{model="qwen2"} 1' in response.text
     assert 'light_vllm_speculative_max_draft_depth{model="qwen2"} 3' in response.text
     assert "light_vllm_time_to_first_token_seconds_bucket" in response.text

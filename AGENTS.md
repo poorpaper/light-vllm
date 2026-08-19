@@ -177,7 +177,8 @@ Executor lease 固定物理资源，取消只标记释放，tensor 等 lease 退
 Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边界。
 
 `TTFTAdmission` 是控制组件：在 Engine 锁内读取一次 Scheduler 快照做准入，在 step 完成后消费真实延迟；
-`PerformanceObserver` 只记录同一事实。投机细节通过独立 `SpeculationObserver` 端口上报；其首次失败后必须停用。
+`PerformanceObserver` 只记录同一事实。投机细节通过独立 `SpeculationObserver` 端口上报，包括候选/命中节点、
+验证产出 token、树形状和 KV 搬运；其首次失败后必须停用。
 这些旁路不得互相调用、持有模型执行锁、执行 I/O 或改变生成结果。
 
 `InMemoryPerformanceObserver` 只有独立短临界区，记录单调时钟与计数；CPU step 用墙钟，CUDA step 用执行层 event

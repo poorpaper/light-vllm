@@ -94,6 +94,7 @@ class PerformanceSnapshot:
     speculation_hits_total: int
     speculative_proposed_nodes_total: int
     speculative_accepted_nodes_total: int
+    speculative_verified_tokens_total: int
     speculative_draft_roots_total: int
     speculative_branching_parents_total: int
     speculative_compacted_tokens_total: int
@@ -117,6 +118,7 @@ class PerformanceSnapshot:
                 self.speculation_hits_total,
                 self.speculative_proposed_nodes_total,
                 self.speculative_accepted_nodes_total,
+                self.speculative_verified_tokens_total,
                 self.speculative_draft_roots_total,
                 self.speculative_branching_parents_total,
                 self.speculative_compacted_tokens_total,

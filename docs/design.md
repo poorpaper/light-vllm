@@ -132,7 +132,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ShortRequestPolicy` / `SelfResubmitPolicy` | 可选调度策略配置，不进入 Engine、Worker 或协议契约 |
 | `StepLatencyPredictor` / `TTFTAdmission` | 用已完成 step 更新的独立延迟预测与动态准入控制端口 |
 | `PerformanceObserver` | Engine 生命周期事实的轻量接收端，不执行 I/O 或控制运行时 |
-| `SpeculationObserver` | 成功树验证的候选、命中、深度和 KV 搬运事实旁路 |
+| `SpeculationObserver` | 成功树验证的候选、命中、验证产出、深度和 KV 搬运事实旁路 |
 | `PerformanceMetricsReader` | Prometheus、日志等控制面读取不可变性能快照的端口 |
 
 `SchedulerOutput` 和 `RequestOutput` 是扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
@@ -312,7 +312,8 @@ token 时记录 TTFT/可见 token 间隔；请求完成、失败或取消时记�
 投机解码和普通解码复用同一路径。
 
 控制面还公开短请求首 token lane 当前请求数、KV completion claim、self-resubmit 次数与回滚的已计算进度，
-并通过独立 `SpeculationObserver` 记录尝试/命中节点、草稿根、真实分支父节点、最大深度和 compact 搬运量；
+并通过独立 `SpeculationObserver` 记录尝试/命中节点、验证产出 token、草稿根、真实分支父节点、最大深度和 compact
+搬运量；`verified_tokens_total / attempts_total` 表达每次 target verification 的平均产出长度；
 确定性 `rejected` 和动态 `overloaded` 与已经启动后的 finished/failed/cancelled 分开计数。这样可以同时验证
 短请求保护是否生效、best-effort 是否产生过多重算，以及 TTFT 429 是否需要调参。
 

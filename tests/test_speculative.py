@@ -252,6 +252,7 @@ def test_speculation_observer_records_the_actual_tree_shape() -> None:
         SpeculativeDecodeObservation(
             num_proposed_nodes=3,
             num_accepted_nodes=2,
+            num_verified_tokens=3,
             num_draft_roots=1,
             num_branching_parents=1,
             max_draft_depth=2,
@@ -304,3 +305,16 @@ def test_speculation_observer_failure_is_disabled_without_changing_output() -> N
     assert first.requests[0].output_token_ids == (6, 7)
     assert second.requests[0].output_token_ids == (6, 7)
     assert observer.calls == 1
+
+
+def test_speculation_observation_counts_the_final_target_token() -> None:
+    with pytest.raises(ValueError, match="one target token"):
+        SpeculativeDecodeObservation(
+            num_proposed_nodes=1,
+            num_accepted_nodes=1,
+            num_verified_tokens=1,
+            num_draft_roots=1,
+            num_branching_parents=0,
+            max_draft_depth=1,
+            num_compacted_tokens=0,
+        )

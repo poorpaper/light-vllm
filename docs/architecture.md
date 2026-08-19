@@ -330,7 +330,8 @@ Scheduler 分开公开两种 token 事实：`pending_tokens` 是当前已知但�
 block token slot 计算；completion claim、短请求首 token lane、self-resubmit 次数与回滚的已计算进度单独公开；
 可淘汰 prefix page 视为可用，无固定上限的连续缓存不输出伪容量。
 
-投机树的 proposed/accepted、root、branching parent、max depth 与 compact 搬运量经独立 `SpeculationObserver`
+投机树的 proposed/accepted、verified tokens、root、branching parent、max depth 与 compact 搬运量经独立
+`SpeculationObserver`
 进入同一快照；旁路首次失败后停用，不影响输出。Prometheus renderer 只依赖 `PerformanceMetricsReader`，
 生成 HTTP 路由仍只依赖 `EngineClient`。Grafana 看板和
 HPA 位于仓库外控制面：前者查询 histogram/计数，后者经 Prometheus Adapter 读取每 Pod 的

@@ -244,7 +244,9 @@ curl http://127.0.0.1:8000/metrics
 
 它包含 TTFT、可见 token 间隔、真实完成的 step 延迟、waiting/running 请求、短请求首 token lane、两种 token
 backlog、KV cache 使用率/claim、self-resubmit 回滚进度、准入拒绝和 token 吞吐，也包含投机尝试、命中节点、
-草稿根/分支、最大深度和 KV 搬运计数。`pending_tokens` 只统计当前
+验证产出 token、草稿根/分支、最大深度和 KV 搬运计数。平均验证产出长度可用
+`rate(light_vllm_speculative_verified_tokens_total[5m]) / rate(light_vllm_speculation_attempts_total[5m])`
+计算。`pending_tokens` 只统计当前
 已知输入；`max_remaining_tokens` 还包含最大输出预算，适合保守扩缩容，二者不会混用。
 指标来自同一套 Engine/Scheduler/KV 事实，与 `qwen2`、`qwen2.5` 或具体模型尺寸无关；`reference`
 runtime 没有 Scheduler 和固定 KV 容量，因此不伪造这些指标。

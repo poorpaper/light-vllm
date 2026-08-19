@@ -354,6 +354,7 @@ def test_engine_runtime_composes_ngram_trie_speculation() -> None:
     assert response.status_code == 200
     assert len(response.json()["generated_token_ids"]) == 2
     assert "light_vllm_speculation_attempts_total" in metrics.text
+    assert "light_vllm_speculative_verified_tokens_total" in metrics.text
 
 
 def test_engine_runtime_rejects_an_unknown_speculative_proposer() -> None:

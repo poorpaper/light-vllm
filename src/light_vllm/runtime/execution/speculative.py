@@ -358,6 +358,7 @@ class SpeculativeDecodeHandler:
                     SpeculativeDecodeObservation(
                         num_proposed_nodes=len(draft),
                         num_accepted_nodes=len(accepted.accepted_draft_indices),
+                        num_verified_tokens=len(accepted.output_token_ids),
                         num_draft_roots=roots,
                         num_branching_parents=branching_parents,
                         max_draft_depth=max_depth,

@@ -113,10 +113,12 @@ class AcceptanceSampler(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class SpeculativeDecodeObservation:
-    """一次成功树验证产生的候选、命中和 KV 搬运事实。"""
+    """一次成功树验证产生的候选、验证产出和 KV 搬运事实。"""
 
     num_proposed_nodes: int
     num_accepted_nodes: int
+    # 包含命中的草稿节点和 target model 最终补出的一个 token。
+    num_verified_tokens: int
     num_draft_roots: int
     num_branching_parents: int
     max_draft_depth: int
@@ -126,6 +128,7 @@ class SpeculativeDecodeObservation:
         values = (
             self.num_proposed_nodes,
             self.num_accepted_nodes,
+            self.num_verified_tokens,
             self.num_draft_roots,
             self.num_branching_parents,
             self.max_draft_depth,
@@ -135,6 +138,8 @@ class SpeculativeDecodeObservation:
             raise ValueError("speculative decode counters must be non-negative integers")
         if self.num_accepted_nodes > self.num_proposed_nodes:
             raise ValueError("accepted nodes must not exceed proposed nodes")
+        if self.num_verified_tokens != self.num_accepted_nodes + 1:
+            raise ValueError("verified tokens must contain accepted nodes plus one target token")
         if self.num_draft_roots > self.num_proposed_nodes:
             raise ValueError("draft roots must not exceed proposed nodes")
         if self.num_branching_parents > self.num_proposed_nodes:
