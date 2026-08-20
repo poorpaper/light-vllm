@@ -58,6 +58,7 @@ if triton is not None:
         stride_output_dim,
         max_sequence_length,
         scale,
+        LINEAR_QUERY_LAYOUTS: tl.constexpr,
         QUERY_WIDTH: tl.constexpr,
         PAGE_SIZE: tl.constexpr,
         GROUP_SIZE: tl.constexpr,
@@ -100,17 +101,20 @@ if triton is not None:
             positions = block_start + token_offsets
             key_query_offsets = positions - computed
             query_key_mask = (key_query_offsets >= 0) & (key_query_offsets < query_length)
-            safe_key_query_offsets = tl.maximum(key_query_offsets, 0)
-            visibility_offsets = (
-                batch_index * stride_visibility_batch
-                + query_offset * stride_visibility_query
-                + safe_key_query_offsets * stride_visibility_key
-            )
-            query_key_visible = tl.load(
-                query_visibility_ptr + visibility_offsets,
-                mask=active_query & query_key_mask,
-                other=0,
-            ).to(tl.int1)
+            if LINEAR_QUERY_LAYOUTS:
+                query_key_visible = query_key_mask & (key_query_offsets <= query_offset)
+            else:
+                safe_key_query_offsets = tl.maximum(key_query_offsets, 0)
+                visibility_offsets = (
+                    batch_index * stride_visibility_batch
+                    + query_offset * stride_visibility_query
+                    + safe_key_query_offsets * stride_visibility_key
+                )
+                query_key_visible = tl.load(
+                    query_visibility_ptr + visibility_offsets,
+                    mask=active_query & query_key_mask,
+                    other=0,
+                ).to(tl.int1)
             # committed prefix 全部可见；本轮 query 只读取父链上的祖先和自身。
             token_mask = active_query & ((positions < computed) | query_key_visible)
             logical_blocks = positions // PAGE_SIZE
@@ -183,6 +187,7 @@ class TritonPagedAttention:
         self._write_mapping: PagedKVWriteMapping | None = None
         self._query_visibility: Tensor | None = None
         self._query_width: int | None = None
+        self._linear_query_layouts = metadata.has_only_linear_queries
 
         config = cache.config
         if config.device.type != "cuda":
@@ -260,18 +265,24 @@ class TritonPagedAttention:
                 query_width=query_width,
                 device=config.device,
             )
-            self._query_visibility = self._metadata.visibility_tensor(
-                query_width=query_width,
-                device=config.device,
-            )
+            if not self._linear_query_layouts:
+                self._query_visibility = self._metadata.visibility_tensor(
+                    query_width=query_width,
+                    device=config.device,
+                )
             # validate_block_tables() in the constructor already proves that
             # generated writable slots are in range and do not alias.
             self._write_mapping = self._cache.prepare_write(
                 self._slot_mapping,
                 validate=False,
             )
-        assert self._query_visibility is not None
         assert self._write_mapping is not None
+
+        query_visibility = self._query_visibility
+        if query_visibility is None:
+            # The linear kernel specializes away every visibility load. A
+            # three-dimensional view only supplies the otherwise unused pointer/strides.
+            query_visibility = query[..., 0]
 
         # KV 写入和 attention 分成两个顺序步骤；同一 CUDA stream 保证读取前写入完成。
         layer = self._cache.layer(layer_id)
@@ -291,16 +302,17 @@ class TritonPagedAttention:
             self._block_tables,
             self._num_computed_tokens,
             self._query_lengths,
-            self._query_visibility,
+            query_visibility,
             output,
             *query.stride(),
             *layer.keys.stride(),
             *layer.values.stride(),
             self._block_tables.stride(0),
-            *self._query_visibility.stride(),
+            *query_visibility.stride(),
             *output.stride(),
             self._max_sequence_length,
             scale,
+            LINEAR_QUERY_LAYOUTS=self._linear_query_layouts,
             QUERY_WIDTH=query_width,
             PAGE_SIZE=config.block_size,
             GROUP_SIZE=layer_spec.num_query_heads // layer_spec.num_kv_heads,

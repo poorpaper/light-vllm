@@ -74,6 +74,18 @@ class PagedAttentionMetadata:
     def query_lengths(self) -> tuple[int, ...]:
         return tuple(len(layout) for layout in self.query_layouts)
 
+    @property
+    def has_only_linear_queries(self) -> bool:
+        """Whether every query layout is the ordinary causal chain."""
+
+        return all(
+            all(
+                parent == (-1 if index == 0 else index - 1)
+                for index, parent in enumerate(layout.parent_indices)
+            )
+            for layout in self.query_layouts
+        )
+
     def slot_mapping(
         self,
         *,

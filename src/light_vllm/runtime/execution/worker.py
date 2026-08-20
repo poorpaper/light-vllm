@@ -57,9 +57,16 @@ def _forward(model: ModelSession, batch: ForwardBatch) -> ModelOutput:
         raise ExecutionNotReadyError("load a model before executing") from exc
     if not isinstance(output, ModelOutput):
         raise ExecutionError("model forwarder must return ModelOutput")
-    if output.logits.ndim != 3 or output.logits.shape[:2] != batch.input_ids.shape:
-        raise ExecutionError("model logits must have shape [batch, sequence, vocabulary]")
+    expected_shape = (batch.input_ids.shape[0], batch.logits_width)
+    if output.logits.ndim != 3 or output.logits.shape[:2] != expected_shape:
+        raise ExecutionError("model logits must cover the requested query rows")
     return output
+
+
+def _requested_logit_indices(request: ModelStepRequest) -> tuple[int, ...]:
+    if request.logit_query_indices is None:
+        return tuple(range(len(request.query_token_ids)))
+    return request.logit_query_indices
 
 
 class ContiguousStepHandler:
@@ -131,6 +138,9 @@ class ContiguousStepHandler:
                         input_ids=input_ids,
                         positions=positions,
                         attention=attention,
+                        logit_query_indices=(request.logit_query_indices,)
+                        if request.logit_query_indices is not None
+                        else None,
                     ),
                 )
                 # AttentionContext 先暂存各层 K/V；整个 forward 成功后再统一追加。
@@ -215,6 +225,7 @@ class PagedStepHandler:
         input_rows: list[tuple[int, ...]] = []
         position_rows: list[tuple[int, ...]] = []
         query_lengths: list[int] = []
+        logit_query_indices = tuple(_requested_logit_indices(request) for request in batch.requests)
         for request in batch.requests:
             query_length = len(request.query_token_ids)
             query_lengths.append(query_length)
@@ -249,13 +260,14 @@ class PagedStepHandler:
                 positions=positions,
                 sequence_lengths=tuple(query_lengths),
                 attention=attention,
+                logit_query_indices=logit_query_indices,
             ),
         )
         expected_layers = frozenset(layer.layer_id for layer in self._cache.model_spec.layers)
         if attention.layer_ids != expected_layers:
             raise ExecutionError("model did not execute every configured paged attention layer")
         return tuple(
-            output.logits[row, :query_length] for row, query_length in enumerate(query_lengths)
+            output.logits[row, : len(indices)] for row, indices in enumerate(logit_query_indices)
         )
 
     def compact(
@@ -304,9 +316,20 @@ class StandardDecodeHandler:
         # 即使本轮不采样，也必须完成已调度输入的模型计算和 KV 写入。
         if len(logits_by_request) != len(batch.requests):
             raise ExecutionError("model step must return one logits tensor per request")
-        for request, logits in zip(batch.requests, logits_by_request, strict=True):
-            if logits.ndim != 2 or logits.shape[0] != len(request.input_token_ids):
-                raise ExecutionError("model step logits must have shape [query, vocabulary]")
+        for request, model_request, logits in zip(
+            batch.requests,
+            model_step.requests,
+            logits_by_request,
+            strict=True,
+        ):
+            expected_logits = 1 if request.max_output_tokens else 0
+            if (
+                model_request.logit_query_indices is None
+                or len(model_request.logit_query_indices) != expected_logits
+            ):
+                raise ExecutionError("standard decode requested the wrong logits rows")
+            if logits.ndim != 2 or logits.shape[0] != expected_logits:
+                raise ExecutionError("model step returned the wrong logits rows")
 
         sampling_rows = [
             row for row, request in enumerate(batch.requests) if request.max_output_tokens

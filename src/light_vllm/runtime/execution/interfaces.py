@@ -256,6 +256,9 @@ class ModelStepRequest:
     query_layout: QueryLayout
     block_ids: tuple[int, ...] | None
     num_readonly_prefix_blocks: int = 0
+    # None requests logits for every query. Decode handlers set the exact rows
+    # needed for sampling so prefill-only work can skip the vocabulary head.
+    logit_query_indices: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         query_token_ids = tuple(self.query_token_ids)
@@ -275,7 +278,16 @@ class ModelStepRequest:
             raise ValueError("query layout must contain one parent per query token")
         if type(self.num_readonly_prefix_blocks) is not int or self.num_readonly_prefix_blocks < 0:
             raise ValueError("num_readonly_prefix_blocks must be a non-negative integer")
+        logit_query_indices = self.logit_query_indices
+        if logit_query_indices is not None:
+            logit_query_indices = tuple(logit_query_indices)
+            if any(
+                type(index) is not int or not 0 <= index < len(query_token_ids)
+                for index in logit_query_indices
+            ):
+                raise ValueError("logit query indices must select valid query positions")
         object.__setattr__(self, "query_token_ids", query_token_ids)
+        object.__setattr__(self, "logit_query_indices", logit_query_indices)
         if self.block_ids is None and self.num_readonly_prefix_blocks:
             raise ValueError("readonly prefix blocks require a block table")
         if self.block_ids is not None:

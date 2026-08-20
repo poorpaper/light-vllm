@@ -345,6 +345,16 @@ class SpeculativeDecodeHandler:
                     ),
                     block_ids=request.block_ids,
                     num_readonly_prefix_blocks=request.num_readonly_prefix_blocks,
+                    logit_query_indices=(
+                        tuple(
+                            range(
+                                len(request.input_token_ids) - 1,
+                                len(request.input_token_ids) + len(draft),
+                            )
+                        )
+                        if request.max_output_tokens
+                        else ()
+                    ),
                 )
             )
 
@@ -362,8 +372,11 @@ class SpeculativeDecodeHandler:
             logits_by_request,
             strict=True,
         ):
-            if logits.ndim != 2 or logits.shape[0] != len(model_request.query_token_ids):
-                raise ExecutionError("model step logits must have shape [query, vocabulary]")
+            logit_query_indices = model_request.logit_query_indices
+            if logit_query_indices is None:
+                raise ExecutionError("speculative decode must select target logits rows")
+            if logits.ndim != 2 or logits.shape[0] != len(logit_query_indices):
+                raise ExecutionError("model step returned the wrong target logits rows")
             if not request.max_output_tokens:
                 results.append(
                     RequestOutput(
@@ -374,9 +387,7 @@ class SpeculativeDecodeHandler:
                 continue
 
             # 正式输入最后一行预测草稿根；每个草稿节点行预测自己的子节点。
-            first_target_row = len(request.input_token_ids) - 1
-            target_logits = logits[first_target_row : first_target_row + len(draft) + 1]
-            target_token_ids = self._target_sampler.sample(target_logits)
+            target_token_ids = self._target_sampler.sample(logits)
             if len(target_token_ids) != len(draft) + 1:
                 raise ExecutionError("target sampler returned the wrong number of tokens")
             accepted = self._acceptance_sampler.accept(draft, target_token_ids)

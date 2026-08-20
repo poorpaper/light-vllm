@@ -39,6 +39,9 @@ class ForwardBatch:
     positions: Tensor | None = None
     sequence_lengths: tuple[int, ...] | None = None
     attention: AttentionContext | None = None
+    # None requests logits for every query position. Otherwise each row lists
+    # only the query positions whose logits the caller will consume.
+    logit_query_indices: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         if self.input_ids.ndim != 2:
@@ -56,7 +59,12 @@ class ForwardBatch:
             raise ValueError("positions must have the same shape as input_ids")
         if positions.dtype != torch.long or positions.device != self.input_ids.device:
             raise ValueError("positions must use torch.long on the input_ids device")
-        if bool(torch.any(positions < 0)):
+        positions_non_negative = torch.all(positions >= 0)
+        if positions.device.type == "cuda":
+            # Keep the contract check on the current stream without forcing a
+            # device-to-host synchronization before model kernels are queued.
+            torch._assert_async(positions_non_negative, "positions must not be negative")
+        elif not bool(positions_non_negative):
             raise ValueError("positions must not be negative")
 
         lengths = self.sequence_lengths
@@ -69,13 +77,53 @@ class ForwardBatch:
             type(length) is not int or length <= 0 or length > sequence_width for length in lengths
         ):
             raise ValueError("sequence lengths must be within the padded sequence width")
+        logit_query_indices = self.logit_query_indices
+        if logit_query_indices is not None:
+            logit_query_indices = tuple(tuple(row) for row in logit_query_indices)
+            if len(logit_query_indices) != batch_size:
+                raise ValueError("logit query indices must contain one row per batch item")
+            for row, length in zip(logit_query_indices, lengths, strict=True):
+                if any(type(index) is not int or not 0 <= index < length for index in row):
+                    raise ValueError("logit query indices must select valid query positions")
         object.__setattr__(self, "positions", positions)
         object.__setattr__(self, "sequence_lengths", lengths)
+        object.__setattr__(self, "logit_query_indices", logit_query_indices)
+
+    @property
+    def logits_width(self) -> int:
+        if self.logit_query_indices is None:
+            return self.input_ids.shape[1]
+        return max((len(row) for row in self.logit_query_indices), default=0)
+
+
+def select_query_states(hidden_states: Tensor, batch: ForwardBatch) -> Tensor:
+    """Gather only hidden-state rows whose logits the caller requested."""
+
+    indices = batch.logit_query_indices
+    if indices is None:
+        return hidden_states
+    width = batch.logits_width
+    if width == 0:
+        return hidden_states[:, :0]
+    first_row = indices[0]
+    if (
+        first_row
+        and all(row == first_row for row in indices)
+        and first_row == tuple(range(first_row[0], first_row[0] + width))
+    ):
+        return hidden_states[:, first_row[0] : first_row[0] + width]
+    padded = tuple(row + (0,) * (width - len(row)) for row in indices)
+    gather_indices = torch.tensor(padded, dtype=torch.long, device=hidden_states.device)
+    return torch.gather(
+        hidden_states,
+        1,
+        gather_indices.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1]),
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class ModelOutput:
-    """模型一次计算得到的 logits。"""
+    """模型一次计算得到的 requested-query logits。"""
 
     logits: Tensor
 

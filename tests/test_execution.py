@@ -9,6 +9,7 @@ from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
     ModelNotLoadedError,
     ModelOutput,
+    select_query_states,
 )
 from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionCausalLM,
@@ -86,7 +87,7 @@ class IncrementingForwarder:
                 keys,
                 scale=1.0,
             )
-        return ModelOutput(logits=logits)
+        return ModelOutput(logits=select_query_states(logits, batch))
 
 
 class UnloadedForwarder:
@@ -657,7 +658,7 @@ def test_contiguous_step_can_resume_after_a_speculative_suffix_is_rejected() -> 
     )
     logits = step.forward(model, ModelStepBatch((second,)))
 
-    assert logits[0].shape == (1, model.vocab_size)
+    assert logits[0].shape == (0, model.vocab_size)
 
 
 @pytest.mark.parametrize(

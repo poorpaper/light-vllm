@@ -280,11 +280,7 @@ class EngineCore:
                 try:
                     # Executor 不读取请求 ContextVar，直接提交线程池，省掉
                     # asyncio.to_thread 每轮复制上下文和包装 callable 的成本。
-                    raw_output = await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        self._executor.execute,
-                        batch,
-                    )
+                    raw_output = await self._execute_batch(batch)
                     # 结果完整通过检查前，不更新请求进度，也不提交 KV cache。
                     output = _validated_output(batch, raw_output)
                     if raw_output.step_elapsed_seconds is not None:
@@ -323,6 +319,15 @@ class EngineCore:
                     self._driver_task = None
                     if self._scheduler.has_requests and not self._closed:
                         self._start_driver_locked()
+
+    async def _execute_batch(self, batch: ExecutionBatch) -> ExecutionOutput:
+        """在线程池执行同步 Executor，并把等待边界留给 Engine。"""
+
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            self._executor.execute,
+            batch,
+        )
 
     def _build_execution_batch_locked(self, scheduled: SchedulerOutput) -> ExecutionBatch:
         requests: list[ExecutionRequest] = []

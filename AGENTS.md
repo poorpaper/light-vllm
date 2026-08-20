@@ -43,10 +43,14 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - 固定页数或 CUDA 空闲显存策略在模型加载后解析成同一个分页容量对象，同时供逻辑 manager 与物理页池使用。
 - 可缓存模型只通过 `AttentionContext` 执行 attention，不内置 dense/paged fallback。reference 与连续缓存使用
   `TorchDenseAttention`；分页缓存默认使用逐页读取 K/V 的 `TorchPagedAttention`，也可装配直接读取 block table、
-  融合 QK/在线 softmax/PV 的 `TritonPagedAttention`。
+  融合 QK/在线 softmax/PV 的 `TritonPagedAttention`。普通线性 query 直接使用因果位置关系，不物化树形
+  visibility tensor；只有非线性草稿树使用显式可见性矩阵。
 - `RequestOutput` 分开表达本轮输入计算量、零到多个确认输出，以及已经写入 KV 的输出前缀。
 - `ExecutionOutput` 额外报告实际进入模型 forward 的 token 数；未产出的投机 lookahead 只保留为调度预留，
   不进入 step 延迟样本。
+- Decode Handler 通过 `ModelStepRequest` 精确声明要消费 logits 的 query 行，Step Handler 把选择传入
+  `ForwardBatch`；普通生成只投影每个请求的最后有效行，纯 prefill 不执行 vocabulary head，投机验证只投影
+  正式输入最后一行和草稿节点行。
 - `ExecutionRequest` 的完整 `context_token_ids` 快照只为草稿 proposer 物化；普通执行只携带本轮
   `input_token_ids`，不得在每个 decode step 复制和校验完整历史。
 - `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
@@ -111,8 +115,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 4. 加载失败不得改变当前模型或 generation。
 5. `open_session()` 只在锁内复制模型引用和 generation；实际计算不持有生命周期锁。一个请求始终使用同一
    session，reload 后旧 session 继续引用旧模型。
-6. 所有模型接受 `ForwardBatch`，返回只包含 logits 的 `ModelOutput`；K/V 读写由 `AttentionContext` 和 Step Handler
-   完成，loader 负责 device、dtype 与 `eval()`。
+6. 所有模型接受 `ForwardBatch`，返回只包含其中明确请求 query 行 logits 的 `ModelOutput`；未指定行选择时返回
+   全部有效 query。K/V 读写由 `AttentionContext` 和 Step Handler 完成，loader 负责 device、dtype 与 `eval()`。
 7. `ReferenceGenerationService` 只依赖 `TokenExecutor`，不得依赖 runner、torch 或具体模型。
 8. transport 的生成路由只依赖 `EngineClient`；监控路由可以额外依赖独立只读指标端口。HTTP/RPC schema、
    Prometheus 格式和 wire format 均不得进入核心契约。

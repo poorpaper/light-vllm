@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
-from light_vllm.modeling.models.interfaces import ForwardBatch, ModelOutput
+from light_vllm.modeling.models.interfaces import ForwardBatch, ModelOutput, select_query_states
 from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionCausalLM,
     TinyAttentionConfig,
@@ -783,7 +783,7 @@ def test_engine_speculates_after_reusing_a_shared_prompt_prefix() -> None:
                 keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
                 assert batch.attention is not None
                 batch.attention.forward("attention", keys, keys, keys, scale=1.0)
-                return ModelOutput(logits=logits)
+                return ModelOutput(logits=select_query_states(logits, batch))
 
         forwarder = Forwarder()
 

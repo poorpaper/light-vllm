@@ -66,4 +66,7 @@ def linear_model_step_request(request: ExecutionRequest) -> ModelStepRequest:
         query_layout=linear_query_layout(len(request.input_token_ids)),
         block_ids=request.block_ids,
         num_readonly_prefix_blocks=request.num_readonly_prefix_blocks,
+        logit_query_indices=(len(request.input_token_ids) - 1,)
+        if request.max_output_tokens
+        else (),
     )

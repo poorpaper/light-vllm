@@ -115,7 +115,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `SchedulerOutput` | 本轮每请求 computed、scheduled、lookahead、输出预算和可选 block table |
 | `ExecutionBatch` | Engine 从请求状态切出的本轮真实 token；只有草稿 proposer 需要时才附带完整 token history 快照 |
 | `DraftTree` / `QueryLayout` | 有界候选父链，以及一次 model step 的 query 依赖事实 |
-| `ModelStepRequest` / `ModelStepBatch` | Decode Handler 已确定的 query、reservation、布局和 block table |
+| `ModelStepRequest` / `ModelStepBatch` | Decode Handler 已确定的 query、reservation、布局、block table 和待消费 logits 行 |
 | `ExecutionOutput` | 每轮请求结果、实际进入模型 forward 的 token 数和可选设备耗时 |
 | `RequestOutput` | 每请求完成的输入计算量、零到多个确认输出与已缓存输出前缀 |
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
@@ -123,7 +123,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回每请求有效 logits |
 | `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
 | `Sampler` | 从二维 `[batch, vocabulary]` logits 选择 token |
-| `ForwardBatch` / `ModelOutput` | token、绝对 position、attention 上下文与 logits 的统一模型边界 |
+| `ForwardBatch` / `ModelOutput` | token、绝对 position、attention 上下文、待投影 query 行与对应 logits 的统一模型边界 |
 | `ModelKVCacheSpec` | 模型声明的逐 attention 层 K/V 形状 |
 | `AttentionContext` | 模型调用连续或分页 attention 后端的稳定边界 |
 | `EngineCapabilities` | 初始化后可发现的模型、KV、并发和单轮容量事实 |
@@ -136,7 +136,10 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `PerformanceMetricsReader` | Prometheus、日志等控制面读取不可变性能快照的端口 |
 
 `SchedulerOutput` 和 `RequestOutput` 是扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
-并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和投机验证因此共用同一循环。
+并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和投机验证因此共用同一循环。Decode Handler 还精确
+声明本轮会消费哪些 query 行的 logits：普通生成只选择每个请求最后一个有效输入，纯 prefill 选择空集，投机验证
+选择正式输入最后一行和全部草稿节点。模型在 vocabulary head 前收窄 hidden states，避免先对 padded query 全宽
+投影再由 Worker 丢弃。
 
 原生 Qwen family 模型也使用这组契约：`qwen2` 与 `qwen2.5` 注册名指向同一个 factory，官方 Qwen2.5
 checkpoint 仍声明 `model_type: qwen2`，3B 等模型尺寸只来自 `config.json`，不会进入 runner 的分发逻辑。
@@ -234,6 +237,8 @@ query 与显式 lookahead reservation，不携带未预留尾页。可选 prefix
 query 与未填满尾页始终独占。命中时至少留一个 token 重新计算 logits；prompt 恰好整页时会重算最后一整页。
 
 Triton backend 在 context 创建时把 block table、已计算长度和 query 长度一次转成 GPU tensor，供所有模型层复用。
+普通线性 query 的可见性由 `key_query_offset <= query_offset` 直接表达，不再构造或上传 `[B, W, W]` 布尔矩阵；
+非线性草稿树仍使用 `QueryLayout` 推导的显式 visibility tensor。
 本轮 K/V 先写入物理页，再在同一 CUDA stream 启动 fused attention；两步不放进同一个 grid，避免 prefill 的某个
 query program 读取到另一个 program 尚未写完的 K/V。首版一个 program 负责一个 query token 的一个 query head，
 直接按逻辑位置查页表，并用 FP32 累计在线 softmax。这个结构便于检查，长上下文的分段并行与归并留给后续优化。

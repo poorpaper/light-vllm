@@ -46,6 +46,40 @@ def test_forward_batch_validates_explicit_positions() -> None:
     torch.testing.assert_close(batch.positions, torch.tensor([[4, 5]]))
 
 
+def test_model_projects_only_requested_query_rows() -> None:
+    runner = create_runner()
+    runner.load(tiny_spec())
+    session = runner.open_session()
+    input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    full = session.forward(ForwardBatch(input_ids=input_ids)).logits
+
+    selected = session.forward(
+        ForwardBatch(
+            input_ids=input_ids,
+            logit_query_indices=((2,), (1,)),
+        )
+    ).logits
+    skipped = session.forward(
+        ForwardBatch(
+            input_ids=input_ids,
+            logit_query_indices=((), ()),
+        )
+    ).logits
+
+    assert selected.shape == (2, 1, 32)
+    torch.testing.assert_close(selected[0, 0], full[0, 2])
+    torch.testing.assert_close(selected[1, 0], full[1, 1])
+    assert skipped.shape == (2, 0, 32)
+
+
+def test_forward_batch_rejects_invalid_logit_query_indices() -> None:
+    with pytest.raises(ValueError, match="valid query positions"):
+        ForwardBatch(
+            input_ids=torch.tensor([[1, 2]]),
+            logit_query_indices=((2,),),
+        )
+
+
 def test_attention_model_exposes_its_kv_cache_shape_without_runner_dispatch() -> None:
     runner = create_runner()
     runner.load(

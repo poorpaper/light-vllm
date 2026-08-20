@@ -165,10 +165,15 @@ class _TargetStep:
     def forward(self, model, batch: ModelStepBatch) -> tuple[torch.Tensor, ...]:
         self.verification_batch = batch
         request = batch.requests[0]
-        logits = torch.zeros((len(request.query_token_ids), 16))
-        first_target_row = self._original_input_length - 1
+        assert request.logit_query_indices == tuple(
+            range(
+                self._original_input_length - 1,
+                self._original_input_length - 1 + len(self._target_token_ids),
+            )
+        )
+        logits = torch.zeros((len(self._target_token_ids), 16))
         for offset, token_id in enumerate(self._target_token_ids):
-            logits[first_target_row + offset, token_id] = 1
+            logits[offset, token_id] = 1
         return (logits,)
 
     def compact(self, request, retained_query_indices: tuple[int, ...]) -> int:

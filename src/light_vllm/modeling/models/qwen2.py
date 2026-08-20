@@ -23,6 +23,7 @@ from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
     ModelOutput,
     ModelSpec,
+    select_query_states,
 )
 
 
@@ -482,7 +483,13 @@ class Qwen2ForCausalLM(nn.Module):
 
         positions = batch.positions
         assert positions is not None
-        if bool(torch.any(positions >= self.config.max_position_embeddings)):
+        positions_in_range = torch.all(positions < self.config.max_position_embeddings)
+        if positions.device.type == "cuda":
+            torch._assert_async(
+                positions_in_range,
+                "Qwen2 position exceeds max_position_embeddings",
+            )
+        elif not bool(positions_in_range):
             raise ValueError("Qwen2 position exceeds max_position_embeddings")
         hidden_states = self.model.embed_tokens(batch.input_ids)
         cosines, sines = self._rotary_embeddings(positions, hidden_states.dtype)
@@ -502,6 +509,7 @@ class Qwen2ForCausalLM(nn.Module):
             self.model.norm.weight,
             self.model.norm.eps,
         )
+        hidden_states = select_query_states(hidden_states, batch)
         logits = self.lm_head(hidden_states)
         return ModelOutput(logits=logits)
 

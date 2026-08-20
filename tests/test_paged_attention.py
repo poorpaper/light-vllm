@@ -130,6 +130,22 @@ def test_slot_mapping_uses_non_contiguous_physical_blocks() -> None:
     assert mapping.tolist() == [[4, 5, 0], [3, 6, -1]]
 
 
+def test_paged_metadata_identifies_linear_and_tree_query_layouts() -> None:
+    linear = PagedAttentionMetadata(
+        block_tables=((0, 1),),
+        num_computed_tokens=(0,),
+        query_layouts=_layouts(3),
+    )
+    tree = PagedAttentionMetadata(
+        block_tables=((0, 1),),
+        num_computed_tokens=(0,),
+        query_layouts=(QueryLayout((-1, 0, 0)),),
+    )
+
+    assert linear.has_only_linear_queries
+    assert not tree.has_only_linear_queries
+
+
 def test_paged_cache_compacts_a_non_contiguous_path_across_blocks() -> None:
     cache = _cache()
     prefix_keys = torch.arange(16, dtype=torch.float32).reshape(1, 2, 2, 4)
