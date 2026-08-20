@@ -51,6 +51,7 @@ class RecordingExecutor:
     capabilities = ExecutionCapabilities(
         max_model_tokens=None,
         max_kv_cache_tokens=32,
+        kv_cache_epoch=0,
     )
 
     def __init__(
@@ -60,6 +61,7 @@ class RecordingExecutor:
         block_first_step: bool = False,
     ) -> None:
         self.history: list[tuple[tuple[int, ...], ...]] = []
+        self.context_history: list[tuple[tuple[int, ...] | None, ...]] = []
         self.active: set[str] = set()
         self.multiple_tokens = multiple_tokens
         self.block_first_step = block_first_step
@@ -84,6 +86,7 @@ class RecordingExecutor:
     def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
         step = len(self.history)
         self.history.append(tuple(request.input_token_ids for request in batch.requests))
+        self.context_history.append(tuple(request.context_token_ids for request in batch.requests))
         if step == 0:
             self.first_step_started.set()
             if self.block_first_step:
@@ -304,7 +307,10 @@ def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
 def test_engine_self_resubmit_preserves_visible_history_and_releases_kv() -> None:
     async def run() -> None:
         executor = RecordingExecutor(block_first_step=True)
-        kv_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1))
+        kv_cache = PagedKVCacheManager(
+            FixedKVBlockCapacity(num_blocks=4, block_size=1),
+            enable_prefix_caching=True,
+        )
         scheduler = TokenBudgetScheduler(
             kv_cache,
             max_num_sequences=2,
@@ -312,6 +318,7 @@ def test_engine_self_resubmit_preserves_visible_history_and_releases_kv() -> Non
             self_resubmit_policy=SelfResubmitPolicy(
                 max_resubmits=1,
                 strict_fallback_rolled_back_tokens=100,
+                kv_admission_watermark=1.0,
             ),
         )
         engine = EngineCore(executor, scheduler)
@@ -374,6 +381,21 @@ def test_engine_accepts_multiple_committed_tokens_from_one_execution() -> None:
         assert result.generated_token_ids == (2, 3, 4)
         assert result.finish_reason == "length"
         assert executor.history == [((1,),), ((3,),)]
+        assert executor.context_history == [((1,),), (None,)]
+
+    asyncio.run(run())
+
+
+def test_engine_omits_complete_context_without_speculative_lookahead() -> None:
+    async def run() -> None:
+        executor = RecordingExecutor()
+        engine = _engine(executor, token_budget=8)
+
+        result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
+        await engine.close()
+
+        assert result.generated_token_ids == (2, 3, 4)
+        assert executor.context_history == [(None,), (None,), (None,)]
 
     asyncio.run(run())
 

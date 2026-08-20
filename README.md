@@ -56,7 +56,7 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `StandardDecodeHandler`：处理普通 prefill 和单 token decode。
 - `SpeculativeDecodeHandler`：把 chain/trie 草稿树交给同一个目标模型并行验证，验收后压实命中路径 KV，不新增 Worker。
 - `PerformanceObserver`：在统一 Engine 边界记录 TTFT、可见 token 间隔、step 延迟、队列与 KV 使用率。
-- `PredictiveTTFTAdmission`：用真实 step 延迟滑窗预测排队 TTFT，并在超过全局 SLO 时早拒。
+- `PredictiveTTFTAdmission`：依次用队列、KV 水位和真实 step 延迟预测做动态早拒，支持请求级 TTFT SLO。
 - `GreedySampler`：独立于 Executor 的贪心采样策略。
 - FastAPI adapter：生成路由只依赖 `EngineClient`，`/metrics` 只依赖独立的性能快照读取端口。
 
@@ -133,7 +133,7 @@ light-vllm-serve \
   --runtime engine \
   --kv-reservation blocks \
   --max-num-sequences 8 \
-  --max-num-scheduled-tokens 256 \
+  --max-num-scheduled-tokens 2048 \
   --model-args '{"vocab_size": 128, "hidden_size": 32, "num_heads": 4}'
 ```
 
@@ -201,7 +201,9 @@ light-vllm-serve \
   --short-request-reserved-kv-token-slots 63 \
   --short-request-reserved-sequences 1 \
   --regular-request-aging-steps 8 \
-  --max-tolerable-ttft-seconds 1.5
+  --max-tolerable-ttft-seconds 1.5 \
+  --max-pending-requests 128 \
+  --ttft-kv-cache-watermark 0.9
 ```
 
 短请求按 prefix 命中后的有效 prompt 和最大总长度分类；scheduled token、KV slot 和 sequence 都有独立预留。
@@ -209,12 +211,19 @@ light-vllm-serve \
 TTFT 预测使用 `新 prompt + waiting pending + running pending` 的全局当前工作量：prefill 贡献尚未计算的 prompt，
 普通 decode 通常贡献当前待算的 1 个 token，所有请求再统一求和；未来 `max_new_tokens` 不会提前展开。延迟表按
 每个 step 实际进入模型 forward 的 token 数更新，默认取 p90 并构造单调包络，可用
-`--ttft-prediction-quantile` 调整；样本不足时放行。确定性容量不足返回 422，预测超过 SLO 返回可重试的 429。
+`--ttft-prediction-quantile` 调整；默认积累 100 个 step 后才启用预测。队列上限和 KV 水位不依赖预测器冷启动，
+会始终生效。请求也可以用 JSON 字段 `max_tolerable_ttft_seconds` 覆盖全局 SLO。确定性容量不足返回 422，
+当前负载不满足准入条件返回可重试的 429。
+压测 Scheduler 本身时可把 `--max-pending-requests` 或 `--ttft-kv-cache-watermark` 设为 `off`，避免把早拒收益
+误算成调度收益；生产默认仍分别是 128 和 0.9。
 
-实验性 `--enable-self-resubmit` 会允许常规请求 best-effort 使用 KV；撞墙者只释放自己的 KV 并从 PREFILL 重算，
-不会回滚第三方，也不会重复输出已经可见的 token。它默认关闭且仅支持 `blocks`。可用
+实验性 `--enable-self-resubmit` 改用乐观准入：每个常规请求先领取覆盖 `prompt + 1 block` 的小额 claim，
+新请求合计最多使用全局 90% KV，余下 10% 留给已经运行的 decode 增长。decode 需要新页但空间不足时，
+撞墙者只释放自己的 KV 并重新排队，不回滚第三方，也不重复输出已经可见的 token。该模式会强制开启 prefix cache，
+因此重算可以找回已提交的完整 prompt 页；生成阶段的 KV 仍需重算。它默认关闭且仅支持 `blocks`。可用
 `--max-self-resubmits` 和 `--self-resubmit-strict-fallback-rolled-back-tokens` 控制何时恢复严格 completion claim，
-从而给活锁一个有界退出路径。
+从而给活锁一个有界退出路径。`--self-resubmit-initial-extra-blocks` 和
+`--self-resubmit-kv-admission-watermark` 可以调整上述两个乐观准入参数。
 
 当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
 

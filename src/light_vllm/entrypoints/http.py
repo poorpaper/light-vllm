@@ -140,7 +140,7 @@ def create_serving_app(
     kv_reservation: KVReservationMode = "blocks",
     paged_attention_backend: PagedAttentionBackendName = "torch",
     max_num_sequences: int = 8,
-    max_num_scheduled_tokens: int = 256,
+    max_num_scheduled_tokens: int = 2048,
     num_kv_blocks: int | None = None,
     kv_block_size: int = 16,
     kv_cache_memory_fraction: float = 0.8,
@@ -154,11 +154,15 @@ def create_serving_app(
     short_request_policy: ShortRequestPolicy | None = None,
     max_tolerable_ttft_seconds: float | None = None,
     ttft_prediction_window_size: int = 32,
-    ttft_prediction_min_observations: int = 3,
+    ttft_prediction_min_observations: int = 100,
     ttft_prediction_quantile: float = 0.9,
+    max_pending_requests: int | None = 128,
+    ttft_kv_cache_watermark: float | None = 0.9,
     enable_self_resubmit: bool = False,
     max_self_resubmits: int = 2,
     self_resubmit_strict_fallback_rolled_back_tokens: int = 4096,
+    self_resubmit_initial_extra_blocks: int = 1,
+    self_resubmit_kv_admission_watermark: float = 0.9,
 ) -> FastAPI:
     """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
 
@@ -214,7 +218,8 @@ def create_serving_app(
             # 同一容量对象同时交给逻辑分配和物理页池，避免两份配置漂移。
             logical_cache = PagedKVCacheManager(
                 cache_planner,
-                enable_prefix_caching=enable_prefix_caching,
+                # 乐观准入会回滚重算；强制缓存 prompt，避免每次都从位置 0 开始。
+                enable_prefix_caching=(enable_prefix_caching or enable_self_resubmit),
             )
             step_factory = partial(
                 PagedStepHandler,
@@ -287,21 +292,24 @@ def create_serving_app(
                     strict_fallback_rolled_back_tokens=(
                         self_resubmit_strict_fallback_rolled_back_tokens
                     ),
+                    initial_extra_blocks=self_resubmit_initial_extra_blocks,
+                    kv_admission_watermark=self_resubmit_kv_admission_watermark,
                 )
                 if enable_self_resubmit
                 else None
             ),
         )
-        ttft_admission = None
-        if max_tolerable_ttft_seconds is not None:
-            ttft_admission = PredictiveTTFTAdmission(
-                SlidingWindowStepLatencyPredictor(
-                    window_size=ttft_prediction_window_size,
-                    min_observations=ttft_prediction_min_observations,
-                    prediction_quantile=ttft_prediction_quantile,
-                ),
-                max_tolerable_ttft_seconds=max_tolerable_ttft_seconds,
-            )
+        # 控制器始终收集 step 样本；没有全局 SLO 时，请求仍可携带自己的 TTFT 上限。
+        ttft_admission = PredictiveTTFTAdmission(
+            SlidingWindowStepLatencyPredictor(
+                window_size=ttft_prediction_window_size,
+                min_observations=ttft_prediction_min_observations,
+                prediction_quantile=ttft_prediction_quantile,
+            ),
+            max_tolerable_ttft_seconds=max_tolerable_ttft_seconds,
+            max_pending_requests=max_pending_requests,
+            kv_cache_watermark=ttft_kv_cache_watermark,
+        )
         engine_core = EngineCore(
             model_executor,
             scheduler,
@@ -344,6 +352,30 @@ def _json_object(value: str) -> dict[str, object]:
         raise argparse.ArgumentTypeError("model args must be valid JSON") from exc
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("model args must be a JSON object")
+    return parsed
+
+
+def _optional_positive_int(value: str) -> int | None:
+    if value.lower() in {"none", "off"}:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a positive integer or 'off'") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer or 'off'")
+    return parsed
+
+
+def _optional_ratio(value: str) -> float | None:
+    if value.lower() in {"none", "off"}:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be within (0, 1] or 'off'") from exc
+    if not 0.0 < parsed <= 1.0:
+        raise argparse.ArgumentTypeError("value must be within (0, 1] or 'off'")
     return parsed
 
 
@@ -399,7 +431,7 @@ def _create_parser() -> argparse.ArgumentParser:
         help="use physical paged KV or a contiguous unbounded experiment baseline",
     )
     parser.add_argument("--max-num-sequences", type=int, default=8)
-    parser.add_argument("--max-num-scheduled-tokens", type=int, default=256)
+    parser.add_argument("--max-num-scheduled-tokens", type=int, default=2048)
     parser.add_argument(
         "--num-kv-blocks",
         type=int,
@@ -454,8 +486,10 @@ def _create_parser() -> argparse.ArgumentParser:
     ttft = parser.add_argument_group("TTFT prediction")
     ttft.add_argument("--max-tolerable-ttft-seconds", type=float)
     ttft.add_argument("--ttft-prediction-window-size", type=int, default=32)
-    ttft.add_argument("--ttft-prediction-min-observations", type=int, default=3)
+    ttft.add_argument("--ttft-prediction-min-observations", type=int, default=100)
     ttft.add_argument("--ttft-prediction-quantile", type=float, default=0.9)
+    ttft.add_argument("--max-pending-requests", type=_optional_positive_int, default=128)
+    ttft.add_argument("--ttft-kv-cache-watermark", type=_optional_ratio, default=0.9)
     resubmit = parser.add_argument_group("self-resubmit")
     resubmit.add_argument("--enable-self-resubmit", action="store_true")
     resubmit.add_argument("--max-self-resubmits", type=int, default=2)
@@ -463,6 +497,18 @@ def _create_parser() -> argparse.ArgumentParser:
         "--self-resubmit-strict-fallback-rolled-back-tokens",
         type=int,
         default=4096,
+    )
+    resubmit.add_argument(
+        "--self-resubmit-initial-extra-blocks",
+        type=int,
+        default=1,
+        help="extra KV blocks guaranteed with the prompt during optimistic admission",
+    )
+    resubmit.add_argument(
+        "--self-resubmit-kv-admission-watermark",
+        type=float,
+        default=0.9,
+        help="fraction of global KV capacity available to new optimistic admissions",
     )
     return parser
 
@@ -509,11 +555,15 @@ def main() -> None:
             ttft_prediction_window_size=args.ttft_prediction_window_size,
             ttft_prediction_min_observations=args.ttft_prediction_min_observations,
             ttft_prediction_quantile=args.ttft_prediction_quantile,
+            max_pending_requests=args.max_pending_requests,
+            ttft_kv_cache_watermark=args.ttft_kv_cache_watermark,
             enable_self_resubmit=args.enable_self_resubmit,
             max_self_resubmits=args.max_self_resubmits,
             self_resubmit_strict_fallback_rolled_back_tokens=(
                 args.self_resubmit_strict_fallback_rolled_back_tokens
             ),
+            self_resubmit_initial_extra_blocks=(args.self_resubmit_initial_extra_blocks),
+            self_resubmit_kv_admission_watermark=(args.self_resubmit_kv_admission_watermark),
         ),
         host=args.host,
         port=args.port,

@@ -256,6 +256,99 @@ def test_best_effort_can_fill_an_existing_block_below_its_watermark() -> None:
     assert second.block_ids == first.block_ids
 
 
+def test_optimistic_admission_claims_prompt_plus_one_block() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=10, block_size=2))
+    admitted = manager.try_add_request(
+        "optimistic",
+        token_ids=(1, 2, 3),
+        max_num_committed_tokens=9,
+        cache_epoch=1,
+        initial_extra_blocks=1,
+        guarantee_completion=False,
+    )
+    assert admitted is not None
+    # prompt=3，再加一个 2-token block，按页向上覆盖到 3 blocks。
+    assert manager.stats.claimed_token_slots == 6
+
+    manager.reserve("optimistic", 3)
+    manager.commit("optimistic", 3)
+    assert manager.stats.used_token_slots == 4
+    assert manager.stats.claimed_token_slots == 2
+    manager.reserve("optimistic", 2)
+    manager.commit("optimistic", 2)
+    assert manager.stats.used_token_slots == 6
+    assert manager.stats.claimed_token_slots == 0
+
+    # 初始 claim 用完后，运行中的请求仍可使用 admission 水位外的 decode 余量。
+    reservation = manager.reserve("optimistic", 2)
+    assert reservation.num_committed_tokens == 5
+
+
+def test_optimistic_initial_claims_return_after_partial_commit_and_free() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=6, block_size=2))
+    admitted = manager.try_add_request(
+        "optimistic",
+        token_ids=(1, 2, 3),
+        max_num_committed_tokens=9,
+        cache_epoch=1,
+        initial_extra_blocks=1,
+        guarantee_completion=False,
+    )
+    assert admitted is not None
+
+    manager.reserve("optimistic", 3)
+    manager.commit("optimistic", 1)
+    assert manager.stats.used_token_slots == 2
+    assert manager.stats.claimed_token_slots == 4
+
+    assert manager.free("optimistic")
+    assert manager.stats.used_token_slots == 0
+    assert manager.stats.claimed_token_slots == 0
+    assert manager.num_free_blocks == 6
+
+
+def test_optimistic_admission_keeps_a_global_decode_watermark() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=10, block_size=1))
+    for index in range(3):
+        admitted = manager.try_add_request(
+            str(index),
+            token_ids=(index, index + 1),
+            max_num_committed_tokens=8,
+            cache_epoch=1,
+            admission_min_free_token_slots=1,
+            initial_extra_blocks=1,
+            guarantee_completion=False,
+        )
+        assert admitted is not None
+
+    assert manager.stats.claimed_token_slots == 9
+    assert (
+        manager.try_add_request(
+            "blocked",
+            token_ids=(8, 9),
+            max_num_committed_tokens=8,
+            cache_epoch=1,
+            admission_min_free_token_slots=1,
+            initial_extra_blocks=1,
+            guarantee_completion=False,
+        )
+        is None
+    )
+
+
+def test_prompt_block_key_plan_is_reused_for_the_same_request_tokens() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=8, block_size=2),
+        enable_prefix_caching=True,
+    )
+    tokens = (1, 2, 3, 4, 5)
+
+    first = manager._prompt_block_keys(tokens, 1)
+    second = manager._prompt_block_keys(tokens, 1)
+
+    assert second is first
+
+
 def test_unbounded_manager_tracks_reservations_without_block_placement() -> None:
     manager = UnboundedKVCacheManager()
     _add_logical_request(manager, "request", (1, 2, 3))

@@ -17,7 +17,7 @@ from light_vllm import (
     ModelSpec,
     TokenGenerated,
 )
-from light_vllm.entrypoints.http import create_serving_app
+from light_vllm.entrypoints.http import _create_parser, create_serving_app
 from light_vllm.runtime.scheduler import ShortRequestPolicy
 from light_vllm.serving.http import _encoded_stream, create_http_app
 
@@ -36,6 +36,15 @@ class StubEngineClient:
             generated_token_ids=(7,),
             finish_reason="length",
         )
+
+
+class RecordingEngineClient(StubEngineClient):
+    def __init__(self) -> None:
+        self.requests: list[GenerateRequest] = []
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        self.requests.append(request)
+        return await super().generate(request)
 
 
 class UnreadyEngineClient(StubEngineClient):
@@ -123,6 +132,37 @@ def test_http_adapter_exposes_health_and_non_streaming_generation() -> None:
         "token_ids": [1, 2, 7],
         "finish_reason": "length",
     }
+
+
+def test_http_adapter_forwards_the_request_ttft_slo() -> None:
+    engine = RecordingEngineClient()
+    client = TestClient(create_http_app(engine))
+
+    response = client.post(
+        "/generate",
+        json={
+            "input_ids": [1, 2],
+            "max_new_tokens": 1,
+            "max_tolerable_ttft_seconds": 0.75,
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.requests[0].max_tolerable_ttft_seconds == 0.75
+
+
+def test_cli_can_disable_load_dependent_ttft_gates() -> None:
+    args = _create_parser().parse_args(
+        [
+            "--max-pending-requests",
+            "off",
+            "--ttft-kv-cache-watermark",
+            "off",
+        ]
+    )
+
+    assert args.max_pending_requests is None
+    assert args.ttft_kv_cache_watermark is None
 
 
 def test_http_adapter_streams_generation_events_as_sse() -> None:

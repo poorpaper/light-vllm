@@ -265,7 +265,6 @@ class EngineCore:
         current_task = asyncio.current_task()
         try:
             while True:
-                await asyncio.sleep(0)
                 async with self._lock:
                     if not self._scheduler.has_requests:
                         self._driver_task = None
@@ -277,8 +276,15 @@ class EngineCore:
                     self._executing_request_ids.update(batch.request_ids)
 
                 # 锁内只生成计划并保留缓存；耗时的模型计算在线程和锁外执行。
+                step_succeeded = False
                 try:
-                    raw_output = await asyncio.to_thread(self._executor.execute, batch)
+                    # Executor 不读取请求 ContextVar，直接提交线程池，省掉
+                    # asyncio.to_thread 每轮复制上下文和包装 callable 的成本。
+                    raw_output = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        self._executor.execute,
+                        batch,
+                    )
                     # 结果完整通过检查前，不更新请求进度，也不提交 KV cache。
                     output = _validated_output(batch, raw_output)
                     if raw_output.step_elapsed_seconds is not None:
@@ -290,6 +296,7 @@ class EngineCore:
                         # 控制组件和只读 Observer 消费同一个已完成 step 事实。
                         self._ttft_admission.step_completed(observation)
                         self._performance_observer.step_completed(observation)
+                    step_succeeded = True
                 except Exception as exc:
                     async with self._lock:
                         self._fail_batch_locked(scheduled.request_ids, exc)
@@ -301,6 +308,9 @@ class EngineCore:
                     finally:
                         async with self._lock:
                             self._finish_execution_locked(batch.request_ids)
+                            # 成功路径紧接着 apply 并发布新状态，不重复发送中间快照。
+                            if not step_succeeded:
+                                self._publish_scheduler_stats()
 
                 async with self._lock:
                     self._apply_output_locked(scheduled, output)
@@ -327,7 +337,10 @@ class EngineCore:
                 ExecutionRequest(
                     request_id=item.request_id,
                     input_token_ids=input_token_ids,
-                    context_token_ids=tuple(state.token_ids),
+                    # 普通执行只消费本轮 input；完整 history 只为草稿 proposer 快照。
+                    context_token_ids=(
+                        tuple(state.token_ids) if item.num_lookahead_tokens else None
+                    ),
                     num_computed_tokens=item.num_computed_tokens,
                     num_lookahead_tokens=item.num_lookahead_tokens,
                     max_output_tokens=item.max_output_tokens,
@@ -410,7 +423,6 @@ class EngineCore:
             if request_id in self._pending_scheduler_removals:
                 self._pending_scheduler_removals.remove(request_id)
                 self._scheduler.remove(request_id)
-        self._publish_scheduler_stats()
 
     def _fail_batch_locked(self, request_ids: tuple[str, ...], exc: Exception) -> None:
         for request_id in request_ids:

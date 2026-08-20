@@ -10,7 +10,7 @@ from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionMetadata,
     _validate_paged_attention_tensors,
 )
-from light_vllm.runtime.execution.paged_cache import PagedKVCache
+from light_vllm.runtime.execution.paged_cache import PagedKVCache, PagedKVWriteMapping
 from light_vllm.runtime.kv_cache import KVCacheError
 
 try:
@@ -164,8 +164,8 @@ if triton is not None:
         )
         tl.store(
             output_ptr + output_offsets,
-            running_value / running_sum,
-            mask=active_query & dim_mask,
+            tl.where(active_query, running_value / running_sum, 0.0),
+            mask=dim_mask,
         )
 
 else:
@@ -180,6 +180,7 @@ class TritonPagedAttention:
         self._metadata = metadata
         self._layer_ids: set[str] = set()
         self._slot_mapping: Tensor | None = None
+        self._write_mapping: PagedKVWriteMapping | None = None
         self._query_visibility: Tensor | None = None
         self._query_width: int | None = None
 
@@ -263,14 +264,25 @@ class TritonPagedAttention:
                 query_width=query_width,
                 device=config.device,
             )
+            # validate_block_tables() in the constructor already proves that
+            # generated writable slots are in range and do not alias.
+            self._write_mapping = self._cache.prepare_write(
+                self._slot_mapping,
+                validate=False,
+            )
         assert self._query_visibility is not None
+        assert self._write_mapping is not None
 
         # KV 写入和 attention 分成两个顺序步骤；同一 CUDA stream 保证读取前写入完成。
-        self._cache.write(layer_id, key, value, self._slot_mapping)
         layer = self._cache.layer(layer_id)
-        output = torch.zeros_like(query)
         block_d = triton.next_power_of_2(layer_spec.head_size)
-        num_warps = 4 if block_d <= 64 else 8
+        self._cache.write_prepared(layer_id, key, value, self._write_mapping)
+        output = torch.empty_like(query)
+        block_n = min(
+            256,
+            max(64, triton.next_power_of_2(self._max_sequence_length)),
+        )
+        num_warps = 4
         grid = (query.shape[0] * query_width, layer_spec.num_query_heads)
         _paged_attention_kernel[grid](
             query,
@@ -294,7 +306,7 @@ class TritonPagedAttention:
             GROUP_SIZE=layer_spec.num_query_heads // layer_spec.num_kv_heads,
             HEAD_SIZE=layer_spec.head_size,
             BLOCK_D=block_d,
-            BLOCK_N=32,
+            BLOCK_N=block_n,
             num_warps=num_warps,
             num_stages=2,
         )

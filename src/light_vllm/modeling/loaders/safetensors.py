@@ -11,7 +11,7 @@ import torch
 from safetensors import SafetensorError, safe_open
 from torch import Tensor, nn
 
-from light_vllm.modeling.loaders.torch import ModelLoadError
+from light_vllm.modeling.loaders.torch import ModelLoadError, _prepare_for_inference
 from light_vllm.modeling.models.interfaces import ModelFactory, ModelSpec
 
 
@@ -137,4 +137,4 @@ class SafetensorsModelLoader:
             if unexpected:
                 details.append(f"unexpected={sorted(unexpected)!r}")
             raise ModelLoadError("checkpoint weights do not match the model: " + ", ".join(details))
-        return model
+        return _prepare_for_inference(model, spec)

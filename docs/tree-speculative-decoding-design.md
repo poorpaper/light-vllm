@@ -158,7 +158,7 @@ class AcceptanceResult:
 假设正式输入有 `B` 个 token，Scheduler 预留 `N` 个 speculative slots，proposer 实际生成 `Q <= N` 个树节点：
 
 1. Scheduler reserve `B + N` 个逻辑 token slot；
-2. proposer 从只读 `context_token_ids` 生成 `DraftTree(Q)`；
+2. Engine 仅在本轮有 speculative slots 时附带只读 `context_token_ids` 快照，proposer 用它生成 `DraftTree(Q)`；
 3. Decode Handler 将正式输入与树节点展平为 `B + Q` 个 query；
 4. `QueryLayout` 为正式输入建立线性依赖，为草稿节点建立树依赖；
 5. Step Handler 为每个 query 生成语义 position 和独立物理 slot；

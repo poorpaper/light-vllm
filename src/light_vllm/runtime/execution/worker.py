@@ -212,29 +212,23 @@ class PagedStepHandler:
 
         # 不同请求的 query 长度可以不同；补零后用 layout 长度屏蔽 padding。
         query_width = max(len(request.query_token_ids) for request in batch.requests)
-        input_ids = torch.zeros(
-            (len(batch.requests), query_width),
-            dtype=torch.long,
-            device=self._device,
-        )
-        positions = torch.zeros_like(input_ids)
+        input_rows: list[tuple[int, ...]] = []
+        position_rows: list[tuple[int, ...]] = []
         query_lengths: list[int] = []
-        for row, request in enumerate(batch.requests):
+        for request in batch.requests:
             query_length = len(request.query_token_ids)
             query_lengths.append(query_length)
-            input_ids[row, :query_length] = torch.tensor(
-                request.query_token_ids,
-                dtype=torch.long,
-                device=self._device,
-            )
-            positions[row, :query_length] = torch.tensor(
+            padding = (0,) * (query_width - query_length)
+            input_rows.append(request.query_token_ids + padding)
+            position_rows.append(
                 semantic_positions(
                     request.query_layout,
                     prefix_length=request.num_computed_tokens,
-                ),
-                dtype=torch.long,
-                device=self._device,
+                )
+                + padding
             )
+        input_ids = torch.tensor(input_rows, dtype=torch.long, device=self._device)
+        positions = torch.tensor(position_rows, dtype=torch.long, device=self._device)
 
         metadata = PagedAttentionMetadata(
             block_tables=tuple(request.block_ids or () for request in batch.requests),

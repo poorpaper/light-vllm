@@ -203,6 +203,43 @@ def _execution_request(
     )
 
 
+def test_execution_request_allows_omitted_draft_context() -> None:
+    request = ExecutionRequest(
+        request_id="request",
+        input_token_ids=(3,),
+        context_token_ids=None,
+        num_computed_tokens=2,
+        num_lookahead_tokens=0,
+        max_output_tokens=1,
+        block_ids=None,
+    )
+
+    assert request.context_token_ids is None
+
+
+@pytest.mark.parametrize(
+    ("context_token_ids", "expected_error"),
+    [
+        ((1, -1, 3), "non-negative integers"),
+        ((1, 2, 4), "scheduled slice"),
+    ],
+)
+def test_execution_request_still_validates_present_draft_context(
+    context_token_ids: tuple[int, ...],
+    expected_error: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_error):
+        ExecutionRequest(
+            request_id="request",
+            input_token_ids=(3,),
+            context_token_ids=context_token_ids,
+            num_computed_tokens=2,
+            num_lookahead_tokens=1,
+            max_output_tokens=2,
+            block_ids=None,
+        )
+
+
 def _contiguous_worker(provider, decode_handler=None) -> LocalModelWorker:
     return LocalModelWorker(
         provider,

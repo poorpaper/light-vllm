@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
+from math import floor
 
 from light_vllm.runtime.kv_cache import KVCacheCapacityError, KVCacheManager
 from light_vllm.runtime.scheduler.interfaces import (
@@ -34,6 +35,8 @@ class _RequestState:
     force_completion_claim: bool = False
     num_resubmits: int = 0
     num_rolled_back_tokens: int = 0
+    short_classification_revision: int = -1
+    short_classification: bool = False
 
 
 class TokenBudgetScheduler:
@@ -63,6 +66,8 @@ class TokenBudgetScheduler:
                 raise ValueError("short sequence reserve must leave a common sequence slot")
             if short_request_policy.reserved_scheduled_tokens >= max_num_scheduled_tokens:
                 raise ValueError("short token reserve must leave a common token budget")
+        if self_resubmit_policy is not None and not kv_cache.prefix_caching_enabled:
+            raise ValueError("self-resubmit requires prefix caching")
         self._kv_cache = kv_cache
         self._max_num_sequences = max_num_sequences
         self._max_num_scheduled_tokens = max_num_scheduled_tokens
@@ -416,8 +421,11 @@ class TokenBudgetScheduler:
         min_free_tokens: int,
     ) -> bool:
         state = self._states[request_id]
-        guarantee_completion = (
-            self._self_resubmit_policy is None or is_short or state.force_completion_claim
+        policy = self._self_resubmit_policy
+        guarantee_completion = policy is None or is_short or state.force_completion_claim
+        optimistic_admission = policy is not None and not guarantee_completion
+        admission_min_free_tokens = (
+            self._decode_reserve_tokens(policy) if optimistic_admission else 0
         )
         match = self._kv_cache.try_add_request(
             request_id,
@@ -426,6 +434,8 @@ class TokenBudgetScheduler:
             max_num_committed_tokens=state.max_num_tokens - 1,
             cache_epoch=state.cache_epoch,
             min_free_token_slots=min_free_tokens,
+            admission_min_free_token_slots=admission_min_free_tokens,
+            initial_extra_blocks=(policy.initial_extra_blocks if optimistic_admission else 0),
             guarantee_completion=guarantee_completion,
         )
         if match is None:
@@ -445,6 +455,13 @@ class TokenBudgetScheduler:
         order.append(request_id)
         return True
 
+    def _decode_reserve_tokens(self, policy: SelfResubmitPolicy) -> int:
+        capacity = self._kv_cache.stats.capacity_token_slots
+        if capacity is None:
+            raise SchedulerError("optimistic admission requires finite paged KV capacity")
+        # watermark=0.9 表示新请求最多占到全局容量的 90%；余量只给已运行请求增长。
+        return capacity - floor(capacity * policy.kv_admission_watermark)
+
     def _is_short_request(self, state: _RequestState) -> bool:
         policy = self._short_request_policy
         if (
@@ -453,12 +470,17 @@ class TokenBudgetScheduler:
             or state.max_num_tokens > policy.max_total_tokens
         ):
             return False
+        revision = self._kv_cache.prefix_cache_revision
+        if state.short_classification_revision == revision:
+            return state.short_classification
         match = self._kv_cache.preview_prefix(
             token_ids=state.prompt_token_ids,
             cache_epoch=state.cache_epoch,
         )
         effective_prompt_tokens = len(state.prompt_token_ids) - match.num_cached_tokens
-        return effective_prompt_tokens <= policy.max_effective_prompt_tokens
+        state.short_classification_revision = revision
+        state.short_classification = effective_prompt_tokens <= policy.max_effective_prompt_tokens
+        return state.short_classification
 
     def _resubmit(self, request_id: str, state: _RequestState) -> None:
         """释放撞墙者自己的 KV，并把完整 token 历史留给 Engine 重算。"""

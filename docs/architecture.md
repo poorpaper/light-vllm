@@ -122,7 +122,7 @@ round-robin。请求分类使用 prefix 命中后的有效 prompt 长度，并�
 ExecutionRequest
 ├── request_id
 ├── input_token_ids
-├── context_token_ids
+├── context_token_ids       # optional，仅草稿 proposer 需要完整 history 时携带
 ├── num_computed_tokens
 ├── num_lookahead_tokens
 ├── max_output_tokens
@@ -260,17 +260,21 @@ model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`�
 报告并发槽和单轮 token budget。`EngineCapabilities.max_request_tokens` 取模型与单请求可用 KV 上限的较小值。
 HTTP 通过 `/capabilities` 展示这些事实，不再硬编码 prompt 长度。
 
-`CapacityAdmission` 只拒绝“即使引擎空闲也不可能完成”的请求。可选 `PredictiveTTFTAdmission` 使用
+`CapacityAdmission` 只拒绝“即使引擎空闲也不可能完成”的请求。`PredictiveTTFTAdmission` 先检查 pending 请求数
+和 KV 水位，再使用
 `prompt + waiting pending + running pending` 的全局当前工作量动态早拒：prefill 贡献剩余 prompt，普通 decode
 通常贡献当前 1 个 token，不提前展开未来输出预算。延迟表按实际进入模型 forward 的 token 数更新并构造单调包络；
-样本不足时 fail-open，超过全局 SLO 时由 HTTP 表达为 429。预测器会改变准入结果，因此是独立控制组件；
+默认积累 100 个 step 后启用预测，样本不足时 fail-open，但前两级门控仍生效。请求可以覆盖全局 SLO；动态拒绝
+由 HTTP 表达为 429。预测器会改变准入结果，因此是独立控制组件；
 `PerformanceObserver` 仍然只读。Engine 在 step 完成后把同一个 `StepObservation` 显式交给二者。
 
 默认路径不挑选第三方 victim。分页请求准入时领取覆盖最大可提交长度的 completion claim，逻辑管理器保持
-`used unique blocks + claims <= capacity`。可选 self-resubmit 只让常规请求 best-effort 使用 KV；撞墙者释放自己
-的页、保留 Engine 中的可见 token 历史并回到 PREFILL。旧 token 不重复发送，回滚不增加 aging；达到次数或累计
-回滚进度阈值后恢复 strict claim，整轮无进展时最早回滚者也走严格恢复。这是 cooperative self rollback，不是
-victim preemption。未来重算式或 swap 式第三方抢占仍只能在 Scheduler 边界内落地。
+`used unique blocks + claims <= capacity`。可选 self-resubmit 让常规请求先领取 `prompt + 1 block` 的初始 claim，
+并把新准入限制在全局 KV 的 90%，其余空间留给 running decode。初始 claim 用完后按实时空闲页增长；撞墙者释放
+自己的页、保留 Engine 中的可见 token 历史并回到 PREFILL。该模式强制启用 prefix cache，重用完整 prompt 页；
+生成阶段 KV 仍需重算。旧 token 不重复发送，回滚不增加 aging；达到次数或累计回滚进度阈值后恢复 strict claim，
+整轮无进展时最早回滚者也走严格恢复。这是 cooperative self rollback，不是 victim preemption。未来重算式或
+swap 式第三方抢占仍只能在 Scheduler 边界内落地。
 
 ## Sampler
 
@@ -327,7 +331,7 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 
 Scheduler 分开公开两种 token 事实：`pending_tokens` 是当前已知但尚未计算的输入，适合 TTFT 排队估算；
 `max_remaining_tokens` 还包含请求声明的最大输出预算，是偏保守的 HPA backlog。Paged KV 使用率按不能立即回收的
-block token slot 计算；completion claim、短请求首 token lane、self-resubmit 次数与回滚的已计算进度单独公开；
+block token slot 计算；completion/initial claim、短请求首 token lane、self-resubmit 次数与回滚的已计算进度单独公开；
 可淘汰 prefix page 视为可用，无固定上限的连续缓存不输出伪容量。
 
 投机树的 proposed/accepted、verified tokens、root、branching parent、max depth 与 compact 搬运量经独立

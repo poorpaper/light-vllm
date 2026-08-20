@@ -11,7 +11,13 @@ class ModelLoadError(RuntimeError):
 
 
 def _prepare_for_inference(model: nn.Module, spec: ModelSpec) -> nn.Module:
-    return model.to(device=spec.device, dtype=spec.dtype).eval()
+    model = model.to(device=spec.device, dtype=spec.dtype).eval()
+    prepare = getattr(model, "prepare_for_inference", None)
+    if prepare is not None:
+        if not callable(prepare):
+            raise ModelLoadError("model prepare_for_inference must be callable")
+        prepare()
+    return model
 
 
 class InitModelLoader:

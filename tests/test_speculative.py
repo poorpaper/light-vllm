@@ -4,6 +4,7 @@ import torch
 from light_vllm.runtime.execution import (
     DraftTree,
     ExecutionBatch,
+    ExecutionError,
     ExecutionRequest,
     GreedyTreeAcceptanceSampler,
     ModelStepBatch,
@@ -46,7 +47,7 @@ def test_ngram_chain_supports_overlapping_history_matches() -> None:
     )
 
 
-def test_ngram_trie_collects_branches_in_deterministic_bfs_order() -> None:
+def test_ngram_trie_collects_branches_in_deterministic_order() -> None:
     proposer = NGramTrieProposer(
         min_match_length=2,
         max_match_length=2,
@@ -61,6 +62,22 @@ def test_ngram_trie_collects_branches_in_deterministic_bfs_order() -> None:
 
     # 7 出现两次；同频子节点优先选择更近的 9，再选择 8。
     assert proposal == DraftTree((7, 9, 8), (-1, 0, 0))
+
+
+def test_ngram_trie_covers_roots_then_preserves_the_frequent_path_depth() -> None:
+    proposer = NGramTrieProposer(
+        min_match_length=2,
+        max_match_length=2,
+        max_depth=3,
+        max_branching=2,
+    )
+
+    proposal = proposer.propose(
+        (1, 2, 7, 8, 9, 1, 2, 7, 8, 9, 1, 2, 6, 5, 1, 2),
+        max_nodes=4,
+    )
+
+    assert proposal == DraftTree((7, 8, 9, 6), (-1, 0, 1, -1))
 
 
 def test_ngram_trie_respects_global_node_budget() -> None:
@@ -210,6 +227,30 @@ def test_speculative_handler_verifies_and_compacts_the_draft_path(
         -1 if index == 0 else index - 1 for index in range(2 + len(drafts))
     )
     assert output.num_model_tokens_computed == len(request.input_token_ids) + len(drafts)
+
+
+def test_speculative_handler_requires_context_when_it_proposes_drafts() -> None:
+    handler = SpeculativeDecodeHandler(
+        _FixedProposer((6,)),
+        GreedySampler(),
+        GreedyTreeAcceptanceSampler(),
+    )
+    request = ExecutionRequest(
+        request_id="request",
+        input_token_ids=(5,),
+        context_token_ids=None,
+        num_computed_tokens=1,
+        num_lookahead_tokens=1,
+        max_output_tokens=2,
+        block_ids=None,
+    )
+
+    with pytest.raises(ExecutionError, match="complete token context"):
+        handler.execute(
+            object(),
+            ExecutionBatch((request,)),
+            _TargetStep((6, 7), original_input_length=1),
+        )
 
 
 def test_speculation_observer_records_the_actual_tree_shape() -> None:

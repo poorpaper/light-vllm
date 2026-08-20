@@ -122,6 +122,15 @@ class PagedLayerCache:
     values: Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class PagedKVWriteMapping:
+    """A slot mapping normalized once for every layer in one model step."""
+
+    active: Tensor
+    source_indices: Tensor
+    slots: Tensor
+
+
 class PagedKVCache:
     """所有请求共用的分页 K/V 张量池，通过 page ID 找到具体存储位置。"""
 
@@ -153,8 +162,47 @@ class PagedKVCache:
             raise KVCacheError(f"KV cache layer {layer_id!r} was not found") from exc
 
     @torch.inference_mode()
-    def write(self, layer_id: str, key: Tensor, value: Tensor, slot_mapping: Tensor) -> None:
-        """把有效 query token 的 K/V 原位写到指定物理 slot。"""
+    def prepare_write(
+        self,
+        slot_mapping: Tensor,
+        *,
+        validate: bool = True,
+    ) -> PagedKVWriteMapping:
+        """Normalize one batch mapping for reuse across all model layers.
+
+        Paged-attention metadata proves range and aliasing properties on the
+        CPU. Its backends can therefore skip CUDA reductions and host
+        synchronizations while direct cache callers keep defensive validation.
+        """
+
+        if slot_mapping.ndim != 2:
+            raise KVCacheError("slot mapping must have shape [batch, query]")
+        if slot_mapping.device != self._config.device:
+            raise KVCacheError("slot mapping device must match the cache")
+        active = slot_mapping >= 0
+        source_indices = torch.nonzero(active.flatten(), as_tuple=False).flatten()
+        slots = slot_mapping.flatten().index_select(0, source_indices).to(torch.long)
+        if validate and slots.numel():
+            num_slots = self._config.num_blocks * self._config.block_size
+            if int(slots.min()) < 0 or int(slots.max()) >= num_slots:
+                raise KVCacheError("slot mapping contains an out-of-range physical slot")
+            if slots.unique().numel() != slots.numel():
+                raise KVCacheError("slot mapping must not write the same physical slot twice")
+        return PagedKVWriteMapping(
+            active=active,
+            source_indices=source_indices,
+            slots=slots,
+        )
+
+    @torch.inference_mode()
+    def write_prepared(
+        self,
+        layer_id: str,
+        key: Tensor,
+        value: Tensor,
+        mapping: PagedKVWriteMapping,
+    ) -> None:
+        """Write K/V with a mapping prepared once for the model step."""
 
         layer = self.layer(layer_id)
         spec = self.layer_spec(layer_id)
@@ -165,29 +213,37 @@ class PagedKVCache:
             )
         if value.shape != key.shape:
             raise KVCacheError("paged K/V updates must have the same shape")
-        if slot_mapping.shape != key.shape[:2]:
+        if mapping.active.shape != key.shape[:2]:
             raise KVCacheError("slot mapping must have one entry per query token")
         if key.dtype != self._config.dtype or key.device != self._config.device:
             raise KVCacheError("paged KV update dtype and device must match the cache")
         if value.dtype != key.dtype or value.device != key.device:
             raise KVCacheError("paged K/V updates must use the same dtype and device")
-        if slot_mapping.device != self._config.device:
-            raise KVCacheError("slot mapping device must match the cache")
-
-        active = slot_mapping >= 0
-        slots = slot_mapping[active].to(torch.long)
-        if slots.numel() == 0:
+        if (
+            mapping.active.device != self._config.device
+            or mapping.source_indices.device != self._config.device
+            or mapping.slots.device != self._config.device
+        ):
+            raise KVCacheError("prepared slot mapping device must match the cache")
+        if mapping.slots.numel() == 0:
             return
-        num_slots = self._config.num_blocks * self._config.block_size
-        if int(slots.min()) < 0 or int(slots.max()) >= num_slots:
-            raise KVCacheError("slot mapping contains an out-of-range physical slot")
-        if slots.unique().numel() != slots.numel():
-            raise KVCacheError("slot mapping must not write the same physical slot twice")
 
+        num_slots = self._config.num_blocks * self._config.block_size
         flat_keys = layer.keys.view(num_slots, *expected_tail)
         flat_values = layer.values.view(num_slots, *expected_tail)
-        flat_keys.index_copy_(0, slots, key[active])
-        flat_values.index_copy_(0, slots, value[active])
+        query_keys = key.flatten(0, 1)
+        query_values = value.flatten(0, 1)
+        if mapping.source_indices.numel() != mapping.active.numel():
+            query_keys = query_keys.index_select(0, mapping.source_indices)
+            query_values = query_values.index_select(0, mapping.source_indices)
+        flat_keys.index_copy_(0, mapping.slots, query_keys)
+        flat_values.index_copy_(0, mapping.slots, query_values)
+
+    @torch.inference_mode()
+    def write(self, layer_id: str, key: Tensor, value: Tensor, slot_mapping: Tensor) -> None:
+        """把有效 query token 的 K/V 原位写到指定物理 slot。"""
+
+        self.write_prepared(layer_id, key, value, self.prepare_write(slot_mapping))
 
     @torch.inference_mode()
     def compact(

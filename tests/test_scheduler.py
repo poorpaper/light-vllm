@@ -276,16 +276,20 @@ def test_common_pool_rotates_admitted_requests() -> None:
 
 def test_self_resubmit_recomputes_without_reemitting_and_then_falls_back_to_strict() -> None:
     scheduler = TokenBudgetScheduler(
-        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1)),
+        PagedKVCacheManager(
+            FixedKVBlockCapacity(num_blocks=4, block_size=1),
+            enable_prefix_caching=True,
+        ),
         max_num_sequences=2,
         max_num_scheduled_tokens=1,
         self_resubmit_policy=SelfResubmitPolicy(
             max_resubmits=1,
             strict_fallback_rolled_back_tokens=100,
+            kv_admission_watermark=1.0,
         ),
     )
-    scheduler.add("a", token_ids=(1,), max_num_tokens=4)
-    scheduler.add("b", token_ids=(2,), max_num_tokens=4)
+    scheduler.add("a", token_ids=(1,), max_num_tokens=4, cache_epoch=0)
+    scheduler.add("b", token_ids=(2,), max_num_tokens=4, cache_epoch=0)
 
     for request_id in ("a", "b", "a", "b"):
         output = scheduler.schedule()
@@ -309,9 +313,37 @@ def test_self_resubmit_recomputes_without_reemitting_and_then_falls_back_to_stri
     assert scheduler.stats.kv_cache.claimed_token_slots == 2
 
 
-def test_self_resubmit_does_not_borrow_short_headroom_without_real_aging() -> None:
+def test_self_resubmit_requires_prefix_caching() -> None:
+    with pytest.raises(ValueError, match="self-resubmit requires prefix caching"):
+        TokenBudgetScheduler(
+            PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1)),
+            max_num_sequences=1,
+            max_num_scheduled_tokens=1,
+            self_resubmit_policy=SelfResubmitPolicy(),
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"initial_extra_blocks": 0},
+        {"kv_admission_watermark": 0},
+        {"kv_admission_watermark": 1.1},
+    ],
+)
+def test_self_resubmit_policy_rejects_invalid_optimistic_limits(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        SelfResubmitPolicy(**changes)
+
+
+def test_self_resubmit_does_not_displace_the_reserved_short_lane() -> None:
     scheduler = TokenBudgetScheduler(
-        PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=3, block_size=1)),
+        PagedKVCacheManager(
+            FixedKVBlockCapacity(num_blocks=5, block_size=1),
+            enable_prefix_caching=True,
+        ),
         max_num_sequences=3,
         max_num_scheduled_tokens=2,
         short_request_policy=_short_policy(
@@ -324,12 +356,13 @@ def test_self_resubmit_does_not_borrow_short_headroom_without_real_aging() -> No
         self_resubmit_policy=SelfResubmitPolicy(
             max_resubmits=1,
             strict_fallback_rolled_back_tokens=100,
+            kv_admission_watermark=1.0,
         ),
     )
-    scheduler.add("a", token_ids=(1,), max_num_tokens=4)
-    scheduler.add("b", token_ids=(2,), max_num_tokens=4)
+    scheduler.add("a", token_ids=(1,), max_num_tokens=4, cache_epoch=0)
+    scheduler.add("b", token_ids=(2,), max_num_tokens=4, cache_epoch=0)
 
-    for request_id in ("a", "b"):
+    for request_id in ("a", "b", "a", "b"):
         output = scheduler.schedule()
         assert output.request_ids == (request_id,)
         scheduler.complete(request_id, num_committed_tokens=1, num_new_tokens=1)
@@ -340,14 +373,12 @@ def test_self_resubmit_does_not_borrow_short_headroom_without_real_aging() -> No
     assert scheduler.stats.self_resubmits_total == 1
     scheduler.complete("b", num_committed_tokens=1, num_new_tokens=1)
     scheduler.remove("b")
-    scheduler.add("short", token_ids=(9,), max_num_tokens=2)
+    scheduler.add("short", token_ids=(9,), max_num_tokens=2, cache_epoch=0)
 
     output = scheduler.schedule()
 
-    # short 先取得严格 claim；b 只能继续等，不能借 aging 绕过预留水位。
-    assert output.request_ids == ("short",)
-    assert scheduler.stats.running_requests == 1
-    assert scheduler.stats.waiting_requests == 1
+    # 回滚请求即使进入 strict fallback，短请求仍先使用自己的首 token 通道。
+    assert output.request_ids[0] == "short"
 
 
 def test_scheduler_rejects_duplicate_request_ids() -> None:
@@ -425,6 +456,9 @@ def test_scheduler_releases_an_invalid_prefix_match() -> None:
         def __init__(self) -> None:
             self.freed: list[str] = []
 
+        prefix_caching_enabled = False
+        prefix_cache_revision = 0
+
         def try_add_request(
             self,
             request_id,
@@ -433,6 +467,8 @@ def test_scheduler_releases_an_invalid_prefix_match() -> None:
             max_num_committed_tokens,
             cache_epoch,
             min_free_token_slots=0,
+            admission_min_free_token_slots=0,
+            initial_extra_blocks=0,
             guarantee_completion=True,
         ):
             return KVCacheMatch(num_cached_tokens=len(token_ids))

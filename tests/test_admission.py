@@ -24,15 +24,22 @@ def _observe(
     )
 
 
-def _scheduler_stats(*, waiting_tokens: int, running_tokens: int) -> SchedulerStats:
+def _scheduler_stats(
+    *,
+    waiting_tokens: int,
+    running_tokens: int,
+    waiting_requests: int = 1,
+    running_requests: int = 1,
+    kv_cache: KVCacheStats | None = None,
+) -> SchedulerStats:
     return SchedulerStats(
-        waiting_requests=1,
-        running_requests=1,
+        waiting_requests=waiting_requests,
+        running_requests=running_requests,
         waiting_pending_tokens=waiting_tokens,
         running_pending_tokens=running_tokens,
         waiting_max_remaining_tokens=waiting_tokens,
         running_max_remaining_tokens=running_tokens,
-        kv_cache=KVCacheStats(),
+        kv_cache=kv_cache or KVCacheStats(),
     )
 
 
@@ -143,4 +150,110 @@ def test_predictive_ttft_admission_does_not_average_away_a_slow_step() -> None:
         admission.validate(
             GenerateRequest(input_ids=(1, 2), max_new_tokens=8),
             _scheduler_stats(waiting_tokens=4, running_tokens=3),
+        )
+
+
+def test_request_ttft_slo_works_without_a_global_slo() -> None:
+    predictor = SlidingWindowStepLatencyPredictor(min_observations=1)
+    _observe(predictor, 9, 0.4)
+    admission = PredictiveTTFTAdmission(predictor)
+
+    with pytest.raises(GenerationOverloadedError, match="the 0.300s SLO"):
+        admission.validate(
+            GenerateRequest(
+                input_ids=(1, 2),
+                max_new_tokens=8,
+                max_tolerable_ttft_seconds=0.3,
+            ),
+            _scheduler_stats(waiting_tokens=4, running_tokens=3),
+        )
+
+
+def test_pending_request_gate_applies_before_predictor_warmup() -> None:
+    predictor = SlidingWindowStepLatencyPredictor(min_observations=100)
+    admission = PredictiveTTFTAdmission(predictor, max_pending_requests=4)
+
+    with pytest.raises(GenerationOverloadedError, match="pending request limit 4"):
+        admission.validate(
+            GenerateRequest(input_ids=(1,), max_new_tokens=1),
+            _scheduler_stats(
+                waiting_tokens=3,
+                running_tokens=1,
+                waiting_requests=3,
+                running_requests=1,
+            ),
+        )
+
+
+def test_kv_gate_counts_used_and_claimed_capacity() -> None:
+    admission = PredictiveTTFTAdmission(
+        SlidingWindowStepLatencyPredictor(min_observations=100),
+        kv_cache_watermark=0.9,
+    )
+
+    with pytest.raises(GenerationOverloadedError, match="KV cache watermark 0.900"):
+        admission.validate(
+            GenerateRequest(input_ids=(1,), max_new_tokens=1),
+            _scheduler_stats(
+                waiting_tokens=1,
+                running_tokens=1,
+                kv_cache=KVCacheStats(
+                    used_token_slots=80,
+                    claimed_token_slots=10,
+                    capacity_token_slots=100,
+                ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("max_tolerable_ttft_seconds", 0),
+        ("max_tolerable_ttft_seconds", True),
+        ("max_pending_requests", 0),
+        ("kv_cache_watermark", 0),
+        ("kv_cache_watermark", 1.1),
+    ],
+)
+def test_predictive_ttft_admission_rejects_invalid_gates(name: str, value: object) -> None:
+    with pytest.raises(ValueError):
+        PredictiveTTFTAdmission(
+            SlidingWindowStepLatencyPredictor(),
+            **{name: value},
+        )
+
+
+def test_predictor_failure_does_not_disable_queue_and_kv_gates() -> None:
+    class FailingPredictor:
+        def predict(self, num_pending_tokens: int) -> float | None:
+            raise RuntimeError("predictor failed")
+
+        def observe(self, observation: StepObservation) -> None:
+            raise RuntimeError("predictor failed")
+
+    admission = PredictiveTTFTAdmission(
+        FailingPredictor(),
+        max_tolerable_ttft_seconds=0.5,
+        max_pending_requests=2,
+    )
+    admission.validate(
+        GenerateRequest(input_ids=(1,), max_new_tokens=1),
+        _scheduler_stats(
+            waiting_tokens=0,
+            running_tokens=1,
+            waiting_requests=0,
+            running_requests=1,
+        ),
+    )
+
+    with pytest.raises(GenerationOverloadedError, match="pending request limit 2"):
+        admission.validate(
+            GenerateRequest(input_ids=(1,), max_new_tokens=1),
+            _scheduler_stats(
+                waiting_tokens=1,
+                running_tokens=1,
+                waiting_requests=1,
+                running_requests=1,
+            ),
         )

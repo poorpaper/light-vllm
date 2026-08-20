@@ -63,15 +63,17 @@ class ShortRequestPolicy:
 
 @dataclass(frozen=True, slots=True)
 class SelfResubmitPolicy:
-    """KV 撞墙时只回滚当前请求，并限制重复回滚代价。
+    """用小额初始 claim 乐观准入，撞墙时只回滚当前请求。
 
-    达到回滚次数或累计回滚进度阈值后，请求下一次准入会自动恢复
-    completion claim，从而保证策略不会无限回滚。最后一次回滚可能
-    跨过 token 阈值，因此该字段是 strict fallback 阈值，不是硬上限。
+    准入只占用 prompt 和少量后续 block，并给运行中的 decode 留出全局
+    KV 水位。达到回滚次数或累计回滚进度阈值后，请求下一次准入会自动
+    恢复完整 completion claim，避免无限回滚。
     """
 
     max_resubmits: int = 2
     strict_fallback_rolled_back_tokens: int = 4096
+    initial_extra_blocks: int = 1
+    kv_admission_watermark: float = 0.9
 
     def __post_init__(self) -> None:
         if type(self.max_resubmits) is not int or self.max_resubmits <= 0:
@@ -81,6 +83,14 @@ class SelfResubmitPolicy:
             or self.strict_fallback_rolled_back_tokens < 0
         ):
             raise ValueError("strict fallback token threshold must be a non-negative integer")
+        if type(self.initial_extra_blocks) is not int or self.initial_extra_blocks <= 0:
+            raise ValueError("initial_extra_blocks must be a positive integer")
+        if (
+            isinstance(self.kv_admission_watermark, bool)
+            or not isinstance(self.kv_admission_watermark, (int, float))
+            or not 0.0 < self.kv_admission_watermark <= 1.0
+        ):
+            raise ValueError("kv_admission_watermark must be within (0, 1]")
 
 
 @dataclass(frozen=True, slots=True)

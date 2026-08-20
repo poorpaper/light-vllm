@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field
 
 from light_vllm.runtime.execution.interfaces import (
@@ -159,16 +158,63 @@ class NGramTrieProposer:
 
         token_ids_by_node: list[int] = []
         parent_indices: list[int] = []
-        queue = deque((node, -1, 1) for node in ranked(roots))
-        while queue and len(token_ids_by_node) < max_nodes:
-            node, parent, depth = queue.popleft()
+        frontier: list[tuple[_TrieNode, int, int]] = []
+
+        # First retain root alternatives: a trie is useful only if it can rescue
+        # the recent-chain miss at the first token. Then spend the remaining
+        # global budget best-first, preserving depth on the historically most
+        # likely path instead of breadth-first diluting every branch equally.
+        for node in ranked(roots):
+            if len(token_ids_by_node) >= max_nodes:
+                break
+            node_index = len(token_ids_by_node)
+            token_ids_by_node.append(node.token_id)
+            parent_indices.append(-1)
+            if self._max_depth > 1:
+                frontier.extend((child, node_index, 2) for child in ranked(node.children))
+
+        while frontier and len(token_ids_by_node) < max_nodes:
+            best = min(
+                range(len(frontier)),
+                key=lambda index: (
+                    -frontier[index][0].frequency,
+                    -frontier[index][0].last_occurrence,
+                    frontier[index][0].token_id,
+                    frontier[index][1],
+                ),
+            )
+            node, parent, depth = frontier.pop(best)
             node_index = len(token_ids_by_node)
             token_ids_by_node.append(node.token_id)
             parent_indices.append(parent)
             if depth < self._max_depth:
-                queue.extend((child, node_index, depth + 1) for child in ranked(node.children))
+                frontier.extend((child, node_index, depth + 1) for child in ranked(node.children))
 
-        return DraftTree(tuple(token_ids_by_node), tuple(parent_indices))
+        # Flatten the selected tree depth-first. The most likely accepted path
+        # stays physically contiguous, so the paged backend does not have to
+        # compact K/V merely because alternative roots consumed early slots.
+        children_by_parent: dict[int, list[int]] = {}
+        for index, parent in enumerate(parent_indices):
+            children_by_parent.setdefault(parent, []).append(index)
+        depth_first_order: list[int] = []
+
+        def append_subtree(index: int) -> None:
+            depth_first_order.append(index)
+            for child in children_by_parent.get(index, ()):
+                append_subtree(child)
+
+        for root in children_by_parent.get(-1, ()):
+            append_subtree(root)
+        remapped_indices = {
+            old_index: new_index for new_index, old_index in enumerate(depth_first_order)
+        }
+        return DraftTree(
+            tuple(token_ids_by_node[index] for index in depth_first_order),
+            tuple(
+                -1 if parent_indices[index] == -1 else remapped_indices[parent_indices[index]]
+                for index in depth_first_order
+            ),
+        )
 
 
 class GreedyTreeAcceptanceSampler:
@@ -271,14 +317,15 @@ class SpeculativeDecodeHandler:
                 request.num_lookahead_tokens,
                 max(0, request.max_output_tokens - 1),
             )
-            draft = (
-                self._proposer.propose(
+            if max_nodes:
+                if request.context_token_ids is None:
+                    raise ExecutionError("draft proposal requires the complete token context")
+                draft = self._proposer.propose(
                     request.context_token_ids,
                     max_nodes=max_nodes,
                 )
-                if max_nodes
-                else DraftTree((), ())
-            )
+            else:
+                draft = DraftTree((), ())
             if not isinstance(draft, DraftTree):
                 raise ExecutionError("draft proposer must return DraftTree")
             if len(draft) > max_nodes:

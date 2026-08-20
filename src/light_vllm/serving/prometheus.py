@@ -177,7 +177,6 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
         scheduler.self_resubmit_rolled_back_tokens_total,
         labels=labels,
     )
-
     for name, help_text, value in (
         (
             "light_vllm_speculation_attempts_total",

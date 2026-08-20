@@ -20,14 +20,16 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `ModelRunner` 通过 `Catalog` 中的 model/loader 注册表加载并原子替换模型；`open_session()` 固定模型对象和
   generation，一个生成请求不得跨 session。
 - 原生 `Qwen2ForCausalLM` 支持 Qwen2/Qwen2.5 的 full-attention、default-RoPE 配置；HF 与 ModelScope 下载的
-  兼容目录共用 `SafetensorsModelLoader`，不进入 Runner 或 Worker 分支。
+  兼容目录共用 `SafetensorsModelLoader`，不进入 Runner 或 Worker 分支。loader 在权重就绪后调用可选的模型自有
+  `prepare_for_inference()` hook；Qwen 用它准备打包权重和 RoPE table。
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
 - `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流。
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode；可选短请求策略同时预留
   scheduled token、KV token slot 和 sequence，首 token 后回到通用 round-robin，常规请求用真实 waiting step aging。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
-  `PagedKVCacheManager` 额外按容量分配 block table。严格准入使用 completion claim；可选 self-resubmit 只允许
-  常规请求 best-effort 准入，撞墙者释放自己的 KV 并带完整 token 历史回到 PREFILL。
+  `PagedKVCacheManager` 额外按容量分配 block table。严格准入使用 completion claim；可选 self-resubmit 让常规
+  请求先领取 `prompt + 1 block` 的初始 claim，并只允许新准入使用全局 90% KV。撞墙者释放自己的 KV、保留完整
+  token 历史并回到 PREFILL；该模式强制启用 prefix cache，以找回已提交的完整 prompt 页。
 - 可选 prefix cache 由 `PagedKVCacheManager` 管理：只复用已提交的完整 prompt 页，缓存页使用哈希链、
   引用计数和 LRU；共享前缀只读，各请求尾页独占。
 - composition root 通过 `kv_reservation=blocks|unbounded` 同时选择匹配的逻辑 manager 和
@@ -45,10 +47,14 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `RequestOutput` 分开表达本轮输入计算量、零到多个确认输出，以及已经写入 KV 的输出前缀。
 - `ExecutionOutput` 额外报告实际进入模型 forward 的 token 数；未产出的投机 lookahead 只保留为调度预留，
   不进入 step 延迟样本。
+- `ExecutionRequest` 的完整 `context_token_ids` 快照只为草稿 proposer 物化；普通执行只携带本轮
+  `input_token_ids`，不得在每个 decode step 复制和校验完整历史。
 - `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
-- 可选 `PredictiveTTFTAdmission` 用 `prompt + waiting pending + running pending` 的全局当前工作量和真实 step 延迟
-  做动态早拒；prefill 贡献剩余 prompt，普通 decode 通常贡献当前 1 个 token，不提前展开未来输出预算。
-  它是独立控制组件，不属于只读 `PerformanceObserver`。HTTP 分别把容量拒绝和 SLO 过载表达为 422/429。
+- `PredictiveTTFTAdmission` 先检查 pending 请求数与 KV 水位，再用
+  `prompt + waiting pending + running pending` 的全局当前工作量和真实 step 延迟做动态早拒；prefill 贡献剩余
+  prompt，普通 decode 通常贡献当前 1 个 token，不提前展开未来输出预算。预测器冷启动时 fail-open，但前两级
+  门控仍生效；请求可以覆盖全局 TTFT SLO。它是独立控制组件，不属于只读 `PerformanceObserver`。HTTP 分别把
+  容量拒绝和当前负载过载表达为 422/429。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
 - `PerformanceObserver` 在 Engine 已生效的生命周期边界记录 TTFT、可见 token 间隔、step 延迟与请求结果，只读取
   Scheduler/KV 不可变快照；Prometheus、Grafana 和 HPA 不进入推理热路径。
@@ -100,7 +106,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 
 1. `ModelRunner` 不得按 architecture、loader 或具体模型类型写功能分支。
 2. 模型和 loader 必须经 `Catalog` 注册表解析；同名注册默认报错。
-3. 候选模型在生命周期锁外完整构造；成功后才在同一临界区替换模型并递增 generation。
+3. 候选模型在生命周期锁外完整构造，包括 loader 调用的可选 post-load inference preparation；成功后才在同一
+   临界区替换模型并递增 generation。
 4. 加载失败不得改变当前模型或 generation。
 5. `open_session()` 只在锁内复制模型引用和 generation；实际计算不持有生命周期锁。一个请求始终使用同一
    session，reload 后旧 session 继续引用旧模型。
@@ -156,10 +163,14 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 37. `ExecutionOutput` 必须报告实际进入模型 forward 的 token 数；Engine 用它构造同一个已完成
     `StepObservation` 并显式交给 TTFT 控制器和 Observer。预测器失败应 fail-open，Observer 失败不得改变控制状态。
 38. self-resubmit 只能回滚撞墙者自己，不得挑选第三方 victim；Engine 保留已经可见的 token 历史，重算不得
-    重复发出旧 token，也不得让回滚凭空获得 aging。
+    重复发出旧 token，也不得让回滚凭空获得 aging。该策略必须强制开启 prefix cache，至少复用已经提交的完整
+    prompt 页。
 39. self-resubmit 必须有 strict fallback：达到次数或累计回滚进度阈值后，下一次准入领取 completion claim；
     整轮均无进展时最早回滚者也必须进入严格恢复路径。
-40. `PerformanceObserver` 只能接收请求生命周期、完成的 step 和 Scheduler/KV 不可变事实；它不得执行 I/O、修改
+40. 乐观 self-resubmit 准入默认只承诺 `prompt + 1 block`，并把新准入限制在全局 KV 容量的 90%；初始 claim 必须
+    与 completion claim 一起计入容量账本。该 10% 是只限制新准入的全局 decode 余量，不是每个请求的滚动 claim；
+    已经 running 的请求可以继续使用这部分余量，真正撞墙时再执行 self-resubmit。
+41. `PerformanceObserver` 只能接收请求生命周期、完成的 step 和 Scheduler/KV 不可变事实；它不得执行 I/O、修改
     运行时状态或按 architecture/模型尺寸分支。安全组合器必须在 observer 首次失败后停用它，且不得在 Engine
     热路径同步写日志或让指标故障改变推理结果。
     Prometheus/Grafana/HPA 表达必须留在控制面 adapter。

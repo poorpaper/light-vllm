@@ -40,12 +40,20 @@ class GenerateHttpRequest(BaseModel):
     input_ids: list[TokenId] = Field(min_length=1)
     max_new_tokens: Annotated[int, Field(strict=True, ge=1)] = 16
     eos_token_id: TokenId | None = None
+    max_tolerable_ttft_seconds: (
+        Annotated[
+            float,
+            Field(strict=True, gt=0, allow_inf_nan=False),
+        ]
+        | None
+    ) = None
 
     def to_contract(self) -> GenerateRequest:
         return GenerateRequest(
             input_ids=tuple(self.input_ids),
             max_new_tokens=self.max_new_tokens,
             eos_token_id=self.eos_token_id,
+            max_tolerable_ttft_seconds=self.max_tolerable_ttft_seconds,
         )
 
 
