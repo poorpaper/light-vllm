@@ -12,6 +12,7 @@ CASE=$3
 OUTPUT_DIR=$4
 PORT=${5:-8010}
 REQUEST_RATE=${6:-}
+HARNESS_ROOT=${HARNESS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 
 PYTHON=${PYTHON:-/root/autodl-tmp/conda-envs/vllm/bin/python}
 MODEL=${MODEL:-/root/autodl-tmp/models/Qwen2.5-Coder-7B-Instruct}
@@ -113,7 +114,7 @@ SERVER_ENV=(PYTHONPATH=${ROOT}/src)
 if [[ "$PROFILE_DETAIL" == off ]]; then
   LIGHT_ENTRY=("$PYTHON" -m light_vllm.entrypoints.http)
 else
-  LIGHT_ENTRY=("$PYTHON" benchmarks/remote_5090/profile_light_cpu_stages.py)
+  LIGHT_ENTRY=("$PYTHON" "$HARNESS_ROOT/benchmarks/remote_5090/profile_light_cpu_stages.py")
 fi
 LIGHT_COMMON=(
   "${LIGHT_ENTRY[@]}"
@@ -168,11 +169,11 @@ case "$MODE" in
       MAX_SEQS=4
     fi
     SERVER=(
-      bash benchmarks/remote_5090/launch_vllm.sh
+      bash "$HARNESS_ROOT/benchmarks/remote_5090/launch_vllm.sh"
       "$MODEL" "$KV_BYTES" none "$MAX_SEQS" 512 "$PORT"
     )
     SERVER_ENV=(
-      PYTHONPATH=${ROOT}/benchmarks/remote_5090/vllm_profile_hook:${ROOT}/src
+      PYTHONPATH=${HARNESS_ROOT}/benchmarks/remote_5090/vllm_profile_hook:${ROOT}/src
       VLLM_CPU_PROFILE_OUTPUT=${PROFILE_PREFIX}.{pid}.json
     )
     if [[ "$MODE" == vllm-eager ]]; then
@@ -213,7 +214,7 @@ run_case() {
     exit 2
   fi
   local arguments=(
-    "$PYTHON" benchmarks/remote_5090/serve_benchmark.py
+    "$PYTHON" "$HARNESS_ROOT/benchmarks/remote_5090/serve_benchmark.py"
     --backend "$BACKEND"
     --base-url "http://127.0.0.1:${PORT}"
     "${MODEL_ARGS[@]}"
