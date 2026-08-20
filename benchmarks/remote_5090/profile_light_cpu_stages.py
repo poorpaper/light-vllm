@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import atexit
 import json
 import os
@@ -10,16 +9,20 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from light_vllm.entrypoints import http as http_entrypoint
+from light_vllm.modeling.models.interfaces import ForwardBatch
 from light_vllm.runtime.engine import core as engine_core_module
 from light_vllm.runtime.engine.core import EngineCore
+from light_vllm.runtime.execution import worker as worker_module
 from light_vllm.runtime.execution.interfaces import ExecutionBatch, ExecutionRequest
 from light_vllm.runtime.execution.local import LocalModelExecutor
+from light_vllm.runtime.execution.paged_attention import PagedAttentionMetadata
+from light_vllm.runtime.execution.paged_cache import PagedKVCache
+from light_vllm.runtime.execution.triton_paged_attention import TritonPagedAttention
 from light_vllm.runtime.execution.worker import (
     LocalModelWorker,
     PagedStepHandler,
@@ -51,7 +54,9 @@ class _StageProfiler:
         self._active = False
         self._samples: dict[str, list[tuple[int, int]]] = defaultdict(list)
         self._executor_intervals: list[tuple[int, int]] = []
+        self._executor_records: list[tuple[int, int, int, int | None]] = []
         self._named_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        self._batch_shapes: list[tuple[int, int, int]] = []
         self._cuda_event_ns = 0
         self._reset_wall_ns = 0
         self._reset_process_cpu_ns = 0
@@ -64,11 +69,20 @@ class _StageProfiler:
         with self._lock:
             self._samples.clear()
             self._executor_intervals.clear()
+            self._executor_records.clear()
             self._named_intervals.clear()
+            self._batch_shapes.clear()
             self._cuda_event_ns = 0
             self._reset_wall_ns = time.perf_counter_ns()
             self._reset_process_cpu_ns = time.process_time_ns()
             self._active = True
+
+    def record_batch_shape(self, *, batch_size: int, query_width: int, model_tokens: int) -> None:
+        if not self._active:
+            return
+        with self._lock:
+            if self._active:
+                self._batch_shapes.append((batch_size, query_width, model_tokens))
 
     def record(
         self,
@@ -101,8 +115,14 @@ class _StageProfiler:
                 return
             self._samples["executor.execute"].append((finished_ns - started_ns, cpu_ns))
             self._executor_intervals.append((started_ns, finished_ns))
+            cuda_event_ns = (
+                round(cuda_event_seconds * 1_000_000_000)
+                if cuda_event_seconds is not None
+                else None
+            )
+            self._executor_records.append((started_ns, finished_ns, cpu_ns, cuda_event_ns))
             if cuda_event_seconds is not None:
-                self._cuda_event_ns += round(cuda_event_seconds * 1_000_000_000)
+                self._cuda_event_ns += cuda_event_ns or 0
 
     def dump(self) -> None:
         with self._lock:
@@ -113,7 +133,9 @@ class _StageProfiler:
             finished_process_cpu_ns = time.process_time_ns()
             samples = {name: list(values) for name, values in self._samples.items()}
             intervals = list(self._executor_intervals)
+            executor_records = list(self._executor_records)
             named_intervals = {name: list(values) for name, values in self._named_intervals.items()}
+            batch_shapes = list(self._batch_shapes)
             cuda_event_ns = self._cuda_event_ns
             reset_wall_ns = self._reset_wall_ns
             reset_process_cpu_ns = self._reset_process_cpu_ns
@@ -160,6 +182,46 @@ class _StageProfiler:
                 "inside_executor_ms": inside_ns / 1_000_000,
                 "outside_executor_ms": (total_ns - inside_ns) / 1_000_000,
             }
+        step_records = []
+        previous_finished_ns: int | None = None
+        for index, (started_ns, finished_ns, cpu_ns, cuda_ns) in enumerate(executor_records):
+            batch_size = query_width = model_tokens = None
+            if index < len(batch_shapes):
+                batch_size, query_width, model_tokens = batch_shapes[index]
+            step_records.append(
+                {
+                    "step_id": index,
+                    "start_ms": (started_ns - reset_wall_ns) / 1_000_000,
+                    "executor_wall_ms": (finished_ns - started_ns) / 1_000_000,
+                    "executor_thread_cpu_ms": cpu_ns / 1_000_000,
+                    "cuda_event_ms": cuda_ns / 1_000_000 if cuda_ns is not None else None,
+                    "previous_executor_gap_ms": (
+                        (started_ns - previous_finished_ns) / 1_000_000
+                        if previous_finished_ns is not None
+                        else None
+                    ),
+                    "batch_size": batch_size,
+                    "query_width": query_width,
+                    "model_tokens": model_tokens,
+                }
+            )
+            previous_finished_ns = finished_ns
+        raw_stages = {}
+        if self._detail == "full":
+            for name, values in samples.items():
+                stage_intervals = named_intervals.get(name, ())
+                raw_stages[name] = [
+                    {
+                        "start_ms": (
+                            (stage_intervals[index][0] - reset_wall_ns) / 1_000_000
+                            if index < len(stage_intervals)
+                            else None
+                        ),
+                        "wall_ms": wall_ns / 1_000_000,
+                        "thread_cpu_ms": cpu_ns / 1_000_000,
+                    }
+                    for index, (wall_ns, cpu_ns) in enumerate(values)
+                ]
         payload = {
             "argv": sys.argv,
             "detail": self._detail,
@@ -173,10 +235,43 @@ class _StageProfiler:
             "executor_host_residual_total_ms": (executor_wall_ns - cuda_event_ns) / 1_000_000,
             "inter_executor_gap_total_ms": (executor_span_ns - executor_wall_ns) / 1_000_000,
             "interval_overlap": interval_overlap,
+            "batch_shapes": _summarize_batch_shapes(batch_shapes),
+            "steps": step_records,
             "stages": stages,
+            "raw_stages": raw_stages,
         }
         self._output.parent.mkdir(parents=True, exist_ok=True)
         self._output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _summarize_batch_shapes(shapes: list[tuple[int, int, int]]) -> dict[str, object]:
+    if not shapes:
+        return {}
+    padded_tokens = sum(batch_size * query_width for batch_size, query_width, _ in shapes)
+    model_tokens = sum(model_tokens for _, _, model_tokens in shapes)
+    query_width_histogram: dict[str, int] = defaultdict(int)
+    batch_size_histogram: dict[str, int] = defaultdict(int)
+    for batch_size, query_width, _ in shapes:
+        query_width_histogram[str(query_width)] += 1
+        batch_size_histogram[str(batch_size)] += 1
+    return {
+        "steps": len(shapes),
+        "model_tokens": model_tokens,
+        "padded_tokens": padded_tokens,
+        "padding_factor": padded_tokens / model_tokens,
+        "padding_waste_percent": 100.0 * (padded_tokens - model_tokens) / padded_tokens,
+        "decode_width_one_steps": sum(query_width == 1 for _, query_width, _ in shapes),
+        "mixed_length_steps": sum(
+            model_tokens != batch_size * query_width
+            for batch_size, query_width, model_tokens in shapes
+        ),
+        "query_width_histogram": dict(
+            sorted(query_width_histogram.items(), key=lambda item: int(item[0]))
+        ),
+        "batch_size_histogram": dict(
+            sorted(batch_size_histogram.items(), key=lambda item: int(item[0]))
+        ),
+    }
 
 
 def _timed_sync(
@@ -207,6 +302,34 @@ def _timed_sync(
     setattr(owner, attribute, wrapped)
 
 
+def _timed_async(
+    profiler: _StageProfiler,
+    owner: Any,
+    attribute: str,
+    stage: str,
+) -> None:
+    original = getattr(owner, attribute)
+
+    @wraps(original)
+    async def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if not profiler.active:
+            return await original(*args, **kwargs)
+        wall_started = time.perf_counter_ns()
+        cpu_started = time.thread_time_ns()
+        try:
+            return await original(*args, **kwargs)
+        finally:
+            wall_finished = time.perf_counter_ns()
+            profiler.record(
+                stage,
+                wall_finished - wall_started,
+                time.thread_time_ns() - cpu_started,
+                started_ns=wall_started,
+            )
+
+    setattr(owner, attribute, wrapped)
+
+
 def _install(profiler: _StageProfiler, *, detail: str) -> None:
     stages = [
         (TokenBudgetScheduler, "schedule", "scheduler.schedule"),
@@ -222,12 +345,47 @@ def _install(profiler: _StageProfiler, *, detail: str) -> None:
         stages.extend(
             (
                 (TokenBudgetScheduler, "complete", "scheduler.complete"),
+                (
+                    TokenBudgetScheduler,
+                    "_classify_waiting_requests",
+                    "scheduler.classify_waiting",
+                ),
+                (
+                    TokenBudgetScheduler,
+                    "_admit_waiting_requests",
+                    "scheduler.admit_waiting",
+                ),
+                (
+                    TokenBudgetScheduler,
+                    "_schedule_admitted_requests",
+                    "scheduler.schedule_admitted",
+                ),
+                (
+                    TokenBudgetScheduler,
+                    "_schedule_request",
+                    "scheduler.schedule_request",
+                ),
                 (LocalModelWorker, "execute", "worker.execute"),
                 (StandardDecodeHandler, "execute", "decode_handler.execute"),
                 (PagedStepHandler, "forward", "paged_step.forward"),
                 (GreedySampler, "sample", "sampler.sample"),
                 (ExecutionRequest, "__post_init__", "execution_request.validate"),
                 (ExecutionBatch, "__post_init__", "execution_batch.validate"),
+                (ForwardBatch, "__post_init__", "forward_batch.validate"),
+                (PagedAttentionMetadata, "__post_init__", "paged_metadata.validate"),
+                (
+                    PagedAttentionMetadata,
+                    "validate_block_tables",
+                    "paged_metadata.validate_block_tables",
+                ),
+                (PagedAttentionMetadata, "slot_mapping", "paged_metadata.slot_mapping"),
+                (
+                    PagedAttentionMetadata,
+                    "visibility_tensor",
+                    "paged_metadata.visibility_tensor",
+                ),
+                (TritonPagedAttention, "__init__", "triton_attention.create"),
+                (PagedKVCache, "prepare_write", "paged_cache.prepare_write"),
                 (
                     InMemoryPerformanceObserver,
                     "scheduler_updated",
@@ -240,11 +398,28 @@ def _install(profiler: _StageProfiler, *, detail: str) -> None:
                 ),
             )
         )
+
+    original_paged_forward = PagedStepHandler.forward
+
+    @wraps(original_paged_forward)
+    def profiled_paged_forward(self: PagedStepHandler, model: Any, batch: Any) -> Any:
+        if profiler.active:
+            query_lengths = [len(request.query_token_ids) for request in batch.requests]
+            profiler.record_batch_shape(
+                batch_size=len(query_lengths),
+                query_width=max(query_lengths),
+                model_tokens=sum(query_lengths),
+            )
+        return original_paged_forward(self, model, batch)
+
+    PagedStepHandler.forward = profiled_paged_forward
     for owner, attribute, stage in stages:
         _timed_sync(profiler, owner, attribute, stage)
+    _timed_async(profiler, EngineCore, "_execute_batch", "engine.executor_future_total")
 
     _timed_sync(profiler, engine_core_module, "_validated_output", "engine.validate_output")
     if detail == "full":
+        _timed_sync(profiler, worker_module, "_forward", "worker.model_forward")
         _timed_sync(profiler, serving_http_module, "_encode_event", "http.encode_event")
 
     original_execute = LocalModelExecutor.execute
@@ -265,30 +440,6 @@ def _install(profiler: _StageProfiler, *, detail: str) -> None:
         return output
 
     LocalModelExecutor.execute = profiled_execute
-
-    original_to_thread: Callable[..., Any] = asyncio.to_thread
-
-    @wraps(original_to_thread)
-    async def profiled_to_thread(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-        is_executor = getattr(func, "__name__", None) == "execute" and isinstance(
-            getattr(func, "__self__", None), LocalModelExecutor
-        )
-        if not profiler.active or not is_executor:
-            return await original_to_thread(func, *args, **kwargs)
-        wall_started = time.perf_counter_ns()
-        cpu_started = time.thread_time_ns()
-        try:
-            return await original_to_thread(func, *args, **kwargs)
-        finally:
-            wall_finished = time.perf_counter_ns()
-            profiler.record(
-                "engine.to_thread_total",
-                wall_finished - wall_started,
-                time.thread_time_ns() - cpu_started,
-                started_ns=wall_started,
-            )
-
-    asyncio.to_thread = profiled_to_thread
 
 
 def main() -> None:

@@ -128,6 +128,8 @@ def _install() -> None:
     from vllm.v1.executor.uniproc_executor import AsyncOutputFuture, UniProcExecutor
 
     output = Path(raw_output.format(pid=os.getpid()))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.with_suffix(".pid").write_text(str(os.getpid()), encoding="utf-8")
     profiler = _Profiler(output)
     for owner, attribute, stage in (
         (Scheduler, "schedule", "scheduler.schedule"),
