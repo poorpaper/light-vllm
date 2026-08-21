@@ -1,0 +1,502 @@
+{
+  "scope": {
+    "input_root": "D:\\light-vllm\\benchmarks\\remote_5090\\results\\2026-08-21-driver-sampler-staging",
+    "rates_req_s": [
+      2,
+      4,
+      6,
+      8
+    ],
+    "modes": [
+      "light-strict",
+      "vllm-eager",
+      "vllm-default"
+    ],
+    "formal_runs_per_point": 3,
+    "excluded": [
+      "warmup",
+      "profile"
+    ],
+    "aggregation": "Throughput and SLO goodput are medians of three formal runs. TTFT quantiles pool the 192 successful requests from those runs."
+  },
+  "matrix": [
+    {
+      "rate_req_s": 2,
+      "mode": "light-strict",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        202.29755626459323,
+        202.3779525554399,
+        202.37302162875042
+      ],
+      "throughput_tok_s_median": 202.37302162875042,
+      "ttft_ms": {
+        "p50": 24.58792249672115,
+        "p90": 32.380502158775926,
+        "p95": 37.90104130748659,
+        "p99": 52.141235689632595
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 193.32831294156875,
+        "100": 202.37302162875042,
+        "200": 202.37302162875042
+      },
+      "throughput_vs_vllm_eager": 0.9997016346448836
+    },
+    {
+      "rate_req_s": 2,
+      "mode": "vllm-eager",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        202.24031079293627,
+        202.43600544499472,
+        202.4334207482194
+      ],
+      "throughput_tok_s_median": 202.4334207482194,
+      "ttft_ms": {
+        "p50": 32.60387177579105,
+        "p90": 39.82976959086955,
+        "p95": 46.15593301132321,
+        "p99": 51.94351880811155
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 186.56765207700138,
+        "100": 202.4334207482194,
+        "200": 202.4334207482194
+      },
+      "throughput_vs_vllm_eager": 1.0
+    },
+    {
+      "rate_req_s": 2,
+      "mode": "vllm-default",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        202.34992267842233,
+        202.3360010307738,
+        202.331552338908
+      ],
+      "throughput_tok_s_median": 202.3360010307738,
+      "ttft_ms": {
+        "p50": 45.5596677493304,
+        "p90": 56.2919851858169,
+        "p95": 64.6000876557082,
+        "p99": 76.16575116757305
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 148.59819980563407,
+        "100": 202.3360010307738,
+        "200": 202.3360010307738
+      },
+      "throughput_vs_vllm_eager": 0.9995187567493277
+    },
+    {
+      "rate_req_s": 4,
+      "mode": "light-strict",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        399.36744743871895,
+        398.4040250480862,
+        398.3909890368112
+      ],
+      "throughput_tok_s_median": 398.4040250480862,
+      "ttft_ms": {
+        "p50": 26.068512117490172,
+        "p90": 34.568468295037746,
+        "p95": 40.48183450940995,
+        "p99": 53.22726292535663
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 380.5763267642043,
+        "100": 398.4040250480862,
+        "200": 398.4040250480862
+      },
+      "throughput_vs_vllm_eager": 0.9956830154334567
+    },
+    {
+      "rate_req_s": 4,
+      "mode": "vllm-eager",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        400.0431661337481,
+        400.1313860663241,
+        400.24155556942975
+      ],
+      "throughput_tok_s_median": 400.1313860663241,
+      "ttft_ms": {
+        "p50": 33.31957943737507,
+        "p90": 42.122863931581385,
+        "p95": 46.84110556263473,
+        "p99": 57.069546421989806
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 358.8005214686823,
+        "100": 400.1313860663241,
+        "200": 400.1313860663241
+      },
+      "throughput_vs_vllm_eager": 1.0
+    },
+    {
+      "rate_req_s": 4,
+      "mode": "vllm-default",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        399.6876863801964,
+        399.6271632989248,
+        399.39679209534523
+      ],
+      "throughput_tok_s_median": 399.6271632989248,
+      "ttft_ms": {
+        "p50": 45.793857192620635,
+        "p90": 63.20953560061754,
+        "p95": 68.55077741201967,
+        "p99": 72.6100552501157
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 273.72808545548185,
+        "100": 399.6271632989248,
+        "200": 399.6271632989248
+      },
+      "throughput_vs_vllm_eager": 0.9987398569945829
+    },
+    {
+      "rate_req_s": 6,
+      "mode": "light-strict",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        516.1143474366303,
+        520.3121212992185,
+        520.7007725424236
+      ],
+      "throughput_tok_s_median": 520.3121212992185,
+      "ttft_ms": {
+        "p50": 28.980179922655225,
+        "p90": 43.633076827973134,
+        "p95": 50.56111013982442,
+        "p99": 61.94271051790566
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 495.0374441267119,
+        "100": 520.3121212992185,
+        "200": 520.3121212992185
+      },
+      "throughput_vs_vllm_eager": 0.9280137937976438
+    },
+    {
+      "rate_req_s": 6,
+      "mode": "vllm-eager",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        560.6728313487483,
+        560.819462038482,
+        560.503000695363
+      ],
+      "throughput_tok_s_median": 560.6728313487483,
+      "ttft_ms": {
+        "p50": 35.68299487233162,
+        "p90": 45.52324810065329,
+        "p95": 49.9198807403445,
+        "p99": 67.64592595864087
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 533.2760117076324,
+        "100": 560.6728313487483,
+        "200": 560.6728313487483
+      },
+      "throughput_vs_vllm_eager": 1.0
+    },
+    {
+      "rate_req_s": 6,
+      "mode": "vllm-default",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        554.1070558811256,
+        554.9054538078564,
+        556.1470005300563
+      ],
+      "throughput_tok_s_median": 554.9054538078564,
+      "ttft_ms": {
+        "p50": 48.53549739345908,
+        "p90": 72.31125999242067,
+        "p95": 75.88107127230614,
+        "p99": 84.53226367011666
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 352.0407636814016,
+        "100": 554.9054538078564,
+        "200": 554.9054538078564
+      },
+      "throughput_vs_vllm_eager": 0.9897134706402341
+    },
+    {
+      "rate_req_s": 8,
+      "mode": "light-strict",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        601.3939659352947,
+        601.4009834001031,
+        600.7624271062265
+      ],
+      "throughput_tok_s_median": 601.3939659352947,
+      "ttft_ms": {
+        "p50": 28.54907000437379,
+        "p90": 44.335660710930824,
+        "p95": 52.361795771867016,
+        "p99": 68.04246024228632
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 569.8208434902949,
+        "100": 601.3939659352947,
+        "200": 601.3939659352947
+      },
+      "throughput_vs_vllm_eager": 0.9206219737022673
+    },
+    {
+      "rate_req_s": 8,
+      "mode": "vllm-eager",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        653.2474599935932,
+        653.8716312435489,
+        653.1194049898555
+      ],
+      "throughput_tok_s_median": 653.2474599935932,
+      "ttft_ms": {
+        "p50": 38.00231497734785,
+        "p90": 49.342177622020245,
+        "p95": 54.714488866738975,
+        "p99": 66.0649633500725
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 578.8025176773288,
+        "100": 653.2474599935932,
+        "200": 653.2474599935932
+      },
+      "throughput_vs_vllm_eager": 1.0
+    },
+    {
+      "rate_req_s": 8,
+      "mode": "vllm-default",
+      "formal_runs": 3,
+      "pooled_successful_requests": 192,
+      "successful_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "requested_requests_per_run": [
+        64,
+        64,
+        64
+      ],
+      "all_requests_successful": true,
+      "throughput_tok_s_runs": [
+        651.7234208613443,
+        656.9006589724023,
+        648.0166169992368
+      ],
+      "throughput_tok_s_median": 651.7234208613443,
+      "ttft_ms": {
+        "p50": 46.0920559708029,
+        "p90": 61.824327055364854,
+        "p95": 70.28602210339159,
+        "p99": 77.90203250944614
+      },
+      "slo_goodput_tok_s_median": {
+        "50": 323.8358260356846,
+        "100": 651.7234208613443,
+        "200": 651.7234208613443
+      },
+      "throughput_vs_vllm_eager": 0.9976669803932129
+    }
+  ],
+  "profiles": {
+    "rows": [
+      {
+        "label": "Light decode W1",
+        "kind": "light",
+        "steps": 921,
+        "service_ms": 12.5434461422367,
+        "executor_ms": 11.213263798045602,
+        "cuda_ms": 11.181248,
+        "gap_ms": 1.3301823441910967
+      },
+      {
+        "label": "Light mixed",
+        "kind": "light",
+        "steps": 59,
+        "service_ms": 17.501776677966102,
+        "executor_ms": 15.89896038983051,
+        "cuda_ms": 15.865022406779662,
+        "gap_ms": 1.6028162881355932
+      },
+      {
+        "label": "vLLM eager overall",
+        "kind": "vllm",
+        "steps": 1091,
+        "service_ms": 10.532538985334556,
+        "executor_ms": 7.693483391184572,
+        "cuda_ms": null,
+        "gap_ms": 0.20490720458715594
+      },
+      {
+        "label": "vLLM default overall",
+        "kind": "vllm",
+        "steps": 1066,
+        "service_ms": 10.886289183864916,
+        "executor_ms": 3.2324446390977446,
+        "cuda_ms": null,
+        "gap_ms": 0.23993106009389673
+      }
+    ],
+    "sources": {
+      "light": {
+        "available": true,
+        "path": "D:\\light-vllm\\benchmarks\\remote_5090\\results\\2026-08-21-driver-sampler-staging\\final-profiles\\light\\light-strict-normal-loaded-profile-stages.json",
+        "definition": "Light service is mean executor wall plus the mean gap immediately before the classified step. Mixed means query_width > 1 and batch_size > 1."
+      },
+      "vllm": {
+        "vllm-eager": {
+          "available": true,
+          "path": "D:\\light-vllm\\benchmarks\\remote_5090\\results\\2026-08-21-driver-sampler-staging\\final-profiles\\vllm-eager\\vllm-eager-normal-loaded-profile.23992.json"
+        },
+        "vllm-default": {
+          "available": true,
+          "path": "D:\\light-vllm\\benchmarks\\remote_5090\\results\\2026-08-21-driver-sampler-staging\\final-profiles\\vllm-default\\vllm-default-normal-loaded-profile.25598.json"
+        },
+        "limitation": "The vLLM hook reports aggregate engine/executor wall time only. It does not record per-step query shape or a CUDA-event duration, so mixed/decode and CUDA are unavailable."
+      }
+    }
+  }
+}
