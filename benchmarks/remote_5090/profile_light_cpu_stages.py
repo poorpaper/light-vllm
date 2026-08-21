@@ -73,7 +73,11 @@ class _StageProfiler:
     def __init__(self, output: Path, *, detail: str) -> None:
         self._output = output
         self._detail = detail
-        self._lock = threading.Lock()
+        # SIGUSR1/SIGUSR2 handlers run on the main Python thread and can interrupt
+        # a profiler record call while it owns this lock.  The handlers call
+        # reset()/dump() synchronously, so a non-reentrant lock can self-deadlock
+        # and leave the requested profile file unwritten.
+        self._lock = threading.RLock()
         self._active = False
         self._samples: dict[str, list[tuple[int, int]]] = defaultdict(list)
         self._executor_intervals: list[tuple[int, int]] = []
