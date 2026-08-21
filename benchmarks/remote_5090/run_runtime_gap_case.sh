@@ -118,10 +118,7 @@ backend = sys.argv[2]
 paths = (
     [Path(f"{prefix}-stages.json")]
     if backend == "light-vllm"
-    else [
-        Path(f"{prefix}.{Path(path).read_text(encoding='utf-8').strip()}.json")
-        for path in glob.glob(f"{prefix}.*.pid")
-    ]
+    else [Path(path) for path in glob.glob(f"{prefix}.*.json")]
 )
 if not paths or not all(path.is_file() and path.stat().st_size for path in paths):
     raise SystemExit(1)
