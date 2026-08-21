@@ -20,6 +20,7 @@ WORKLOAD_DIR=${WORKLOAD_DIR:-/root/autodl-tmp/light-vllm-results/workloads}
 REPLAY_REFERENCE=${REPLAY_REFERENCE:-/root/autodl-tmp/light-vllm-results/preemption-latest-20260820/replay-reference.json}
 PROFILE_DETAIL=${PROFILE_DETAIL:-full}
 RUNS=${RUNS:-3}
+SHORT_REQUEST_RESERVED_SEQUENCES=${SHORT_REQUEST_RESERVED_SEQUENCES:-}
 SERVER_PREFIX=${MODE}-${CASE}
 LOG=${OUTPUT_DIR}/${SERVER_PREFIX}-server.log
 
@@ -171,6 +172,15 @@ LIGHT_COMMON=(
   --max-pending-requests off
   --ttft-kv-cache-watermark off
 )
+if [[ -n "$SHORT_REQUEST_RESERVED_SEQUENCES" ]]; then
+  LIGHT_COMMON+=(
+    --short-request-max-effective-prompt-tokens 256
+    --short-request-max-total-tokens 2048
+    --short-request-reserved-scheduled-tokens 256
+    --short-request-reserved-kv-token-slots 2047
+    --short-request-reserved-sequences "$SHORT_REQUEST_RESERVED_SEQUENCES"
+  )
+fi
 
 case "$MODE" in
   light-strict)
@@ -307,6 +317,7 @@ BENCHMARK_CASE="$CASE" \
 BENCHMARK_MODEL="$MODEL" \
 BENCHMARK_KV_TOKENS="$KV_TOKENS" \
 BENCHMARK_MAX_SEQS="$MAX_SEQS" \
+BENCHMARK_SHORT_REQUEST_RESERVED_SEQUENCES="$SHORT_REQUEST_RESERVED_SEQUENCES" \
 "$PYTHON" - <<'PY' >"${OUTPUT_DIR}/${SERVER_PREFIX}-environment.json"
 import hashlib
 import json
@@ -335,6 +346,11 @@ print(json.dumps({
     "case": os.environ.get("BENCHMARK_CASE"),
     "kv_tokens": int(os.environ["BENCHMARK_KV_TOKENS"]),
     "max_num_sequences": int(os.environ["BENCHMARK_MAX_SEQS"]),
+    "short_request_reserved_sequences": (
+        int(os.environ["BENCHMARK_SHORT_REQUEST_RESERVED_SEQUENCES"])
+        if os.environ["BENCHMARK_SHORT_REQUEST_RESERVED_SEQUENCES"]
+        else None
+    ),
     "model": os.environ["BENCHMARK_MODEL"],
     "model_config_sha256": hashlib.sha256(
         (Path(os.environ["BENCHMARK_MODEL"]) / "config.json").read_bytes()
