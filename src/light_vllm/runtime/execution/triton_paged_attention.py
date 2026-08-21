@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from torch import Tensor
 
@@ -172,64 +170,6 @@ else:
     _paged_attention_kernel = None
 
 
-@dataclass(frozen=True, slots=True)
-class _TritonBatchTensors:
-    """一次传输 batch 整数元数据，再以 view 暴露各段。"""
-
-    storage: Tensor
-    block_tables: Tensor
-    num_computed_tokens: Tensor
-    query_lengths: Tensor
-    query_start_loc: Tensor
-    request_indices: Tensor
-
-    @classmethod
-    def create(
-        cls,
-        metadata: PagedAttentionMetadata,
-        *,
-        device: torch.device,
-    ) -> _TritonBatchTensors:
-        batch_size = metadata.batch_size
-        max_blocks = max(len(table) for table in metadata.block_tables)
-        query_lengths = metadata.query_lengths
-        query_start_loc = metadata.query_start_loc
-
-        values: list[int] = []
-        for table in metadata.block_tables:
-            values.extend(table)
-            values.extend((0,) * (max_blocks - len(table)))
-        values.extend(metadata.num_computed_tokens)
-        values.extend(query_lengths)
-        values.extend(query_start_loc)
-        for request_index, query_length in enumerate(query_lengths):
-            values.extend((request_index,) * query_length)
-
-        storage = torch.tensor(values, dtype=torch.int32, device=device)
-        cursor = 0
-        block_table_size = batch_size * max_blocks
-        block_tables = storage[cursor : cursor + block_table_size].view(
-            batch_size,
-            max_blocks,
-        )
-        cursor += block_table_size
-        num_computed_tokens = storage[cursor : cursor + batch_size]
-        cursor += batch_size
-        packed_query_lengths = storage[cursor : cursor + batch_size]
-        cursor += batch_size
-        packed_query_start_loc = storage[cursor : cursor + batch_size + 1]
-        cursor += batch_size + 1
-        request_indices = storage[cursor:]
-        return cls(
-            storage=storage,
-            block_tables=block_tables,
-            num_computed_tokens=num_computed_tokens,
-            query_lengths=packed_query_lengths,
-            query_start_loc=packed_query_start_loc,
-            request_indices=request_indices,
-        )
-
-
 class TritonPagedAttention:
     """先写本轮 K/V，再用 Triton 融合完成分页 attention。"""
 
@@ -250,13 +190,32 @@ class TritonPagedAttention:
             num_blocks=config.num_blocks,
             block_size=config.block_size,
         )
-        # 这些 batch 事实供所有 attention 层复用；连续打包可减少小额 H2D 提交。
-        self._batch_tensors = _TritonBatchTensors.create(metadata, device=config.device)
-        self._block_tables = self._batch_tensors.block_tables
-        self._num_computed_tokens = self._batch_tensors.num_computed_tokens
-        self._query_lengths = self._batch_tensors.query_lengths
-        self._query_start_loc = self._batch_tensors.query_start_loc
-        self._request_indices = self._batch_tensors.request_indices
+        max_blocks = max(len(table) for table in metadata.block_tables)
+        padded_tables = tuple(
+            table + (0,) * (max_blocks - len(table)) for table in metadata.block_tables
+        )
+        # 这些 batch 事实供所有 attention 层复用，不在每层重复创建 GPU tensor。
+        self._block_tables = torch.tensor(
+            padded_tables,
+            dtype=torch.int32,
+            device=config.device,
+        )
+        self._num_computed_tokens = torch.tensor(
+            metadata.num_computed_tokens,
+            dtype=torch.int32,
+            device=config.device,
+        )
+        self._query_lengths = torch.tensor(
+            metadata.query_lengths,
+            dtype=torch.int32,
+            device=config.device,
+        )
+        self._query_start_loc = torch.tensor(
+            metadata.query_start_loc,
+            dtype=torch.int32,
+            device=config.device,
+        )
+        self._request_indices = metadata.request_indices_tensor(device=config.device)
         self._max_sequence_length = max(
             computed + query_length
             for computed, query_length in zip(
