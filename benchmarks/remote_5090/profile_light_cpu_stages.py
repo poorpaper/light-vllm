@@ -73,10 +73,8 @@ class _StageProfiler:
     def __init__(self, output: Path, *, detail: str) -> None:
         self._output = output
         self._detail = detail
-        # SIGUSR1/SIGUSR2 handlers run on the main Python thread and can interrupt
-        # a profiler record call while it owns this lock.  The handlers call
-        # reset()/dump() synchronously, so a non-reentrant lock can self-deadlock
-        # and leave the requested profile file unwritten.
+        # Signal handlers can interrupt a profiler record call on the main thread.
+        # Keep reset reentrant, while the heavier dump runs on a helper thread.
         self._lock = threading.RLock()
         self._active = False
         self._samples: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -494,7 +492,14 @@ def main() -> None:
         profiler.reset()
 
     def dump_profile(_signum: int, _frame: Any) -> None:
-        profiler.dump()
+        # JSON aggregation can take seconds for a full trace.  Returning from the
+        # signal handler first keeps the asyncio server responsive and avoids doing
+        # lock acquisition, allocation, and filesystem I/O in signal context.
+        threading.Thread(
+            target=profiler.dump,
+            name="light-vllm-profile-dump",
+            daemon=True,
+        ).start()
 
     signal.signal(signal.SIGUSR1, reset_profile)
     signal.signal(signal.SIGUSR2, dump_profile)
