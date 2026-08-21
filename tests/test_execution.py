@@ -30,6 +30,7 @@ from light_vllm.runtime.execution import (
     LocalModelWorker,
     LocalTokenExecutor,
     ModelStepBatch,
+    ModelStepOutput,
     NGramChainProposer,
     PagedKVCacheConfig,
     RequestOutput,
@@ -652,9 +653,50 @@ def test_contiguous_step_can_resume_after_a_speculative_suffix_is_rejected() -> 
     second = linear_model_step_request(
         _execution_request("request", (3,), 1, None, max_output_tokens=0)
     )
-    logits = step.forward(model, ModelStepBatch((second,)))
+    output = step.forward(model, ModelStepBatch((second,)))
 
-    assert logits[0].shape == (0, model.vocab_size)
+    assert output.request_logits(0).shape == (0, model.vocab_size)
+
+
+def test_model_step_output_keeps_empty_request_slices() -> None:
+    logits = torch.zeros((2, 5))
+    output = ModelStepOutput(logits, (0, 1, 1, 2))
+
+    assert output.num_requests == 3
+    assert output.request_logits(0).shape == (1, 5)
+    assert output.request_logits(1).shape == (0, 5)
+    assert output.request_logits(2).shape == (1, 5)
+
+
+def test_standard_decode_samples_the_packed_logits_without_restacking() -> None:
+    logits = torch.tensor([[0.0, 2.0, 1.0], [3.0, 0.0, 1.0]])
+    model_output = ModelStepOutput(logits, (0, 1, 2))
+
+    class Step:
+        def forward(self, model, batch):
+            return model_output
+
+    class RecordingSampler:
+        seen = None
+
+        def sample(self, value):
+            self.seen = value
+            return (1, 0)
+
+    sampler = RecordingSampler()
+    output = StandardDecodeHandler(sampler).execute(
+        None,
+        ExecutionBatch(
+            requests=(
+                _execution_request("first", (1,), 0, None),
+                _execution_request("second", (2,), 0, None),
+            )
+        ),
+        Step(),
+    )
+
+    assert sampler.seen is logits
+    assert tuple(request.output_token_ids for request in output.requests) == ((1,), (0,))
 
 
 @pytest.mark.parametrize(

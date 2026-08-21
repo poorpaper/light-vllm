@@ -8,6 +8,7 @@ from light_vllm.runtime.execution import (
     ExecutionRequest,
     GreedyTreeAcceptanceSampler,
     ModelStepBatch,
+    ModelStepOutput,
     NGramChainProposer,
     NGramTrieProposer,
     SpeculativeDecodeHandler,
@@ -162,7 +163,7 @@ class _TargetStep:
         self.verification_batch: ModelStepBatch | None = None
         self.compacted: tuple[str, tuple[int, ...]] | None = None
 
-    def forward(self, model, batch: ModelStepBatch) -> tuple[torch.Tensor, ...]:
+    def forward(self, model, batch: ModelStepBatch) -> ModelStepOutput:
         self.verification_batch = batch
         request = batch.requests[0]
         assert request.logit_query_indices == tuple(
@@ -174,7 +175,7 @@ class _TargetStep:
         logits = torch.zeros((len(self._target_token_ids), 16))
         for offset, token_id in enumerate(self._target_token_ids):
             logits[offset, token_id] = 1
-        return (logits,)
+        return ModelStepOutput(logits, (0, len(self._target_token_ids)))
 
     def compact(self, request, retained_query_indices: tuple[int, ...]) -> int:
         self.compacted = (request.request_id, retained_query_indices)

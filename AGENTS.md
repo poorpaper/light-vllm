@@ -52,7 +52,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   不进入 step 延迟样本。
 - Decode Handler 通过 `ModelStepRequest` 精确声明要消费 logits 的 query 行，Step Handler 把选择传入
   `ForwardBatch`；普通生成只投影每个请求的最后有效行，纯 prefill 不执行 vocabulary head，投机验证只投影
-  正式输入最后一行和草稿节点行。
+  正式输入最后一行和草稿节点行。`ModelStepOutput` 保留连续 logits 及其请求边界，普通采样不得先按请求切开再
+  `stack` 回同一矩阵。
 - `ExecutionRequest` 的完整 `context_token_ids` 快照只为草稿 proposer 物化；普通执行只携带本轮
   `input_token_ids`，不得在每个 decode step 复制和校验完整历史。
 - `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
@@ -146,6 +147,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 25. `ForwardBatch.positions` 表示请求内绝对位置；连续与分页 Step Handler 都必须显式生成，模型不得从批次形态猜测。
     `input_ids`、`positions` 和 attention Q/K/V 必须使用 token-major 一维布局；`query_start_loc` 必须从 0 开始、
     严格递增并以总 query token 数结束。不得在模型热路径重新引入 `[batch, max_query_width]` padding。
+    `ModelStepOutput.logits_start_loc` 允许空请求切片，但必须覆盖连续 logits 的全部行。
 26. 使用外部 KV 的模型必须声明 `ModelKVCacheSpec`；连续和分页 Step Handler 都从该规格初始化物理缓存，不再接受
     第二份层数、KV head 数或 head size 配置。
 27. `blocks` 必须装配 `PagedKVCacheManager + PagedStepHandler`，`unbounded` 必须装配

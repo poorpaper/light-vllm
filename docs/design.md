@@ -116,11 +116,12 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ExecutionBatch` | Engine 从请求状态切出的本轮真实 token；只有草稿 proposer 需要时才附带完整 token history 快照 |
 | `DraftTree` / `QueryLayout` | 有界候选父链，以及一次 model step 的 query 依赖事实 |
 | `ModelStepRequest` / `ModelStepBatch` | Decode Handler 已确定的 query、reservation、布局、block table 和待消费 logits 行 |
+| `ModelStepOutput` | 连续的已请求 logits，以及允许空切片的请求边界 |
 | `ExecutionOutput` | 每轮请求结果、实际进入模型 forward 的 token 数和可选设备耗时 |
 | `RequestOutput` | 每请求完成的输入计算量、零到多个确认输出与已缓存输出前缀 |
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
 | `ModelWorker` | 一个设备 rank 内固定模型版本并编排请求生命周期 |
-| `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回每请求有效 logits |
+| `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回连续有效 logits 与请求边界 |
 | `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
 | `Sampler` | 从二维 `[batch, vocabulary]` logits 选择 token |
 | `ForwardBatch` / `ModelOutput` | 一维 token 流、请求边界、绝对 position、attention 上下文与对应 logits 的统一模型边界 |
@@ -139,7 +140,8 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和投机验证因此共用同一循环。Decode Handler 还精确
 声明本轮会消费哪些 query 行的 logits：普通生成只选择每个请求最后一个有效输入，纯 prefill 选择空集，投机验证
 选择正式输入最后一行和全部草稿节点。模型在 vocabulary head 前收窄 hidden states，避免先对无用 query 行
-投影再由 Worker 丢弃。
+投影再由 Worker 丢弃。Step Handler 不把连续结果拆成请求 tensor；普通 Decode Handler 直接对这块矩阵采样，
+投机 Decode Handler 才按 `ModelStepOutput.logits_start_loc` 取各请求的验证切片。
 
 原生 Qwen family 模型也使用这组契约：`qwen2` 与 `qwen2.5` 注册名指向同一个 factory，官方 Qwen2.5
 checkpoint 仍声明 `model_type: qwen2`，3B 等模型尺寸只来自 `config.json`，不会进入 runner 的分发逻辑。
@@ -181,7 +183,7 @@ sequenceDiagram
     A-->>M: attended states
     M-->>H: logits
     H->>H: finalize physical KV updates
-    H-->>D: per-request logits
+    H-->>D: packed logits + request boundaries
     D->>P: sample(target logits)
     P-->>D: token IDs
     D->>H: compact(accepted query path, speculative only)

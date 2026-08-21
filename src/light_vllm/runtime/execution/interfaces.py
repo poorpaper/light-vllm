@@ -318,6 +318,39 @@ class ModelStepBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelStepOutput:
+    """一次模型步骤的连续 logits，以及按请求切分它的边界。"""
+
+    logits: Tensor
+    logits_start_loc: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.logits.ndim != 2:
+            raise ValueError("model step logits must have shape [rows, vocabulary]")
+        starts = tuple(self.logits_start_loc)
+        if (
+            len(starts) < 2
+            or starts[0] != 0
+            or starts[-1] != self.logits.shape[0]
+            or any(type(index) is not int for index in starts)
+            or any(left > right for left, right in zip(starts, starts[1:], strict=False))
+        ):
+            raise ValueError("logits_start_loc must cover every logits row in request order")
+        object.__setattr__(self, "logits_start_loc", starts)
+
+    @property
+    def num_requests(self) -> int:
+        return len(self.logits_start_loc) - 1
+
+    def request_logits(self, request_index: int) -> Tensor:
+        if type(request_index) is not int or not 0 <= request_index < self.num_requests:
+            raise IndexError("model step request index is out of range")
+        start = self.logits_start_loc[request_index]
+        end = self.logits_start_loc[request_index + 1]
+        return self.logits[start:end]
+
+
+@dataclass(frozen=True, slots=True)
 class RequestOutput:
     """一个请求本轮算完了多少输入，以及最终确认了哪些新 token。
 
@@ -443,8 +476,8 @@ class ModelStepHandler(Protocol):
         self,
         model: ModelSession,
         batch: ModelStepBatch,
-    ) -> tuple[Tensor, ...]:
-        """返回每个请求有效位置的 ``[query, vocabulary]`` logits。"""
+    ) -> ModelStepOutput:
+        """返回连续 logits，并保留按请求切分所需的边界。"""
 
         ...
 

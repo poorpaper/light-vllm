@@ -359,19 +359,16 @@ class SpeculativeDecodeHandler:
             )
 
         model_batch = ModelStepBatch(tuple(model_requests))
-        logits_by_request = step.forward(model, model_batch)
-        if len(logits_by_request) != len(batch.requests):
+        model_output = step.forward(model, model_batch)
+        if model_output.num_requests != len(batch.requests):
             raise ExecutionError("model step must return one logits tensor per request")
 
         results: list[RequestOutput] = []
         observations: list[SpeculativeDecodeObservation] = []
-        for request, model_request, draft, logits in zip(
-            batch.requests,
-            model_requests,
-            drafts_by_request,
-            logits_by_request,
-            strict=True,
+        for row, (request, model_request, draft) in enumerate(
+            zip(batch.requests, model_requests, drafts_by_request, strict=True)
         ):
+            logits = model_output.request_logits(row)
             logit_query_indices = model_request.logit_query_indices
             if logit_query_indices is None:
                 raise ExecutionError("speculative decode must select target logits rows")

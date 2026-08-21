@@ -28,6 +28,7 @@ from light_vllm.runtime.execution.interfaces import (
     ExecutionOutput,
     ModelStepBatch,
     ModelStepHandler,
+    ModelStepOutput,
     ModelStepRequest,
     RequestOutput,
 )
@@ -95,9 +96,10 @@ class ContiguousStepHandler:
         self,
         model: ModelSession,
         batch: ModelStepBatch,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> ModelStepOutput:
         # 连续缓存按请求独立存放，因此逐请求前向，不为凑 batch 改变缓存布局。
         logits: list[torch.Tensor] = []
+        logits_start_loc = [0]
         for request in batch.requests:
             if request.block_ids is not None:
                 raise ExecutionError("contiguous model step does not accept a block table")
@@ -146,7 +148,9 @@ class ContiguousStepHandler:
             except KVCacheError as exc:
                 raise ExecutionError(str(exc)) from exc
             logits.append(output.logits)
-        return tuple(logits)
+            logits_start_loc.append(logits_start_loc[-1] + output.logits.shape[0])
+        packed_logits = logits[0] if len(logits) == 1 else torch.cat(logits, dim=0)
+        return ModelStepOutput(packed_logits, tuple(logits_start_loc))
 
     def compact(
         self,
@@ -210,7 +214,7 @@ class PagedStepHandler:
         self,
         model: ModelSession,
         batch: ModelStepBatch,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> ModelStepOutput:
         for request in batch.requests:
             if request.block_ids is None:
                 raise ExecutionError("paged model step requires a block table for every request")
@@ -262,12 +266,10 @@ class PagedStepHandler:
         expected_layers = frozenset(layer.layer_id for layer in self._cache.model_spec.layers)
         if attention.layer_ids != expected_layers:
             raise ExecutionError("model did not execute every configured paged attention layer")
-        logits_by_request: list[torch.Tensor] = []
-        start = 0
+        logits_start_loc = [0]
         for count in requested_logits_per_request:
-            logits_by_request.append(output.logits[start : start + count])
-            start += count
-        return tuple(logits_by_request)
+            logits_start_loc.append(logits_start_loc[-1] + count)
+        return ModelStepOutput(output.logits, tuple(logits_start_loc))
 
     def compact(
         self,
@@ -311,16 +313,14 @@ class StandardDecodeHandler:
         model_step = ModelStepBatch(
             requests=tuple(linear_model_step_request(request) for request in batch.requests)
         )
-        logits_by_request = step.forward(model, model_step)
+        model_output = step.forward(model, model_step)
         # 即使本轮不采样，也必须完成已调度输入的模型计算和 KV 写入。
-        if len(logits_by_request) != len(batch.requests):
+        if model_output.num_requests != len(batch.requests):
             raise ExecutionError("model step must return one logits tensor per request")
-        for request, model_request, logits in zip(
-            batch.requests,
-            model_step.requests,
-            logits_by_request,
-            strict=True,
+        for row, (request, model_request) in enumerate(
+            zip(batch.requests, model_step.requests, strict=True)
         ):
+            logits = model_output.request_logits(row)
             expected_logits = 1 if request.max_output_tokens else 0
             if (
                 model_request.logit_query_indices is None
@@ -335,12 +335,8 @@ class StandardDecodeHandler:
         ]
         sampled: dict[int, int] = {}
         if sampling_rows:
-            # 只取最后一个有效 query 的 logits，它预测该请求的下一个 token。
-            sample_logits: list[torch.Tensor] = []
-            for row in sampling_rows:
-                logits = logits_by_request[row]
-                sample_logits.append(logits[-1])
-            sampled_ids = self._sampler.sample(torch.stack(sample_logits))
+            # 模型已经按请求顺序只投影需要采样的行，直接消费连续结果。
+            sampled_ids = self._sampler.sample(model_output.logits)
             sampled = dict(zip(sampling_rows, sampled_ids, strict=True))
 
         # 把“算了多少输入”和“确认了哪些输出”作为事实返回给 Engine。
