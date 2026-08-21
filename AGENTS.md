@@ -23,7 +23,9 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   兼容目录共用 `SafetensorsModelLoader`，不进入 Runner 或 Worker 分支。loader 在权重就绪后调用可选的模型自有
   `prepare_for_inference()` hook；Qwen 用它准备打包权重和 RoPE table。
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
-- `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流。
+- `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流；每次至多保留一个不可变
+  `PreparedStep` 在模型侧执行。上一轮结果、执行结束状态和下一轮计划在同一个锁区原子推进，并只发布一次稳定
+  Scheduler 快照。
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode；可选短请求策略同时预留
   scheduled token、KV token slot 和 sequence，首 token 后回到通用 round-robin，常规请求用真实 waiting step aging。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
@@ -195,7 +197,9 @@ reference 的请求不占用 worker thread，并让同步 iterator 的创建、`
 
 `EngineCore` 的异步锁保护请求状态、Scheduler 状态和 driver 生命周期。模型执行发生在锁外；执行前通过
 Executor lease 固定物理资源，取消只标记释放，tensor 等 lease 退出后再销毁。正在执行的分页请求被取消时，
-Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边界。
+Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边界。锁外只传递 `PreparedStep` 与
+`CompletedStep` 事实；lease 释放后，Engine 在一个锁区内完成上一轮提交并准备下一轮，不允许 Executor 或
+Observer 反向修改请求和 Scheduler 状态。
 
 `TTFTAdmission` 是控制组件：在 Engine 锁内读取一次 Scheduler 快照做准入，在 step 完成后消费真实延迟；
 `PerformanceObserver` 只记录同一事实。投机细节通过独立 `SpeculationObserver` 端口上报，包括候选/命中节点、

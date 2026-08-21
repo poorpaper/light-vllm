@@ -199,6 +199,11 @@ sequenceDiagram
     E->>O: visible tokens / outcome / SchedulerStats
 ```
 
+Engine 每次只允许一个 `PreparedStep` 在模型侧执行。它在锁内完成 schedule、构造不可变 `ExecutionBatch` 并取得
+lease，锁外等待 Executor；设备越过安全边界并释放 lease 后，再在一个锁区内提交上一轮 `CompletedStep`、应用可见
+token 并准备下一轮。这个单在途状态机让取消与 KV 所有权保持明确，同时把相邻轮次的 finish、apply、schedule 和
+Scheduler 快照收敛成一次原子状态推进。
+
 执行失败时 Engine 移除本轮请求。连续 Step Handler 的请求级 tensor 由 lease 延迟销毁；分页页池是进程级全局
 资源，执行中的请求取消时由 Scheduler 把 block ID 延迟到安全边界后归还，防止物理页被过早复用。
 不会出现逻辑状态已经前进但模型 K/V 没有成功写入的半提交状态。

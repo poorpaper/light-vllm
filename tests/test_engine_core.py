@@ -290,6 +290,35 @@ def test_observer_failure_does_not_change_generation_or_leak_resources() -> None
     asyncio.run(run())
 
 
+def test_engine_publishes_one_scheduler_snapshot_per_state_boundary() -> None:
+    class RecordingStatsObserver(InMemoryPerformanceObserver):
+        def __init__(self) -> None:
+            super().__init__("test-model")
+            self.scheduler_states: list[tuple[int, int]] = []
+
+        def scheduler_updated(self, stats) -> None:
+            self.scheduler_states.append((stats.waiting_requests, stats.running_requests))
+            super().scheduler_updated(stats)
+
+    async def run() -> None:
+        observer = RecordingStatsObserver()
+        engine = _engine(RecordingExecutor(), performance_observer=observer)
+        try:
+            result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=2))
+
+            assert result.generated_token_ids == (2, 3)
+            assert observer.scheduler_states == [
+                (1, 0),
+                (0, 1),
+                (0, 1),
+                (0, 0),
+            ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
     async def run() -> None:
         executor = RecordingExecutor()

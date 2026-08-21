@@ -253,6 +253,14 @@ class _StageProfiler:
                 "inside_executor_ms": inside_ns / 1_000_000,
                 "outside_executor_ms": (total_ns - inside_ns) / 1_000_000,
             }
+        future_intervals = named_intervals.get("engine.executor_future_total", ())
+        boundary_totals_ns = {
+            "event_loop_resume": 0,
+            "control_path": 0,
+            "next_dispatch": 0,
+        }
+        boundary_gap_ns = 0
+        boundary_steps = 0
         step_records = []
         previous_finished_ns: int | None = None
         for index, (started_ns, finished_ns, cpu_ns, cuda_ns) in enumerate(executor_records):
@@ -262,6 +270,40 @@ class _StageProfiler:
             scheduler_shape = (
                 scheduler_shapes[index] if index < len(scheduler_shapes) else (None,) * 4
             )
+            future_started_ns = future_finished_ns = None
+            if index < len(future_intervals):
+                future_started_ns, future_finished_ns = future_intervals[index]
+
+            next_future_started_ns = next_executor_started_ns = None
+            if index + 1 < len(executor_records) and index + 1 < len(future_intervals):
+                next_future_started_ns = future_intervals[index + 1][0]
+                next_executor_started_ns = executor_records[index + 1][0]
+
+            dispatch_ns = started_ns - future_started_ns if future_started_ns is not None else None
+            event_loop_resume_ns = (
+                future_finished_ns - finished_ns if future_finished_ns is not None else None
+            )
+            control_path_ns = (
+                next_future_started_ns - future_finished_ns
+                if next_future_started_ns is not None and future_finished_ns is not None
+                else None
+            )
+            next_dispatch_ns = (
+                next_executor_started_ns - next_future_started_ns
+                if next_executor_started_ns is not None and next_future_started_ns is not None
+                else None
+            )
+            if (
+                event_loop_resume_ns is not None
+                and control_path_ns is not None
+                and next_dispatch_ns is not None
+            ):
+                boundary_totals_ns["event_loop_resume"] += event_loop_resume_ns
+                boundary_totals_ns["control_path"] += control_path_ns
+                boundary_totals_ns["next_dispatch"] += next_dispatch_ns
+                boundary_gap_ns += next_executor_started_ns - finished_ns
+                boundary_steps += 1
+
             step_records.append(
                 {
                     "step_id": index,
@@ -273,6 +315,25 @@ class _StageProfiler:
                         (started_ns - previous_finished_ns) / 1_000_000
                         if previous_finished_ns is not None
                         else None
+                    ),
+                    "future_start_ms": (
+                        (future_started_ns - reset_wall_ns) / 1_000_000
+                        if future_started_ns is not None
+                        else None
+                    ),
+                    "submit_to_worker_start_ms": (
+                        dispatch_ns / 1_000_000 if dispatch_ns is not None else None
+                    ),
+                    "worker_finish_to_event_loop_resume_ms": (
+                        event_loop_resume_ns / 1_000_000
+                        if event_loop_resume_ns is not None
+                        else None
+                    ),
+                    "event_loop_resume_to_next_submit_ms": (
+                        control_path_ns / 1_000_000 if control_path_ns is not None else None
+                    ),
+                    "next_submit_to_worker_start_ms": (
+                        next_dispatch_ns / 1_000_000 if next_dispatch_ns is not None else None
                     ),
                     "batch_size": batch_size,
                     "query_width": query_width,
@@ -312,6 +373,19 @@ class _StageProfiler:
             "executor_cuda_event_total_ms": cuda_event_ns / 1_000_000,
             "executor_host_residual_total_ms": (executor_wall_ns - cuda_event_ns) / 1_000_000,
             "inter_executor_gap_total_ms": (executor_span_ns - executor_wall_ns) / 1_000_000,
+            "inter_executor_gap_breakdown": {
+                "definition": (
+                    "For each worker-to-worker gap: current worker finish to event-loop "
+                    "resume, event-loop control path to the next submit, and next submit "
+                    "to worker start. The first dispatch and final resume are outside the "
+                    "executor span."
+                ),
+                "steps": boundary_steps,
+                "covered_gap_total_ms": boundary_gap_ns / 1_000_000,
+                "event_loop_resume_total_ms": (boundary_totals_ns["event_loop_resume"] / 1_000_000),
+                "control_path_total_ms": boundary_totals_ns["control_path"] / 1_000_000,
+                "next_dispatch_total_ms": boundary_totals_ns["next_dispatch"] / 1_000_000,
+            },
             "interval_overlap": interval_overlap,
             "batch_shapes": _summarize_batch_shapes(batch_shapes),
             "steps": step_records,
