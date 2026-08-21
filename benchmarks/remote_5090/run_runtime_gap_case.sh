@@ -64,6 +64,13 @@ configure_case() {
     exit 2
     ;;
   esac
+  if [[ -n "${WARMUP_LIMIT_OVERRIDE:-}" ]]; then
+    if [[ ! "$WARMUP_LIMIT_OVERRIDE" =~ ^[1-9][0-9]*$ ]]; then
+      echo "WARMUP_LIMIT_OVERRIDE must be a positive integer" >&2
+      exit 2
+    fi
+    WARMUP_LIMIT=$WARMUP_LIMIT_OVERRIDE
+  fi
 }
 
 if [[ "$CASE" == runtime ]]; then
