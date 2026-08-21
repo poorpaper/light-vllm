@@ -236,11 +236,12 @@ def _plot_policy(summary: dict[str, Any], output: Path) -> None:
         median["rollback_events"] = (
             median["counters"]["light_resubmits"] + median["counters"]["vllm_preemptions"]
         )
-    figure, axes = plt.subplots(1, 4, figsize=(19, 5.2))
+    figure, axes = plt.subplots(1, 5, figsize=(23, 5.2))
     _bar_panel(axes[0], records, "success_percent", "Success rate (%)")
     _bar_panel(axes[1], records, "output_tokens_per_s", "Output throughput (tok/s)")
-    _bar_panel(axes[2], records, "max_itl_p95_s", "Max ITL p95 (ms)", scale=1000)
-    _bar_panel(axes[3], records, "rollback_events", "Rollback / preemption events")
+    _bar_panel(axes[2], records, "ttft_p95_s", "TTFT p95 (ms)", scale=1000)
+    _bar_panel(axes[3], records, "max_itl_p95_s", "Max ITL p95 (ms)", scale=1000)
+    _bar_panel(axes[4], records, "rollback_events", "Rollback / preemption events")
     figure.suptitle("4096-token KV pressure under Poisson arrivals: policy trade-off")
     figure.tight_layout(rect=(0, 0, 1, 0.92))
     figure.savefig(output, dpi=180)
