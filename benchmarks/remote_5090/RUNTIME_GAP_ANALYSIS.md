@@ -138,9 +138,19 @@ vLLM 先调度 running 请求并按本轮 token 数调用 `allocate_slots()`。�
 | 缺 CUDA Graph 是 eager 对比差距 | **不成立** | 匹配的 vLLM eager 对照也关闭 graph。vLLM default 会另列，不能把 graph 收益归因给 scheduler。 |
 | self-resubmit 丢失已输出 token | **不属实** | Engine 的可见 token history 不会清空或重复发送；归零的是 KV computed 进度，代价是重算。 |
 
-## 4. 当前分支修复与实验门槛
+## 4. 最终实验配置
 
-分支：`codex/runtime-gap-profile-and-fix`。
+分支：`codex/runtime-gap-profile-and-fix`。运行时基线为 `fbf20da`，最终候选运行时代码为 `9b4d91c`；后续提交只改分析脚本和图。
+
+两组实验回答不同问题，不能混在一起解释：
+
+- **raw runtime 组**给足 `32768` KV tokens，并同时关闭 prefix cache、TTFT admission、speculation；要求 Light
+  self-resubmit/pause 和 vLLM preemption 都为 0。这组只看模型执行与 runtime，不让调度政策事件污染数据。
+- **policy 压力组**把 KV 降到 `4096` tokens，以固定 seed 的 ShareGPT replay 和 Poisson `8 req/s` 触发容量竞争，
+  比较 Light strict、Light self-resubmit、vLLM default preempt16，以及用并发上限 4 避免抢占的 vLLM 内控。
+
+两组都使用 RTX 5090、Qwen2.5-Coder-7B-Instruct/BF16、block size 16、单步 token budget 512；每个模式独立
+warm-up 后跑 3 轮，表中取逐指标中位数。正常负载是主结论，固定 `B=16,W=1` 只作热路径 micro-profile。
 
 已实现：
 
@@ -148,17 +158,120 @@ vLLM 先调度 running 请求并按本轮 token 数调用 `allocate_slots()`。�
 2. 普通线性 Triton attention 跳过 `[B,W,W]` visibility；tree 路径保持显式矩阵；
 3. last-token/selected-row logits，在 vocabulary head 前裁剪；
 4. CUDA positions 范围检查改为异步 assertion，避免热路径 host sync；
-5. CPU 全量 pytest、ruff、format、`git diff --check` 已通过。
+5. 修复 profiler 的 signal dump、区间重叠统计和 vLLM CPU stage hook，使 normal mixed step 能按形状归因。
 
-GPU 实验必须满足：
+### 4.1 raw runtime：政策事件为 0 时仍有差距
 
-- 同一模型快照、BF16、block size 16、`max_num_sequences=16`、token budget 512；
-- raw runtime 对比双方 prefix/TTFT/speculation 全关；
-- vLLM eager 与 default 分开，不能把 CUDA Graph 收益算到调度；
-- 正常 ShareGPT replay 使用 Poisson 2 rps 与一个两边都无回滚的 loaded rate；
-- policy 压力组使用 Poisson 而非 burst，单列 Light strict、Light optimistic、vLLM preempt16 和 vLLM 低并发零抢占内控；
-- 每个模式 warmup 后 3 轮；逐轮保留 JSON、Prometheus before/after、server log、profile、argv 和 git SHA；
-- CUDA 数值测试必须同时覆盖 linear 和 tree visibility，输出请求数/长度必须一致。
+![政策影响关闭后的运行时对比](results/2026-08-21-runtime-gap-final/analysis/runtime_gap.png)
 
-在这些数据完成前，可以确认“固定 decode 的剩余差距主要不是 kernel 执行时间”，但不能把正常 mixed workload 的全部
-差距提前归因给 CPU，也不能声称当前三个修复已经缩小了端到端差距。
+| 场景 | Light 基线 | Light 修复后 | vLLM eager | vLLM graph |
+| --- | ---: | ---: | ---: | ---: |
+| 固定 B16/W1 service step | 13.29 ms | 13.36 ms | 10.89 ms | 10.77 ms |
+| 正常 2 req/s TTFT P95 | 218.25 ms | 129.42 ms | 45.00 ms | 63.93 ms |
+| 正常 2 req/s max ITL P95 | 213.41 ms | 150.43 ms | 27.23 ms | 32.95 ms |
+| loaded 8 req/s output throughput | 475.40 tok/s | **500.76 tok/s** | 652.90 tok/s | 647.52 tok/s |
+| loaded 8 req/s TTFT P95 | 2190.30 ms | **1519.80 ms** | 54.11 ms | 69.84 ms |
+| loaded 8 req/s TPOT P95 | 45.15 ms | **40.37 ms** | 11.30 ms | 11.85 ms |
+
+2 req/s 下约 202 tok/s 的观测吞吐由到达速率限制，不能拿来排最大吞吐。8 req/s loaded 下，修复把 Light 吞吐提高
+`5.3%`，TTFT P95 降低 `30.6%`，但仍比 vLLM eager 少 `23.3%` 吞吐，TPOT P95 约为其 `3.6` 倍。固定
+`W=1` 没有改善，说明本轮收益来自 mixed/prefill 浪费的减少，不是 ordinary decode kernel 变快。
+
+vLLM eager 与 graph 的差别很小，且 loaded 下 graph 还略慢。因此 **缺 CUDA Graph 不是 Light 对 vLLM eager
+差距的解释**；它是后续可做的优化，不是当前根因。
+
+### 4.2 policy 压力：非抢占换连续性，抢占换 TTFT/吞吐
+
+![容量压力下的调度政策取舍](results/2026-08-21-runtime-gap-final/analysis/policy_tradeoff.png)
+
+| 模式 | 成功率 | 吞吐 | TTFT P95 | max ITL P95 | 中位控制事件 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Light strict | 100% | 396.68 tok/s | 8.142 s | 0.236 s | 0 |
+| Light self-resubmit | 100% | 466.63 tok/s | 3.405 s | 0.729 s | 5 次，回滚 1984 tokens |
+| vLLM default preempt16 | 100% | **610.10 tok/s** | **0.731 s** | 0.588 s | 17 次抢占 |
+| vLLM cap4 | 100% | 361.83 tok/s | 10.015 s | **0.034 s** | 0 |
+
+这张图确实能说明非抢占的价值，但不能说明 Light 总体性能更好：
+
+- Light strict 不回滚已运行请求，所以流内连续性优于 Light self-resubmit 和 vLLM preempt16；代价是新请求长时间排队，
+  TTFT 最差。
+- vLLM preempt16 通过 17 次 victim preemption 得到最高吞吐和最低 TTFT，但被抢占请求出现更长 token gap。
+- vLLM cap4 不是“关闭抢占开关”，而是用更低并发使抢占不发生。它的 max ITL 最好，TTFT 和吞吐最差，独立验证了
+  “保运行连续性，就会把等待推给新请求”这一普遍取舍。
+- Light self-resubmit 位于两者之间，但它会释放自己的 KV 并重算。已经输出给用户的 token 不会丢；损失的是 KV 进度和
+  流内连续性。
+
+### 4.3 `--max-tolerable-ttft-seconds 1.25` 的独立结果
+
+raw runtime 组故意关闭 TTFT gate；否则 429 会改变 offered work，吞吐差异就不能归到 runtime。按照单独的用户可见
+SLO 实验开启 `--max-tolerable-ttft-seconds 1.25` 后，结果如下：
+
+![1.25 秒预测 TTFT 准入的服务取舍](results/2026-08-21-ttft125-comparison/comparison.png)
+
+- 2 req/s 下四组中位均 64/64 完成，Light optimistic TTFT P95 为 0.186 s，vLLM default 为 0.067 s；
+- 8 req/s 下 Light optimistic 中位完成 60/64，拒绝 4 个请求，交付 91.3% offered tokens，TTFT P95 1.79 s，
+  goodput 428.44 tok/s；
+- 同组 vLLM 没有 admission SLO，64/64 完成，TTFT P95 1.33 s，goodput 603.88 tok/s；
+- Light strict 即使拒绝中位 27/64，已接纳请求 TTFT P95 仍为 5.44 s。
+
+所以 1.25 秒是**准入预测阈值**，不是首 token 的硬 deadline。它对 optimistic 有用，但以 429 和少交付 token 为代价；
+strict completion claim 的真实等待没有被当前 token-only predictor 表达，不能靠继续调小秒数解决。
+
+## 5. normal-loaded CPU/GPU 明细与最终根因
+
+| Light profile 指标 | 基线 | 修复后 |
+| --- | ---: | ---: |
+| Executor wall / step | 18.276 ms | 17.074 ms |
+| CUDA-event window / step | 18.244 ms | 17.041 ms |
+| Executor 外部 gap / step | 1.467 ms | 1.454 ms |
+| Scheduler / step | 0.242 ms | 0.218 ms |
+| Build batch / step | 0.150 ms | 0.135 ms |
+| Validate + apply / step | 0.417 ms | 0.382 ms |
+| mixed padded Executor P50 | 69.518 ms | **62.489 ms** |
+| decode W1 Executor P50 | 11.486 ms | 11.387 ms |
+
+这些 stage 是嵌套墙钟，尤其 `model_forward` 与 `sampler` 会因为 GPU 同步点移动而互相转移时间，**不能相加**。CUDA-event
+window 也包含 stream idle、kernel launch 间隙和 H2D，并不等于纯 kernel sum。
+
+vLLM eager 的 normal-loaded 轻量 profile 为：engine step 10.342 ms、execute_model 7.639 ms、future wait wall
+2.098 ms（thread CPU 仅 0.026 ms）、sampler 0.436 ms、scheduler 0.095 ms、update 0.049 ms；相邻 engine step gap
+只有 0.204 ms。Light 的 executor 外 gap 为 1.454 ms，单是 driver topology 就多约 `1.25 ms/step`。
+
+结合固定 W1 trace，可以把结论说得更精确：
+
+1. **不是“损失基本都是 kernel 本体”。** 固定 W1 下 Light kernel sum 10.592 ms，vLLM eager 10.742 ms，Light
+   还短 0.150 ms；但 service step 慢 3.376 ms。
+2. **不是 CUDA launch 次数太多。** 固定 W1 下 Light 324 launches/step，vLLM 383，Light 更少。真正的问题是
+   Python/driver 工作、H2D 和 launch 之间的空洞，以及下一步 CPU prepare 不能和当前步 GPU 重叠。
+3. **normal mixed 的 GPU 浪费仍真实存在。** 最终 profile 中 81.9% padded token position 是填充；mixed step P50
+   62.489 ms，而 decode W1 只有 11.387 ms。`[B,W]` padded 布局仍是下一项最高价值 GPU 改造，合理方向是
+   varlen/flatten，而不是继续微调 W1 attention kernel。
+4. **本轮修复有效但不是终点。** linear visibility 和 selected-row logits 缩短 mixed step；没有改变 padded 主布局，也
+   没有把 Engine 改成 double buffer，所以不能抹平 vLLM 差距。
+
+## 6. 一次重要的失败与修正
+
+第一版 linear visibility fast path 把 `QUERY_WIDTH` 声明成 Triton `constexpr`。正常负载中每遇到新宽度就编译一个新
+kernel：profile 捕获到 `W=35` 单步 507.7 ms、`W=34` 单步 301 ms，直接把 TTFT/ITL 拖到秒级。最终实现改为三维
+grid，让 query offset 成为 runtime program axis，不再按宽度特化；RTX 5090 的 linear/tree 数值测试随后全部通过。
+
+这个过程也解释了为什么固定 B16/W1 microbenchmark 不够：它只有一个宽度，看不到真实生产混合形状中的首次编译风暴。
+
+## 7. 输出完整性边界
+
+所有正式轮次请求数、成功数和 replay 输出长度均完全匹配：normal 每轮 64/64、7514 tokens；fixed 每轮 16/16、8192
+tokens；没有连接、HTTP 或长度错误。RTX 5090 上 linear/tree attention、selected logits、普通与投机执行测试均通过。
+
+但不能宣称跨实现逐 token bitwise 一致。进一步复核发现，基线 Light 自己重复跑固定 B16/W1 时，16 条 512-token 输出
+也没有一条整段完全相同；最终 Light 也一样。vLLM 重复跑更稳定，但长生成仍有分叉。这说明当前 BF16/Triton 生成路径
+存在数值/批次相关的贪心分叉，且不是本轮修复单独引入。性能结论只在“请求完整、输出长度一致、greedy 服务成功”的
+边界内成立；逐 token 确定性应作为独立 correctness 事项继续追踪。
+
+## 8. 最终判断
+
+- 非抢占不是吞吐卖点；它的卖点是 **running request 不因容量压力被回滚，token 流更连续**。必须同时展示更差的 TTFT
+  和吞吐，结论才完整。
+- Light 当前落后 vLLM 不是一个单独 kernel：固定 W1 的主要损失在串行 driver/stream bubbles，normal mixed 还叠加
+  padded `[B,W]` 浪费。
+- 下一步优先级应是 `varlen/flatten → driver double-buffer/overlap → 再评估 CUDA Graph`。completion claim、TTFT
+  predictor 与 self-resubmit 的改进属于调度控制面，不能代替执行层优化。
