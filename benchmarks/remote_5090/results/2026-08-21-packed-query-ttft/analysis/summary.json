@@ -641,6 +641,21 @@
       "executor_cuda_event_total_ms": 14270.090094,
       "inter_executor_gap_total_ms": 1173.63631,
       "inter_executor_gap_mean_ms": 1.4106205649038464,
+      "remaining_step_breakdown": {
+        "service_ms": 18.597129359375,
+        "executor_ms": 17.186508794471152,
+        "cuda_event_ms": 17.15155059375,
+        "executor_host_residual_ms": 0.034958200721153077,
+        "driver_gap_ms": 1.4106205649038464,
+        "sampler_ms": 3.9956743353365383,
+        "step_handler_ms": 13.009683798076924,
+        "model_forward_ms": 12.274038491586538,
+        "step_handler_outside_model_ms": 0.7356453064903867,
+        "schedule_ms": 0.2192265997596154,
+        "build_batch_ms": 0.1343635264423077,
+        "apply_output_ms": 0.3546348617788461,
+        "publish_stats_ms": 0.04825131257014591
+      },
       "batch_shapes": {
         "steps": 832,
         "model_tokens": 13308,
@@ -741,6 +756,21 @@
       "executor_cuda_event_total_ms": 11346.39379,
       "inter_executor_gap_total_ms": 1454.170156,
       "inter_executor_gap_mean_ms": 1.4868815501022494,
+      "remaining_step_breakdown": {
+        "service_ms": 13.123318561349693,
+        "executor_ms": 11.636437011247443,
+        "cuda_event_ms": 11.60162964212679,
+        "executor_host_residual_ms": 0.034807369120652965,
+        "driver_gap_ms": 1.4868815501022494,
+        "sampler_ms": 0.6061674938650307,
+        "step_handler_ms": 10.859690530674847,
+        "model_forward_ms": 10.224725153374232,
+        "step_handler_outside_model_ms": 0.634965377300615,
+        "schedule_ms": 0.22309353783231084,
+        "build_batch_ms": 0.13400122494887526,
+        "apply_output_ms": 0.35586765337423315,
+        "publish_stats_ms": 0.04988649662487946
+      },
       "batch_shapes": {
         "execution_layout": "token-major",
         "steps": 978,
@@ -1140,6 +1170,91 @@
     "vllm_preemptions": [
       0.0
     ]
+  },
+  "timer_sync_ab": {
+    "groups": {
+      "current": {
+        "throughput": {
+          "values": [
+            1205.88834645937,
+            1202.158521517208,
+            1201.7241047678062
+          ],
+          "min": 1201.7241047678062,
+          "median": 1202.158521517208,
+          "max": 1205.88834645937
+        },
+        "tpot_p50_ms": {
+          "values": [
+            13.16325265072184,
+            13.224283993287914,
+            13.176153859109007
+          ],
+          "min": 13.16325265072184,
+          "median": 13.176153859109007,
+          "max": 13.224283993287914
+        },
+        "success": [
+          {
+            "requests": 16,
+            "successful": 16,
+            "failed": 0
+          },
+          {
+            "requests": 16,
+            "successful": 16,
+            "failed": 0
+          },
+          {
+            "requests": 16,
+            "successful": 16,
+            "failed": 0
+          }
+        ]
+      },
+      "wall": {
+        "throughput": {
+          "values": [
+            1204.875358145584,
+            1204.5652759732698,
+            1163.1019135236265
+          ],
+          "min": 1163.1019135236265,
+          "median": 1204.5652759732698,
+          "max": 1204.875358145584
+        },
+        "tpot_p50_ms": {
+          "values": [
+            13.186716202577237,
+            13.170358345346298,
+            13.627857643265255
+          ],
+          "min": 13.170358345346298,
+          "median": 13.186716202577237,
+          "max": 13.627857643265255
+        },
+        "success": [
+          {
+            "requests": 16,
+            "successful": 16,
+            "failed": 0
+          },
+          {
+            "requests": 16,
+            "successful": 16,
+            "failed": 0
+          },
+          {
+            "requests": 16,
+            "successful": 16,
+            "failed": 0
+          }
+        ]
+      }
+    },
+    "throughput_delta_percent": 0.20020275304659663,
+    "tpot_delta_percent": 0.08016256929883614,
+    "order_recheck_throughput": 1212.9009313167996
   },
   "archive_sha256": "379a82e4ecf4012ae600452fabfb13d44f3691d0ca7746f14e199e4d081ff6ab",
   "raw_manifest_files": 388

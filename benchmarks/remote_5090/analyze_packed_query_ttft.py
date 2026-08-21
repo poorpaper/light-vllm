@@ -5,12 +5,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import statistics
 from collections.abc import Callable
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+import matplotlib
+import numpy as np
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib import font_manager, ticker  # noqa: E402
+from matplotlib.axes import Axes  # noqa: E402
+from matplotlib.figure import Figure  # noqa: E402
 
 RATES = (2, 4, 6, 8)
 COLORS = {
@@ -99,14 +106,40 @@ def _profile_summary(path: Path, *, packed: bool) -> dict[str, object]:
     )
     decode = _step_category(profile, lambda step: int(step["query_width"]) == 1)
     mixed["executed_positions"] = mixed["model_tokens"] if packed else mixed["legacy_positions"]
+    stages = profile.get("stages", {})
+
+    def stage_mean(name: str) -> float:
+        stage = stages.get(name, {})  # type: ignore[union-attr]
+        return float(stage.get("wall_mean_ms", 0.0))  # type: ignore[union-attr]
+
+    steps = int(profile["executor_steps"])
+    service_step_ms = float(profile["executor_span_ms"]) / steps
+    executor_step_ms = float(profile["executor_wall_total_ms"]) / steps
+    cuda_step_ms = float(profile["executor_cuda_event_total_ms"]) / steps
+    gap_step_ms = float(profile["inter_executor_gap_total_ms"]) / steps
     return {
-        "executor_steps": int(profile["executor_steps"]),
+        "executor_steps": steps,
         "executor_span_ms": float(profile["executor_span_ms"]),
         "executor_wall_total_ms": float(profile["executor_wall_total_ms"]),
         "executor_cuda_event_total_ms": float(profile["executor_cuda_event_total_ms"]),
         "inter_executor_gap_total_ms": float(profile["inter_executor_gap_total_ms"]),
-        "inter_executor_gap_mean_ms": float(profile["inter_executor_gap_total_ms"])
-        / int(profile["executor_steps"]),
+        "inter_executor_gap_mean_ms": gap_step_ms,
+        "remaining_step_breakdown": {
+            "service_ms": service_step_ms,
+            "executor_ms": executor_step_ms,
+            "cuda_event_ms": cuda_step_ms,
+            "executor_host_residual_ms": executor_step_ms - cuda_step_ms,
+            "driver_gap_ms": gap_step_ms,
+            "sampler_ms": stage_mean("sampler.sample"),
+            "step_handler_ms": stage_mean("paged_step.forward"),
+            "model_forward_ms": stage_mean("worker.model_forward"),
+            "step_handler_outside_model_ms": stage_mean("paged_step.forward")
+            - stage_mean("worker.model_forward"),
+            "schedule_ms": stage_mean("scheduler.schedule"),
+            "build_batch_ms": stage_mean("engine.build_batch"),
+            "apply_output_ms": stage_mean("engine.apply_output"),
+            "publish_stats_ms": stage_mean("engine.publish_scheduler_stats"),
+        },
         "batch_shapes": profile["batch_shapes"],
         "mixed": mixed,
         "decode_w1": decode,
@@ -151,55 +184,106 @@ def _metric_values(path: Path, metric_prefix: str) -> list[float]:
     return values
 
 
-def _font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def _timer_sync_ab(result_root: Path) -> dict[str, object] | None:
+    """读取可选的固定解码计时器消融；主实验包不依赖这组补测。"""
+    root = result_root / "timer-ab"
+    if not root.is_dir():
+        return None
+
+    groups: dict[str, object] = {}
+    for label in ("current", "wall"):
+        runs = [
+            _json(root / label / f"r{index}.json")
+            for index in (1, 2, 3)
+            if (root / label / f"r{index}.json").is_file()
+        ]
+        if len(runs) != 3:
+            return None
+        groups[label] = {
+            "throughput": _series(runs, "output_tokens_per_s"),
+            "tpot_p50_ms": _series(runs, "tpot_p50_s", 1000.0),
+            "success": [
+                {
+                    "requests": int(summary["requests"]),
+                    "successful": int(summary["successful_requests"]),
+                    "failed": int(summary["failed_requests"]),
+                }
+                for summary in _summaries(runs)
+            ],
+        }
+
+    current = groups["current"]  # type: ignore[assignment]
+    wall = groups["wall"]  # type: ignore[assignment]
+    current_throughput = float(current["throughput"]["median"])
+    wall_throughput = float(wall["throughput"]["median"])
+    current_tpot = float(current["tpot_p50_ms"]["median"])
+    wall_tpot = float(wall["tpot_p50_ms"]["median"])
+    return {
+        "groups": groups,
+        "throughput_delta_percent": (wall_throughput / current_throughput - 1.0) * 100.0,
+        "tpot_delta_percent": (wall_tpot / current_tpot - 1.0) * 100.0,
+        "order_recheck_throughput": (
+            float(_json(root / "current-recheck" / "r1.json")["summary"]["output_tokens_per_s"])
+            if (root / "current-recheck" / "r1.json").is_file()
+            else None
+        ),
+    }
+
+
+def _configure_matplotlib() -> None:
+    """为本地离线绘图选择中文字体，不把字体文件写入结果目录。"""
     candidates = (
-        Path("C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc"),
+        Path("C:/Windows/Fonts/msyh.ttc"),
         Path("C:/Windows/Fonts/simhei.ttf"),
     )
+    family = "DejaVu Sans"
     for path in candidates:
         if path.exists():
-            return ImageFont.truetype(str(path), size)
-    return ImageFont.load_default()
+            font_manager.fontManager.addfont(path)
+            family = font_manager.FontProperties(fname=path).get_name()
+            break
+    plt.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": [family, "DejaVu Sans"],
+            "axes.unicode_minus": False,
+            "axes.edgecolor": COLORS["text"],
+            "axes.labelcolor": COLORS["text"],
+            "axes.titlecolor": COLORS["text"],
+            "xtick.color": COLORS["muted"],
+            "ytick.color": COLORS["muted"],
+            "text.color": COLORS["text"],
+        }
+    )
 
 
-def _canvas(title: str, subtitle: str) -> tuple[Image.Image, ImageDraw.ImageDraw]:
-    image = Image.new("RGB", (1600, 960), "white")
-    draw = ImageDraw.Draw(image)
-    draw.text((70, 38), title, fill=COLORS["text"], font=_font(38, bold=True))
-    draw.text((72, 92), subtitle, fill=COLORS["muted"], font=_font(21))
-    return image, draw
+def _figure(title: str, subtitle: str, *, rows: int = 1, cols: int = 1) -> tuple[Figure, object]:
+    fig, axes = plt.subplots(rows, cols, figsize=(16, 9.6), facecolor="white")
+    fig.suptitle(title, x=0.055, y=0.97, ha="left", fontsize=27, fontweight="bold")
+    fig.text(0.057, 0.915, subtitle, ha="left", fontsize=14, color=COLORS["muted"])
+    return fig, axes
 
 
-def _legend(draw: ImageDraw.ImageDraw, items: list[tuple[str, str]], x: int, y: int) -> None:
-    for index, (label, color) in enumerate(items):
-        left = x + index * 285
-        draw.rounded_rectangle((left, y, left + 30, y + 18), 4, fill=color)
-        draw.text((left + 40, y - 6), label, fill=COLORS["text"], font=_font(20))
+def _style_axis(axis: Axes, *, grid: bool = True) -> None:
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.spines[["left", "bottom"]].set_linewidth(1.2)
+    axis.tick_params(labelsize=12)
+    if grid:
+        axis.grid(axis="y", color=COLORS["grid"], linewidth=0.8)
+        axis.set_axisbelow(True)
+
+
+def _save_figure(fig: Figure, output: Path) -> None:
+    fig.savefig(output, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
 
 
 def _plot_ttft(summary: dict[str, object], output: Path) -> None:
-    image, draw = _canvas(
+    fig, axis_value = _figure(
         "正常 Poisson 负载：TTFT P95",
-        "Qwen2.5-Coder-7B / BF16 / RTX 5090；点为 3 次中位数，误差线为 min–max；纵轴为对数刻度",
+        "Qwen2.5-Coder-7B / BF16 / RTX 5090；点为 3 次中位数，误差线为 min–max",
     )
-    left, top, right, bottom = 145, 170, 1530, 820
-    ticks = (20, 50, 100, 200, 500, 1000, 2000)
-    y_min, y_max = math.log10(20), math.log10(2000)
-
-    def y_of(value: float) -> float:
-        return bottom - (math.log10(value) - y_min) / (y_max - y_min) * (bottom - top)
-
-    x_by_rate = {
-        rate: left + index * (right - left) / (len(RATES) - 1) for index, rate in enumerate(RATES)
-    }
-    for tick in ticks:
-        y = y_of(tick)
-        draw.line((left, y, right, y), fill=COLORS["grid"], width=1)
-        draw.text((60, y - 13), f"{tick}", fill=COLORS["muted"], font=_font(18))
-    draw.line((left, top, left, bottom), fill=COLORS["text"], width=2)
-    draw.line((left, bottom, right, bottom), fill=COLORS["text"], width=2)
-    draw.text((20, 145), "ms", fill=COLORS["muted"], font=_font(18))
-
+    axis: Axes = axis_value  # type: ignore[assignment]
     labels = {
         "baseline": "Light 原版 strict",
         "candidate": "Light Packed strict",
@@ -207,52 +291,63 @@ def _plot_ttft(summary: dict[str, object], output: Path) -> None:
         "vllm_default": "vLLM default/graph",
     }
     primary = summary["primary"]  # type: ignore[index]
-    for group in labels:
-        points: list[tuple[float, float]] = []
-        for rate in RATES:
-            stats = primary[group][str(rate)]["ttft_p95_ms"]  # type: ignore[index]
-            x = x_by_rate[rate]
-            y = y_of(float(stats["median"]))
-            y_low = y_of(float(stats["max"]))
-            y_high = y_of(float(stats["min"]))
-            draw.line((x, y_low, x, y_high), fill=COLORS[group], width=3)
-            draw.line((x - 7, y_low, x + 7, y_low), fill=COLORS[group], width=2)
-            draw.line((x - 7, y_high, x + 7, y_high), fill=COLORS[group], width=2)
-            points.append((x, y))
-        draw.line(points, fill=COLORS[group], width=4)
-        for rate, (x, y) in zip(RATES, points, strict=True):
-            draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=COLORS[group])
-            value = primary[group][str(rate)]["ttft_p95_ms"]["median"]  # type: ignore[index]
-            x_offset = 10 if group == "vllm_eager" else -10
-            y_offset = -30 if group in ("baseline", "candidate") else 18
-            draw.text(
-                (x + x_offset, y + y_offset),
-                f"{float(value):.0f}",
-                fill=COLORS[group],
-                font=_font(17),
-                anchor="mm",
+    annotation_offsets = {
+        "baseline": (-8, 12),
+        "candidate": (-9, -20),
+        "vllm_eager": (10, 8),
+        "vllm_default": (-8, -18),
+    }
+    for group, label in labels.items():
+        medians = np.array(
+            [float(primary[group][str(rate)]["ttft_p95_ms"]["median"]) for rate in RATES]
+        )
+        minimums = np.array(
+            [float(primary[group][str(rate)]["ttft_p95_ms"]["min"]) for rate in RATES]
+        )
+        maximums = np.array(
+            [float(primary[group][str(rate)]["ttft_p95_ms"]["max"]) for rate in RATES]
+        )
+        axis.errorbar(
+            RATES,
+            medians,
+            yerr=np.vstack((medians - minimums, maximums - medians)),
+            label=label,
+            color=COLORS[group],
+            marker="o",
+            linewidth=2.3,
+            markersize=7,
+            capsize=5,
+        )
+        for rate, value in zip(RATES, medians, strict=True):
+            axis.annotate(
+                f"{value:.0f}",
+                (rate, value),
+                xytext=annotation_offsets[group],
+                textcoords="offset points",
+                color=COLORS[group],
+                fontsize=11,
+                ha="center",
             )
-    for rate, x in x_by_rate.items():
-        draw.text((x - 18, bottom + 18), str(rate), fill=COLORS["text"], font=_font(20))
-    draw.text((690, 865), "请求到达率（req/s）", fill=COLORS["text"], font=_font(22))
-    _legend(draw, [(labels[key], COLORS[key]) for key in labels], 155, 900)
-    image.save(output)
+    axis.set_yscale("log")
+    axis.set_ylim(20, 2000)
+    axis.set_yticks((20, 50, 100, 200, 500, 1000, 2000))
+    axis.yaxis.set_major_formatter(ticker.ScalarFormatter())
+    axis.yaxis.set_minor_formatter(ticker.NullFormatter())
+    axis.set_xticks(RATES)
+    axis.set_xlabel("请求到达率（req/s）", fontsize=14, labelpad=12)
+    axis.set_ylabel("TTFT P95（ms）", fontsize=14, labelpad=12)
+    _style_axis(axis)
+    axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=4, frameon=False, fontsize=12)
+    fig.subplots_adjust(left=0.09, right=0.97, top=0.84, bottom=0.19)
+    _save_figure(fig, output)
 
 
 def _plot_throughput(summary: dict[str, object], output: Path) -> None:
-    image, draw = _canvas(
+    fig, axis_value = _figure(
         "正常 Poisson 负载：输出吞吐",
-        "柱为 3 次中位数；Packed 柱上方标注其相对 vLLM eager 的比例",
+        "柱为 3 次中位数；横轴同时标注 Packed 相对 vLLM eager 的比例",
     )
-    left, top, right, bottom = 120, 170, 1530, 820
-    maximum = 700.0
-    for tick in range(0, 701, 100):
-        y = bottom - tick / maximum * (bottom - top)
-        draw.line((left, y, right, y), fill=COLORS["grid"], width=1)
-        draw.text((52, y - 12), str(tick), fill=COLORS["muted"], font=_font(18))
-    draw.line((left, top, left, bottom), fill=COLORS["text"], width=2)
-    draw.line((left, bottom, right, bottom), fill=COLORS["text"], width=2)
-    draw.text((18, 145), "tok/s", fill=COLORS["muted"], font=_font(18))
+    axis: Axes = axis_value  # type: ignore[assignment]
     groups = ("baseline", "candidate", "vllm_eager", "vllm_default")
     labels = {
         "baseline": "Light 原版",
@@ -261,76 +356,94 @@ def _plot_throughput(summary: dict[str, object], output: Path) -> None:
         "vllm_default": "vLLM graph",
     }
     primary = summary["primary"]  # type: ignore[index]
-    cluster_width, bar_width = 310, 55
-    for rate_index, rate in enumerate(RATES):
-        center = 285 + rate_index * cluster_width
-        for group_index, group in enumerate(groups):
-            value = float(primary[group][str(rate)]["throughput"]["median"])  # type: ignore[index]
-            x0 = center - 126 + group_index * 64
-            y0 = bottom - value / maximum * (bottom - top)
-            draw.rectangle((x0, y0, x0 + bar_width, bottom), fill=COLORS[group])
-            draw.text((x0 - 1, y0 - 25), f"{value:.0f}", fill=COLORS[group], font=_font(16))
-        candidate = float(primary["candidate"][str(rate)]["throughput"]["median"])  # type: ignore[index]
-        eager = float(primary["vllm_eager"][str(rate)]["throughput"]["median"])  # type: ignore[index]
-        draw.text(
-            (center - 72, 835),
-            f"{rate} req/s   Packed/eager {candidate / eager:.1%}",
-            fill=COLORS["text"],
-            font=_font(17),
+    centers = np.arange(len(RATES), dtype=float)
+    width = 0.19
+    for index, group in enumerate(groups):
+        values = np.array(
+            [float(primary[group][str(rate)]["throughput"]["median"]) for rate in RATES]
         )
-    _legend(draw, [(labels[key], COLORS[key]) for key in groups], 160, 905)
-    image.save(output)
+        bars = axis.bar(
+            centers + (index - 1.5) * width,
+            values,
+            width=width * 0.92,
+            label=labels[group],
+            color=COLORS[group],
+        )
+        axis.bar_label(bars, labels=[f"{value:.0f}" for value in values], padding=4, fontsize=11)
+    ratios = []
+    for rate in RATES:
+        candidate = float(primary["candidate"][str(rate)]["throughput"]["median"])
+        eager = float(primary["vllm_eager"][str(rate)]["throughput"]["median"])
+        ratios.append(candidate / eager)
+    axis.set_xticks(
+        centers,
+        [
+            f"{rate} req/s\nPacked/eager {ratio:.1%}"
+            for rate, ratio in zip(RATES, ratios, strict=True)
+        ],
+    )
+    axis.set_ylim(0, 710)
+    axis.set_ylabel("输出吞吐（tok/s）", fontsize=14, labelpad=12)
+    _style_axis(axis)
+    axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=4, frameon=False, fontsize=12)
+    fig.subplots_adjust(left=0.09, right=0.97, top=0.84, bottom=0.2)
+    _save_figure(fig, output)
 
 
-def _panel(
-    draw: ImageDraw.ImageDraw,
-    box: tuple[int, int, int, int],
+def _bar_panel(
+    axis: Axes,
     title: str,
     labels: tuple[str, ...],
     series: tuple[tuple[str, tuple[float, ...], str], ...],
     *,
     suffix: str,
+    note: str | None = None,
 ) -> None:
-    x0, y0, x1, y1 = box
-    draw.rounded_rectangle(box, 18, fill=COLORS["panel"], outline=COLORS["grid"], width=2)
-    draw.text((x0 + 25, y0 + 20), title, fill=COLORS["text"], font=_font(23, bold=True))
+    centers = np.arange(len(labels), dtype=float)
+    width = 0.68 / max(1, len(series))
     values = [value for _, entries, _ in series for value in entries]
-    maximum = max(values) * 1.22 if values else 1.0
-    # 横轴标签和图例分两层放置，避免短面板里相互覆盖。
-    chart_top, chart_bottom = y0 + 85, y1 - 90
-    group_width = (x1 - x0 - 90) / len(labels)
-    bar_width = min(55, group_width / (len(series) + 1))
-    for label_index, label in enumerate(labels):
-        center = x0 + 55 + group_width * (label_index + 0.5)
-        for series_index, (_, entries, color) in enumerate(series):
-            value = entries[label_index]
-            left = center + (series_index - (len(series) - 1) / 2) * (bar_width + 8) - bar_width / 2
-            top = chart_bottom - value / maximum * (chart_bottom - chart_top)
-            draw.rectangle((left, top, left + bar_width, chart_bottom), fill=color)
-            draw.text(
-                (left - 4, top - 24),
-                f"{value:.1f}{suffix}",
-                fill=color,
-                font=_font(15),
-            )
-        draw.text((center - 50, chart_bottom + 15), label, fill=COLORS["text"], font=_font(17))
-    legend_x = x0 + 25
-    for name, _, color in series:
-        draw.rectangle((legend_x, y1 - 37, legend_x + 20, y1 - 24), fill=color)
-        draw.text((legend_x + 27, y1 - 43), name, fill=COLORS["muted"], font=_font(15))
-        legend_x += 170
+    for index, (name, entries, color) in enumerate(series):
+        offset = (index - (len(series) - 1) / 2) * width
+        bars = axis.bar(centers + offset, entries, width=width * 0.9, label=name, color=color)
+        axis.bar_label(
+            bars,
+            labels=[f"{value:.1f}{suffix}" for value in entries],
+            padding=4,
+            fontsize=10,
+            color=color,
+        )
+    axis.set_title(title, loc="left", fontsize=16, fontweight="bold", pad=12)
+    axis.set_xticks(centers, labels)
+    axis.set_ylim(0, max(values) * 1.25 if values else 1.0)
+    _style_axis(axis)
+    if len(series) > 1:
+        axis.legend(frameon=False, fontsize=10, loc="upper right")
+    if note is not None:
+        axis.text(
+            0.98,
+            0.93,
+            note,
+            transform=axis.transAxes,
+            fontsize=10,
+            color=COLORS["muted"],
+            ha="right",
+            va="top",
+        )
 
 
 def _plot_breakdown(summary: dict[str, object], output: Path) -> None:
-    image, draw = _canvas(
+    fig, axes_value = _figure(
         "8 req/s Profile：Mixed 与 Decode 分解",
-        "相同 64 请求；Packed 只消除 mixed padding，decode W1 与 Driver gap 基本未变",
+        "相同 64 请求；Packed 消除 mixed padding，decode W1 与 Driver gap 基本未变",
+        rows=2,
+        cols=2,
     )
+    axes = np.asarray(axes_value).reshape(2, 2)
     baseline = summary["profiles"]["baseline"]  # type: ignore[index]
     candidate = summary["profiles"]["candidate"]  # type: ignore[index]
-    _panel(
-        draw,
-        (55, 145, 780, 515),
+    avoided = int(candidate["mixed"]["legacy_positions"]) - int(candidate["mixed"]["model_tokens"])
+    _bar_panel(
+        axes[0, 0],
         "Mixed step 实际执行位置数",
         ("原版", "Packed"),
         (
@@ -344,16 +457,10 @@ def _plot_breakdown(summary: dict[str, object], output: Path) -> None:
             ),
         ),
         suffix="",
+        note=f"Packed 避免 {avoided:,} 个 padding 位置",
     )
-    draw.text(
-        (85, 460),
-        f"Packed 避免了 {int(candidate['mixed']['legacy_positions']) - int(candidate['mixed']['model_tokens']):,} 个 padding 位置",
-        fill=COLORS["muted"],
-        font=_font(17),
-    )
-    _panel(
-        draw,
-        (820, 145, 1545, 515),
+    _bar_panel(
+        axes[0, 1],
         "Mixed step P50",
         ("原版", "Packed"),
         (
@@ -367,15 +474,17 @@ def _plot_breakdown(summary: dict[str, object], output: Path) -> None:
             ),
             (
                 "CUDA event",
-                (float(baseline["mixed"]["cuda_p50_ms"]), float(candidate["mixed"]["cuda_p50_ms"])),
+                (
+                    float(baseline["mixed"]["cuda_p50_ms"]),
+                    float(candidate["mixed"]["cuda_p50_ms"]),
+                ),
                 COLORS["candidate"],
             ),
         ),
         suffix="ms",
     )
-    _panel(
-        draw,
-        (55, 545, 780, 915),
+    _bar_panel(
+        axes[1, 0],
         "Decode W1 P50",
         ("原版", "Packed"),
         (
@@ -398,9 +507,8 @@ def _plot_breakdown(summary: dict[str, object], output: Path) -> None:
         ),
         suffix="ms",
     )
-    _panel(
-        draw,
-        (820, 545, 1545, 915),
+    _bar_panel(
+        axes[1, 1],
         "前一 Executor 到本步的 gap P50",
         ("Mixed", "Decode W1"),
         (
@@ -423,45 +531,37 @@ def _plot_breakdown(summary: dict[str, object], output: Path) -> None:
         ),
         suffix="ms",
     )
-    image.save(output)
+    fig.subplots_adjust(left=0.07, right=0.97, top=0.82, bottom=0.08, hspace=0.42, wspace=0.2)
+    _save_figure(fig, output)
 
 
 def _plot_ablation(summary: dict[str, object], output: Path) -> None:
-    image, draw = _canvas(
+    fig, axes_value = _figure(
         "8 req/s：reserved_sequences 消融",
         "短请求池固定：256 scheduled tokens / 2047 KV slots；只改变 sequence slot 数量",
+        cols=2,
     )
+    axes = np.asarray(axes_value).reshape(2)
     ablation = summary["reserved_sequences_ablation"]  # type: ignore[index]
     labels = ("off", "1", "2", "4", "8")
-    _panel(
-        draw,
-        (80, 170, 780, 850),
-        "TTFT P95（3 次中位数）",
-        labels,
-        (
-            (
-                "TTFT",
-                tuple(float(ablation[label]["ttft_p95_ms"]["median"]) for label in labels),
-                COLORS["baseline"],
-            ),
-        ),
-        suffix="ms",
-    )
-    _panel(
-        draw,
-        (820, 170, 1520, 850),
-        "吞吐（3 次中位数）",
-        labels,
-        (
-            (
-                "吞吐",
-                tuple(float(ablation[label]["throughput"]["median"]) for label in labels),
-                COLORS["candidate"],
-            ),
-        ),
-        suffix="",
-    )
-    image.save(output)
+    ttft = np.array([float(ablation[label]["ttft_p95_ms"]["median"]) for label in labels])
+    throughput = np.array([float(ablation[label]["throughput"]["median"]) for label in labels])
+    bars = axes[0].bar(labels, ttft, color=COLORS["baseline"], width=0.62)
+    axes[0].set_title("TTFT P95（3 次中位数）", loc="left", fontsize=16, fontweight="bold")
+    axes[0].set_yscale("log")
+    axes[0].set_ylim(30, 4000)
+    axes[0].set_ylabel("TTFT P95（ms）", fontsize=13)
+    axes[0].bar_label(bars, labels=[f"{value:.1f}" for value in ttft], padding=4, fontsize=10)
+    _style_axis(axes[0])
+
+    bars = axes[1].bar(labels, throughput, color=COLORS["candidate"], width=0.62)
+    axes[1].set_title("吞吐（3 次中位数）", loc="left", fontsize=16, fontweight="bold")
+    axes[1].set_ylim(0, 680)
+    axes[1].set_ylabel("输出吞吐（tok/s）", fontsize=13)
+    axes[1].bar_label(bars, labels=[f"{value:.1f}" for value in throughput], padding=4, fontsize=10)
+    _style_axis(axes[1])
+    fig.subplots_adjust(left=0.08, right=0.97, top=0.82, bottom=0.1, wspace=0.24)
+    _save_figure(fig, output)
 
 
 def _markdown_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
@@ -506,6 +606,37 @@ def _write_report(summary: dict[str, object], result_root: Path) -> None:
     ]
     validations = summary["output_validation"]  # type: ignore[index]
     exact_rate8 = len(validations["8"]["exact_token_mismatches"])
+    remaining = profiles["candidate"]["remaining_step_breakdown"]
+    service_ms = float(remaining["service_ms"])
+    driver_gap_ms = float(remaining["driver_gap_ms"])
+    sampler_ms = float(remaining["sampler_ms"])
+    prepare_ms = float(remaining["step_handler_outside_model_ms"])
+    timer_residual_ms = float(remaining["executor_host_residual_ms"])
+
+    def theoretical_speedup(recovered_ms: float) -> float:
+        return service_ms / (service_ms - recovered_ms) - 1.0
+
+    timer_ab = summary.get("timer_sync_ab")
+    if isinstance(timer_ab, dict):
+        timer_groups = timer_ab["groups"]
+        timer_current = timer_groups["current"]
+        timer_wall = timer_groups["wall"]
+        timer_budget = (
+            f"固定 B16/W1 三次中位数：{float(timer_current['throughput']['median']):.1f}→"
+            f"{float(timer_wall['throughput']['median']):.1f} tok/s"
+        )
+        timer_limit = f"实测吞吐 {float(timer_ab['throughput_delta_percent']):+.2f}%"
+        timer_expectation = "不作为性能修复；仅在保留准确 CUDA 指标的前提下重构采样"
+        timer_ttft = (
+            f"TPOT 中位数 {float(timer_current['tpot_p50_ms']['median']):.3f}→"
+            f"{float(timer_wall['tpot_p50_ms']['median']):.3f} ms，差异属于运行噪声"
+        )
+    else:
+        timer_budget = f"Executor wall 与 CUDA event 只差 {timer_residual_ms:.3f} ms/step"
+        timer_limit = f"吞吐 +{theoretical_speedup(timer_residual_ms):.1%}"
+        timer_expectation = "<0.5%"
+        timer_ttft = "sampler 已先完成同步，关 timer 不会吃掉 Driver gap"
+
     report = f"""# light-vLLM Packed Query 与 TTFT 根因实验
 
 ## 一句话结论
@@ -554,6 +685,24 @@ def _write_report(summary: dict[str, object], result_root: Path) -> None:
 
 ![reserved_sequences 消融](analysis/reserved_sequences_ablation.png)
 
+## 其他修复方向的收益上限
+
+以下区间不是已经实现的成绩，而是用当前 Packed profile 的每步时间预算推导出的工程预期。多项优化会吃同一段时间，不能直接相加。
+
+| 方向 | 当前可见时间预算 | 理论上限 | 保守工程预期 | 对当前 TTFT 的判断 |
+| --- | --- | --- | --- | --- |
+| Driver 双缓冲 / 两批在途 | 外部 gap {driver_gap_ms:.2f} ms / service step {service_ms:.2f} ms | 全部隐藏时吞吐 +{theoretical_speedup(driver_gap_ms):.1%} | 吞吐 +5%～9% | 2/8 req/s 已无明显首 token 排队，通常只省 0～10 ms；更高负载下收益会非线性放大 |
+| decode CUDA Graph | 独立 fixed-W1 trace 中 kernel 10.592 ms、CUDA-event 11.743 ms，设备边界内空洞约 1.151 ms | 最多约 +10% step capacity | 吞吐 +4%～7% | 只 capture 常见 decode shape 时通常小幅改善；不要让首个不规则 prefill 等待 graph |
+| sampler 异步回传 | {sampler_ms:.2f} ms/step | 全部隐藏时吞吐 +{theoretical_speedup(sampler_ms):.1%} | 吞吐 +1%～3% | 对 TTFT 很小，主要改善 decode capacity / TPOT |
+| staging buffer、metadata/H2D | Step Handler 中 model 外只有 {prepare_ms:.2f} ms/step，且含不可删除工作 | 全部消失时吞吐 +{theoretical_speedup(prepare_ms):.1%} | 吞吐 +1%～2% | 目前没有证明单独 H2D ≥0.5 ms，不应先做大改 |
+| 删除每步 CUDA timer 同步 | {timer_budget} | {timer_limit} | {timer_expectation} | {timer_ttft} |
+| `reserved_sequences` 调参 | `off/1/2` 吞吐仅 596.0/599.4/597.6 tok/s | 没有稳定正收益 | 保持默认 1 | 设为 8 会把 TTFT 恶化到 2520.6 ms |
+| self-resubmit 部分 KV 保留 | 本组 resubmit=0 | 当前正常负载收益为 0 | 只改善容量压力下的重算量和 token gap | 首 token 已产生后才触发，主要影响 ITL/吞吐，不是当前 TTFT 根因 |
+
+最值得继续的是 **Driver overlap + 常见 decode shape 的 CUDA Graph**。按时间预算，两者有机会把正常 8 req/s 吞吐从约 596 tok/s 推到 630～650 tok/s；但它们会重叠吃掉 launch/等待空洞，必须分别 A/B，不能把两个百分比直接相加。当前 TTFT 已经比 vLLM eager 低，因此下一阶段应把主验收改成 fixed-W1 TPOT、饱和吞吐和 inter-step gap，而不是继续压 46.5 ms 的 TTFT。
+
+计时器消融的原始 JSON、Prometheus 快照和服务日志保存在 `timer-ab/`。这组补测使用同一个 `6c46884` checkout，关闭 prefix cache、TTFT admission 与 speculation；`current` 和替换成墙钟计时器的 `wall` 都经过 warmup 后正式运行三次，并额外回切一次 `current` 检查顺序漂移。每次均为 16/16 成功、8192 输出 token。
+
 ## 正确性与边界
 
 - 本地：237 个测试通过；ruff、format check、`git diff --check` 通过。
@@ -570,7 +719,7 @@ def _write_report(summary: dict[str, object], result_root: Path) -> None:
 - 包 SHA-256：`{summary["archive_sha256"]}`
 - 解包后的 `SHA256SUMS` 已逐文件校验：388/388 通过。
 - 分析数据：`analysis/summary.json`
-- 重画命令：`python benchmarks/remote_5090/analyze_packed_query_ttft.py <解包目录> <结果目录>`（需要 Pillow）。
+- 重画命令：`python benchmarks/remote_5090/analyze_packed_query_ttft.py <解包目录> <结果目录>`（需要 matplotlib）。
 """
     (result_root / "report.md").write_text(report, encoding="utf-8")
 
@@ -668,12 +817,14 @@ def main() -> None:
             ),
             "vllm_preemptions": _metric_values(vllm_prom, "vllm:num_preemptions_total"),
         },
+        "timer_sync_ab": _timer_sync_ab(result_root),
         "archive_sha256": archive_sha,
         "raw_manifest_files": len((raw / "SHA256SUMS").read_text(encoding="utf-8").splitlines()),
     }
     (analysis / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    _configure_matplotlib()
     _plot_ttft(summary, analysis / "ttft_p95.png")
     _plot_throughput(summary, analysis / "throughput.png")
     _plot_breakdown(summary, analysis / "step_breakdown.png")

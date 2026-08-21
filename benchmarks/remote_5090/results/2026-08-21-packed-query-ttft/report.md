@@ -57,6 +57,24 @@
 
 ![reserved_sequences 消融](analysis/reserved_sequences_ablation.png)
 
+## 其他修复方向的收益上限
+
+以下区间不是已经实现的成绩，而是用当前 Packed profile 的每步时间预算推导出的工程预期。多项优化会吃同一段时间，不能直接相加。
+
+| 方向 | 当前可见时间预算 | 理论上限 | 保守工程预期 | 对当前 TTFT 的判断 |
+| --- | --- | --- | --- | --- |
+| Driver 双缓冲 / 两批在途 | 外部 gap 1.49 ms / service step 13.12 ms | 全部隐藏时吞吐 +12.8% | 吞吐 +5%～9% | 2/8 req/s 已无明显首 token 排队，通常只省 0～10 ms；更高负载下收益会非线性放大 |
+| decode CUDA Graph | 独立 fixed-W1 trace 中 kernel 10.592 ms、CUDA-event 11.743 ms，设备边界内空洞约 1.151 ms | 最多约 +10% step capacity | 吞吐 +4%～7% | 只 capture 常见 decode shape 时通常小幅改善；不要让首个不规则 prefill 等待 graph |
+| sampler 异步回传 | 0.61 ms/step | 全部隐藏时吞吐 +4.8% | 吞吐 +1%～3% | 对 TTFT 很小，主要改善 decode capacity / TPOT |
+| staging buffer、metadata/H2D | Step Handler 中 model 外只有 0.63 ms/step，且含不可删除工作 | 全部消失时吞吐 +5.1% | 吞吐 +1%～2% | 目前没有证明单独 H2D ≥0.5 ms，不应先做大改 |
+| 删除每步 CUDA timer 同步 | 固定 B16/W1 三次中位数：1202.2→1204.6 tok/s | 实测吞吐 +0.20% | 不作为性能修复；仅在保留准确 CUDA 指标的前提下重构采样 | TPOT 中位数 13.176→13.187 ms，差异属于运行噪声 |
+| `reserved_sequences` 调参 | `off/1/2` 吞吐仅 596.0/599.4/597.6 tok/s | 没有稳定正收益 | 保持默认 1 | 设为 8 会把 TTFT 恶化到 2520.6 ms |
+| self-resubmit 部分 KV 保留 | 本组 resubmit=0 | 当前正常负载收益为 0 | 只改善容量压力下的重算量和 token gap | 首 token 已产生后才触发，主要影响 ITL/吞吐，不是当前 TTFT 根因 |
+
+最值得继续的是 **Driver overlap + 常见 decode shape 的 CUDA Graph**。按时间预算，两者有机会把正常 8 req/s 吞吐从约 596 tok/s 推到 630～650 tok/s；但它们会重叠吃掉 launch/等待空洞，必须分别 A/B，不能把两个百分比直接相加。当前 TTFT 已经比 vLLM eager 低，因此下一阶段应把主验收改成 fixed-W1 TPOT、饱和吞吐和 inter-step gap，而不是继续压 46.5 ms 的 TTFT。
+
+计时器消融的原始 JSON、Prometheus 快照和服务日志保存在 `timer-ab/`。这组补测使用同一个 `6c46884` checkout，关闭 prefix cache、TTFT admission 与 speculation；`current` 和替换成墙钟计时器的 `wall` 都经过 warmup 后正式运行三次，并额外回切一次 `current` 检查顺序漂移。每次均为 16/16 成功、8192 输出 token。
+
 ## 正确性与边界
 
 - 本地：237 个测试通过；ruff、format check、`git diff --check` 通过。
@@ -73,4 +91,4 @@
 - 包 SHA-256：`379a82e4ecf4012ae600452fabfb13d44f3691d0ca7746f14e199e4d081ff6ab`
 - 解包后的 `SHA256SUMS` 已逐文件校验：388/388 通过。
 - 分析数据：`analysis/summary.json`
-- 重画命令：`python benchmarks/remote_5090/analyze_packed_query_ttft.py <解包目录> <结果目录>`（需要 Pillow）。
+- 重画命令：`python benchmarks/remote_5090/analyze_packed_query_ttft.py <解包目录> <结果目录>`（需要 matplotlib）。
