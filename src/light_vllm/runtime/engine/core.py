@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from itertools import count
 
 from light_vllm.runtime.engine.admission import CapacityAdmission, SafeTTFTAdmission
+from light_vllm.runtime.engine.execution_lane import ExecutionLane
 from light_vllm.runtime.engine.interfaces import (
     EngineCapabilities,
     RequestAdmission,
@@ -146,6 +147,7 @@ class EngineCore:
         ttft_admission: TTFTAdmission | None = None,
     ) -> None:
         self._executor = executor
+        self._execution_lane = ExecutionLane(executor)
         self._scheduler = scheduler
         self._admission = admission or CapacityAdmission()
         self._ttft_admission = SafeTTFTAdmission(ttft_admission)
@@ -224,8 +226,11 @@ class EngineCore:
                     )
                 self._publish_scheduler_stats()
             task = self._driver_task
-        if task is not None:
-            await _await_safe_boundary(task)
+        try:
+            if task is not None:
+                await _await_safe_boundary(task)
+        finally:
+            self._execution_lane.close()
 
     async def _register(self, request: GenerateRequest) -> _RequestState:
         async with self._lock:
@@ -372,13 +377,9 @@ class EngineCore:
             return _CompletedStep(prepared=prepared, error=exc)
 
     async def _execute_batch(self, batch: ExecutionBatch) -> ExecutionOutput:
-        """在线程池执行同步 Executor，并把等待边界留给 Engine。"""
+        """把同步 Executor 交给 Engine 私有的常驻执行线程。"""
 
-        return await asyncio.get_running_loop().run_in_executor(
-            None,
-            self._executor.execute,
-            batch,
-        )
+        return await self._execution_lane.execute(batch)
 
     def _build_execution_batch_locked(self, scheduled: SchedulerOutput) -> ExecutionBatch:
         requests: list[ExecutionRequest] = []

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
-from threading import Event
+from threading import Event, get_ident
 
 import pytest
 
@@ -62,6 +62,7 @@ class RecordingExecutor:
     ) -> None:
         self.history: list[tuple[tuple[int, ...], ...]] = []
         self.context_history: list[tuple[tuple[int, ...] | None, ...]] = []
+        self.execution_thread_ids: list[int] = []
         self.active: set[str] = set()
         self.multiple_tokens = multiple_tokens
         self.block_first_step = block_first_step
@@ -84,6 +85,7 @@ class RecordingExecutor:
         self.lease_release_count += 1
 
     def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+        self.execution_thread_ids.append(get_ident())
         step = len(self.history)
         self.history.append(tuple(request.input_token_ids for request in batch.requests))
         self.context_history.append(tuple(request.context_token_ids for request in batch.requests))
@@ -333,6 +335,23 @@ def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
     asyncio.run(run())
 
 
+def test_engine_reuses_one_private_execution_thread() -> None:
+    async def run() -> None:
+        event_loop_thread_id = get_ident()
+        executor = RecordingExecutor()
+        engine = _engine(executor, token_budget=2)
+
+        result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
+        await engine.close()
+
+        assert result.generated_token_ids == (2, 3, 4)
+        assert len(executor.execution_thread_ids) == 3
+        assert set(executor.execution_thread_ids) != {event_loop_thread_id}
+        assert len(set(executor.execution_thread_ids)) == 1
+
+    asyncio.run(run())
+
+
 def test_engine_self_resubmit_preserves_visible_history_and_releases_kv() -> None:
     async def run() -> None:
         executor = RecordingExecutor(block_first_step=True)
@@ -521,6 +540,23 @@ def test_execution_failure_is_delivered_to_the_request() -> None:
         await engine.close()
         assert executor.lease_release_count == 1
         assert observer.snapshot().failed_requests_total == 1
+
+    asyncio.run(run())
+
+
+def test_execution_lane_preserves_invalid_output_for_engine_validation() -> None:
+    class InvalidExecutor(RecordingExecutor):
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            return None  # type: ignore[return-value]
+
+    async def run() -> None:
+        engine = _engine(InvalidExecutor())
+        with pytest.raises(GenerationError, match="must return ExecutionOutput"):
+            await asyncio.wait_for(
+                engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1)),
+                timeout=1.0,
+            )
+        await engine.close()
 
     asyncio.run(run())
 

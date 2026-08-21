@@ -25,7 +25,7 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
 - `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流；每次至多保留一个不可变
   `PreparedStep` 在模型侧执行。上一轮结果、执行结束状态和下一轮计划在同一个锁区原子推进，并只发布一次稳定
-  Scheduler 快照。
+  Scheduler 快照。同步 Executor 固定在 Engine 私有的单在途 `ExecutionLane`，不再逐轮提交到进程级线程池。
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode；可选短请求策略同时预留
   scheduled token、KV token slot 和 sequence，首 token 后回到通用 round-robin，常规请求用真实 waiting step aging。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
@@ -102,6 +102,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/runtime/execution/triton_paged_attention.py` | 可选 Triton fused Paged Attention backend |
 | `src/light_vllm/runtime/engine/admission.py` | 确定性容量准入、step 延迟预测与 TTFT 早拒 |
 | `src/light_vllm/runtime/engine/core.py` | 请求状态、迭代循环、事件与安全取消 |
+| `src/light_vllm/runtime/engine/execution_lane.py` | 单在途同步 Executor 的常驻线程边界 |
 | `src/light_vllm/runtime/engine/in_process.py` | 同步 reference 到异步 Engine 的适配器 |
 | `src/light_vllm/runtime/engine/interfaces.py` | serving 使用的异步 `EngineClient` |
 | `src/light_vllm/runtime/observability/interfaces.py` | 性能快照、读取端口与观察者契约 |
@@ -199,7 +200,9 @@ reference 的请求不占用 worker thread，并让同步 iterator 的创建、`
 Executor lease 固定物理资源，取消只标记释放，tensor 等 lease 退出后再销毁。正在执行的分页请求被取消时，
 Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边界。锁外只传递 `PreparedStep` 与
 `CompletedStep` 事实；lease 释放后，Engine 在一个锁区内完成上一轮提交并准备下一轮，不允许 Executor 或
-Observer 反向修改请求和 Scheduler 状态。
+Observer 反向修改请求和 Scheduler 状态。`ExecutionLane` 只跨线程传递 `ExecutionBatch` 与
+`ExecutionOutput`，不得提交 Scheduler 状态或提前释放 lease；Engine 关闭时先等待 driver 越过安全边界，再回收
+lane 的常驻线程。
 
 `TTFTAdmission` 是控制组件：在 Engine 锁内读取一次 Scheduler 快照做准入，在 step 完成后消费真实延迟；
 `PerformanceObserver` 只记录同一事实。投机细节通过独立 `SpeculationObserver` 端口上报，包括候选/命中节点、
