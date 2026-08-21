@@ -254,6 +254,9 @@ class _StageProfiler:
                 "outside_executor_ms": (total_ns - inside_ns) / 1_000_000,
             }
         future_intervals = named_intervals.get("engine.executor_future_total", ())
+        prepared_intervals = named_intervals.get("engine.execute_prepared_step", ())
+        advance_intervals = sorted(named_intervals.get("engine.advance_locked", ()))
+        advance_ends = [finished_ns for _, finished_ns in advance_intervals]
         boundary_totals_ns = {
             "event_loop_resume": 0,
             "control_path": 0,
@@ -261,6 +264,13 @@ class _StageProfiler:
         }
         boundary_gap_ns = 0
         boundary_steps = 0
+        driver_control_totals_ns = {
+            "output_processing": 0,
+            "transition_to_advance": 0,
+            "advance_locked": 0,
+            "next_execute_entry": 0,
+        }
+        driver_control_steps = 0
         step_records = []
         previous_finished_ns: int | None = None
         for index, (started_ns, finished_ns, cpu_ns, cuda_ns) in enumerate(executor_records):
@@ -304,6 +314,32 @@ class _StageProfiler:
                 boundary_gap_ns += next_executor_started_ns - finished_ns
                 boundary_steps += 1
 
+            driver_control_parts_ns = None
+            if (
+                future_finished_ns is not None
+                and next_future_started_ns is not None
+                and index < len(prepared_intervals)
+            ):
+                prepared_started_ns, prepared_finished_ns = prepared_intervals[index]
+                advance_index = bisect_right(advance_ends, next_future_started_ns) - 1
+                if advance_index >= 0:
+                    advance_started_ns, advance_finished_ns = advance_intervals[advance_index]
+                    parts = {
+                        "output_processing": prepared_finished_ns - future_finished_ns,
+                        "transition_to_advance": advance_started_ns - prepared_finished_ns,
+                        "advance_locked": advance_finished_ns - advance_started_ns,
+                        "next_execute_entry": next_future_started_ns - advance_finished_ns,
+                    }
+                    if (
+                        prepared_started_ns <= future_finished_ns <= prepared_finished_ns
+                        and advance_started_ns >= prepared_finished_ns
+                        and all(value >= 0 for value in parts.values())
+                    ):
+                        driver_control_parts_ns = parts
+                        for name, value in parts.items():
+                            driver_control_totals_ns[name] += value
+                        driver_control_steps += 1
+
             step_records.append(
                 {
                     "step_id": index,
@@ -334,6 +370,11 @@ class _StageProfiler:
                     ),
                     "next_submit_to_worker_start_ms": (
                         next_dispatch_ns / 1_000_000 if next_dispatch_ns is not None else None
+                    ),
+                    "driver_control_ms": (
+                        {name: value / 1_000_000 for name, value in driver_control_parts_ns.items()}
+                        if driver_control_parts_ns is not None
+                        else None
                     ),
                     "batch_size": batch_size,
                     "query_width": query_width,
@@ -385,6 +426,18 @@ class _StageProfiler:
                 "event_loop_resume_total_ms": (boundary_totals_ns["event_loop_resume"] / 1_000_000),
                 "control_path_total_ms": boundary_totals_ns["control_path"] / 1_000_000,
                 "next_dispatch_total_ms": boundary_totals_ns["next_dispatch"] / 1_000_000,
+            },
+            "driver_control_breakdown": {
+                "definition": (
+                    "For aligned consecutive steps: finish executor await and process its "
+                    "output, transition through lease release and lock acquisition, atomically "
+                    "advance the previous and next step, then enter the next executor await."
+                ),
+                "steps": driver_control_steps,
+                **{
+                    f"{name}_total_ms": value / 1_000_000
+                    for name, value in driver_control_totals_ns.items()
+                },
             },
             "interval_overlap": interval_overlap,
             "batch_shapes": _summarize_batch_shapes(batch_shapes),
@@ -498,6 +551,7 @@ def _timed_async(
 
 def _install(profiler: _StageProfiler, *, detail: str) -> None:
     stages = [
+        (EngineCore, "_advance_locked", "engine.advance_locked"),
         (EngineCore, "_build_execution_batch_locked", "engine.build_batch"),
         (EngineCore, "_apply_output_locked", "engine.apply_output"),
         (EngineCore, "_finish_execution_locked", "engine.finish_execution"),
@@ -629,6 +683,13 @@ def _install(profiler: _StageProfiler, *, detail: str) -> None:
     EngineCore._apply_output_locked = profiled_apply_output
     if hasattr(EngineCore, "_execute_batch"):
         _timed_async(profiler, EngineCore, "_execute_batch", "engine.executor_future_total")
+    if hasattr(EngineCore, "_execute_prepared_step"):
+        _timed_async(
+            profiler,
+            EngineCore,
+            "_execute_prepared_step",
+            "engine.execute_prepared_step",
+        )
 
     _timed_sync(profiler, engine_core_module, "_validated_output", "engine.validate_output")
     if detail == "full":
