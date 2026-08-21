@@ -104,6 +104,45 @@ cleanup() {
 }
 trap cleanup EXIT
 
+wait_for_profile_dump() {
+  local ready=false
+  for _ in $(seq 1 60); do
+    if "$PYTHON" - "$PROFILE_PREFIX" "$BACKEND" <<'PY'
+import glob
+import json
+import sys
+from pathlib import Path
+
+prefix = sys.argv[1]
+backend = sys.argv[2]
+paths = (
+    [Path(f"{prefix}-stages.json")]
+    if backend == "light-vllm"
+    else [
+        Path(f"{prefix}.{Path(path).read_text(encoding='utf-8').strip()}.json")
+        for path in glob.glob(f"{prefix}.*.pid")
+    ]
+)
+if not paths or not all(path.is_file() and path.stat().st_size for path in paths):
+    raise SystemExit(1)
+try:
+    for path in paths:
+        json.loads(path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+    then
+      ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$ready" != true ]]; then
+    echo "profile dump did not become valid JSON: $PROFILE_PREFIX" >&2
+    exit 1
+  fi
+}
+
 MAX_SEQS=16
 KV_BLOCKS=$((KV_TOKENS / 16))
 KV_BYTES=$((KV_TOKENS * 57344))
@@ -263,7 +302,7 @@ if [[ "$PROFILE_DETAIL" != off ]]; then
       kill -0 "$profile_pid" 2>/dev/null && kill -USR2 "$profile_pid"
     done
   fi
-  sleep 1
+  wait_for_profile_dump
 fi
 
 BENCHMARK_MODE="$MODE" \
