@@ -23,60 +23,108 @@ def test_minimal_forward_shape() -> None:
     runner = create_runner()
     runner.load(tiny_spec())
 
-    batch = ForwardBatch(input_ids=torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    batch = ForwardBatch(
+        input_ids=torch.tensor([1, 2, 3, 4, 5, 6]),
+        positions=torch.tensor([0, 1, 2, 0, 1, 2]),
+        query_start_loc=(0, 3, 6),
+    )
     output = runner.open_session().forward(batch)
 
-    assert output.logits.shape == (2, 3, 32)
-    torch.testing.assert_close(batch.positions, torch.tensor([[0, 1, 2], [0, 1, 2]]))
+    assert output.logits.shape == (6, 32)
+    torch.testing.assert_close(batch.positions, torch.tensor([0, 1, 2, 0, 1, 2]))
     assert runner.generation == 1
 
 
 def test_forward_batch_validates_explicit_positions() -> None:
     with pytest.raises(ValueError, match="same shape"):
         ForwardBatch(
-            input_ids=torch.tensor([[1, 2]]),
-            positions=torch.tensor([[4]]),
+            input_ids=torch.tensor([1, 2]),
+            positions=torch.tensor([4]),
         )
 
     batch = ForwardBatch(
-        input_ids=torch.tensor([[1, 2]]),
-        positions=torch.tensor([[4, 5]]),
+        input_ids=torch.tensor([1, 2]),
+        positions=torch.tensor([4, 5]),
     )
 
-    torch.testing.assert_close(batch.positions, torch.tensor([[4, 5]]))
+    torch.testing.assert_close(batch.positions, torch.tensor([4, 5]))
+
+
+@pytest.mark.parametrize(
+    "query_start_loc",
+    ((1, 3), (0, 2), (0, 2, 2, 3), (0, 3.0)),
+)
+def test_forward_batch_rejects_invalid_query_boundaries(
+    query_start_loc: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="query_start_loc"):
+        ForwardBatch(
+            input_ids=torch.tensor([1, 2, 3]),
+            query_start_loc=query_start_loc,
+        )
+
+
+def test_forward_batch_exposes_packed_query_lengths() -> None:
+    batch = ForwardBatch(
+        input_ids=torch.tensor([1, 2, 3, 4, 5]),
+        positions=torch.tensor([0, 1, 2, 0, 1]),
+        query_start_loc=(0, 3, 5),
+    )
+
+    assert batch.batch_size == 2
+    assert batch.query_lengths == (3, 2)
+
+
+def test_forward_batch_requires_positions_for_multiple_requests() -> None:
+    with pytest.raises(ValueError, match="positions are required"):
+        ForwardBatch(
+            input_ids=torch.tensor([1, 2, 3]),
+            query_start_loc=(0, 1, 3),
+        )
 
 
 def test_model_projects_only_requested_query_rows() -> None:
     runner = create_runner()
     runner.load(tiny_spec())
     session = runner.open_session()
-    input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
-    full = session.forward(ForwardBatch(input_ids=input_ids)).logits
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6])
+    positions = torch.tensor([0, 1, 2, 0, 1, 2])
+    full = session.forward(
+        ForwardBatch(
+            input_ids=input_ids,
+            positions=positions,
+            query_start_loc=(0, 3, 6),
+        )
+    ).logits
 
     selected = session.forward(
         ForwardBatch(
             input_ids=input_ids,
-            logit_query_indices=((2,), (1,)),
+            positions=positions,
+            query_start_loc=(0, 3, 6),
+            logit_query_indices=(2, 4),
         )
     ).logits
     skipped = session.forward(
         ForwardBatch(
             input_ids=input_ids,
-            logit_query_indices=((), ()),
+            positions=positions,
+            query_start_loc=(0, 3, 6),
+            logit_query_indices=(),
         )
     ).logits
 
-    assert selected.shape == (2, 1, 32)
-    torch.testing.assert_close(selected[0, 0], full[0, 2])
-    torch.testing.assert_close(selected[1, 0], full[1, 1])
-    assert skipped.shape == (2, 0, 32)
+    assert selected.shape == (2, 32)
+    torch.testing.assert_close(selected[0], full[2])
+    torch.testing.assert_close(selected[1], full[4])
+    assert skipped.shape == (0, 32)
 
 
 def test_forward_batch_rejects_invalid_logit_query_indices() -> None:
-    with pytest.raises(ValueError, match="valid query positions"):
+    with pytest.raises(ValueError, match="valid token rows"):
         ForwardBatch(
-            input_ids=torch.tensor([[1, 2]]),
-            logit_query_indices=((2,),),
+            input_ids=torch.tensor([1, 2]),
+            logit_query_indices=(2,),
         )
 
 
@@ -104,7 +152,7 @@ def test_attention_model_exposes_its_kv_cache_shape_without_runner_dispatch() ->
 def test_state_dict_loader_round_trip(tmp_path: Path) -> None:
     spec = tiny_spec()
     source_model = create_catalog().models.get(spec.architecture)(spec).eval()
-    batch = ForwardBatch(input_ids=torch.tensor([[1, 2]]))
+    batch = ForwardBatch(input_ids=torch.tensor([1, 2]))
     source_output = source_model(batch)
 
     checkpoint = tmp_path / "tiny.pt"
@@ -119,7 +167,7 @@ def test_state_dict_loader_round_trip(tmp_path: Path) -> None:
 
 class ScaleModel(nn.Module):
     def forward(self, batch: ForwardBatch) -> ModelOutput:
-        return ModelOutput(logits=batch.input_ids.float() * 2)
+        return ModelOutput(logits=batch.input_ids.float().unsqueeze(-1) * 2)
 
 
 class DirectLoader:
@@ -134,9 +182,9 @@ def test_components_can_be_added_without_core_changes() -> None:
 
     runner = create_runner(catalog)
     runner.load(ModelSpec(architecture="scale", loader="direct"))
-    output = runner.open_session().forward(ForwardBatch(input_ids=torch.tensor([[2, 4]])))
+    output = runner.open_session().forward(ForwardBatch(input_ids=torch.tensor([2, 4])))
 
-    torch.testing.assert_close(output.logits, torch.tensor([[4.0, 8.0]]))
+    torch.testing.assert_close(output.logits, torch.tensor([[4.0], [8.0]]))
 
 
 def test_failed_reload_keeps_current_model() -> None:
@@ -147,8 +195,8 @@ def test_failed_reload_keeps_current_model() -> None:
         runner.load(tiny_spec(loader="state-dict", weights=None))
 
     assert runner.generation == 1
-    output = runner.open_session().forward(ForwardBatch(input_ids=torch.tensor([[1]])))
-    assert output.logits.shape == (1, 1, 32)
+    output = runner.open_session().forward(ForwardBatch(input_ids=torch.tensor([1])))
+    assert output.logits.shape == (1, 32)
 
 
 def test_open_session_keeps_one_model_generation_across_reload() -> None:
@@ -158,7 +206,7 @@ def test_open_session_keeps_one_model_generation_across_reload() -> None:
 
     runner.load(tiny_spec(model_args={"vocab_size": 16, "hidden_size": 8}))
 
-    batch = ForwardBatch(input_ids=torch.tensor([[1]]))
+    batch = ForwardBatch(input_ids=torch.tensor([1]))
     assert old_session.generation == 1
     assert old_session.forward(batch).logits.shape[-1] == 32
     assert runner.open_session().forward(batch).logits.shape[-1] == 16

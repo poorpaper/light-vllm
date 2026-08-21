@@ -266,7 +266,7 @@ class Qwen2Attention(nn.Module):
         cosines: Tensor,
         sines: Tensor,
     ) -> Tensor:
-        batch_size, query_width, _ = hidden_states.shape
+        num_tokens = hidden_states.shape[0]
         merged_weight = self._merged_qkv_weight
         merged_bias = self._merged_qkv_bias
         if merged_weight is None or merged_bias is None:
@@ -282,14 +282,12 @@ class Qwen2Attention(nn.Module):
                 dim=-1,
             )
         queries = query_projection.view(
-            batch_size,
-            query_width,
+            num_tokens,
             self._num_query_heads,
             self._head_size,
         )
         keys = key_projection.view(
-            batch_size,
-            query_width,
+            num_tokens,
             self._num_kv_heads,
             self._head_size,
         )
@@ -307,7 +305,7 @@ class Qwen2Attention(nn.Module):
             values,
             scale=self._scale,
         )
-        output = self.o_proj(attended.reshape(batch_size, query_width, -1))
+        output = self.o_proj(attended.reshape(num_tokens, -1))
         return output
 
     def prepare_for_inference(self) -> None:
@@ -565,7 +563,7 @@ class Qwen2ForCausalLM(nn.Module):
                 / self.config.head_size
             )
         )
-        angles = torch.einsum("bs,d->bsd", positions.float(), frequencies)
+        angles = torch.einsum("s,d->sd", positions.float(), frequencies)
         embeddings = torch.cat((angles, angles), dim=-1)
         return embeddings.cos().to(dtype), embeddings.sin().to(dtype)
 

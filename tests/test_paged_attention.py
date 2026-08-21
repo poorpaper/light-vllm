@@ -85,10 +85,10 @@ def test_tree_layout_hides_siblings_in_dense_and_paged_attention() -> None:
     torch.manual_seed(20260819)
     cache = _cache()
     layout = QueryLayout((-1, 0, 0, 2))
-    positions = torch.tensor([semantic_positions(layout, prefix_length=0)])
-    query = torch.randn(1, 4, 2, 4)
-    key = torch.randn(1, 4, 2, 4)
-    value = torch.randn(1, 4, 2, 4)
+    positions = torch.tensor(semantic_positions(layout, prefix_length=0))
+    query = torch.randn(4, 2, 4)
+    key = torch.randn(4, 2, 4)
+    value = torch.randn(4, 2, 4)
     scale = 0.5
 
     dense_output = TorchDenseAttention(
@@ -110,12 +110,12 @@ def test_tree_layout_hides_siblings_in_dense_and_paged_attention() -> None:
     visible_indices = ((0,), (0, 1), (0, 2), (0, 2, 3))
     for query_offset, indices in enumerate(visible_indices):
         expected = _dense_attention(
-            query[0, query_offset],
-            key[0, list(indices)],
-            value[0, list(indices)],
+            query[query_offset],
+            key[list(indices)],
+            value[list(indices)],
         )
-        torch.testing.assert_close(dense_output[0, query_offset], expected)
-        torch.testing.assert_close(paged_output[0, query_offset], expected)
+        torch.testing.assert_close(dense_output[query_offset], expected)
+        torch.testing.assert_close(paged_output[query_offset], expected)
 
 
 def test_slot_mapping_uses_non_contiguous_physical_blocks() -> None:
@@ -125,9 +125,9 @@ def test_slot_mapping_uses_non_contiguous_physical_blocks() -> None:
         query_layouts=_layouts(3, 2),
     )
 
-    mapping = metadata.slot_mapping(block_size=2, query_width=3, device=torch.device("cpu"))
+    mapping = metadata.slot_mapping(block_size=2, device=torch.device("cpu"))
 
-    assert mapping.tolist() == [[4, 5, 0], [3, 6, -1]]
+    assert mapping.tolist() == [4, 5, 0, 3, 6]
 
 
 def test_paged_metadata_identifies_linear_and_tree_query_layouts() -> None:
@@ -146,15 +146,44 @@ def test_paged_metadata_identifies_linear_and_tree_query_layouts() -> None:
     assert not tree.has_only_linear_queries
 
 
+def test_paged_metadata_packs_request_indices_and_tree_visibility() -> None:
+    metadata = PagedAttentionMetadata(
+        block_tables=((0, 1), (2,)),
+        num_computed_tokens=(0, 0),
+        query_layouts=(QueryLayout((-1, 0, 0)), linear_query_layout(2)),
+    )
+
+    visibility, visibility_start = metadata.visibility_tensor(device=torch.device("cpu"))
+
+    assert metadata.query_start_loc == (0, 3, 5)
+    assert metadata.request_indices_tensor(device=torch.device("cpu")).tolist() == [0, 0, 0, 1, 1]
+    assert visibility_start.tolist() == [0, 9, 13]
+    assert visibility.tolist() == [
+        True,
+        False,
+        False,
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+        True,
+        False,
+        True,
+        True,
+    ]
+
+
 def test_paged_cache_compacts_a_non_contiguous_path_across_blocks() -> None:
     cache = _cache()
-    prefix_keys = torch.arange(16, dtype=torch.float32).reshape(1, 2, 2, 4)
+    prefix_keys = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
     prefix_values = prefix_keys + 100
     cache.write(
         "attention",
         prefix_keys,
         prefix_values,
-        torch.tensor([[2, 3]]),
+        torch.tensor([2, 3]),
     )
     layout = QueryLayout((-1, 0, 0, 2, 3))
     metadata = PagedAttentionMetadata(
@@ -163,7 +192,7 @@ def test_paged_cache_compacts_a_non_contiguous_path_across_blocks() -> None:
         query_layouts=(layout,),
         num_readonly_prefix_blocks=(1,),
     )
-    query_keys = torch.arange(40, dtype=torch.float32).reshape(1, 5, 2, 4) + 20
+    query_keys = torch.arange(40, dtype=torch.float32).reshape(5, 2, 4) + 20
     query_values = query_keys + 100
     cache.write(
         "attention",
@@ -171,7 +200,6 @@ def test_paged_cache_compacts_a_non_contiguous_path_across_blocks() -> None:
         query_values,
         metadata.slot_mapping(
             block_size=2,
-            query_width=5,
             device=torch.device("cpu"),
         ),
     )
@@ -186,17 +214,17 @@ def test_paged_cache_compacts_a_non_contiguous_path_across_blocks() -> None:
     )
 
     layer = cache.layer("attention")
-    torch.testing.assert_close(layer.keys[1], prefix_keys[0])
+    torch.testing.assert_close(layer.keys[1], prefix_keys)
     destination_slots = (6, 7, 0)
     flat_keys = layer.keys.view(8, 2, 4)
     flat_values = layer.values.view(8, 2, 4)
     torch.testing.assert_close(
         flat_keys[list(destination_slots)],
-        query_keys[0, [0, 2, 4]],
+        query_keys[[0, 2, 4]],
     )
     torch.testing.assert_close(
         flat_values[list(destination_slots)],
-        query_values[0, [0, 2, 4]],
+        query_values[[0, 2, 4]],
     )
 
 
@@ -208,9 +236,9 @@ def test_paged_attention_matches_dense_attention_across_blocks_and_requests() ->
         num_computed_tokens=(0, 0),
         query_layouts=_layouts(3, 2),
     )
-    first_query = torch.randn(2, 3, 2, 4)
-    first_key = torch.randn(2, 3, 2, 4)
-    first_value = torch.randn(2, 3, 2, 4)
+    first_query = torch.randn(5, 2, 4)
+    first_key = torch.randn(5, 2, 4)
+    first_value = torch.randn(5, 2, 4)
 
     first_output = TorchPagedAttention(cache, first_metadata).forward(
         "attention",
@@ -220,24 +248,23 @@ def test_paged_attention_matches_dense_attention_across_blocks_and_requests() ->
         scale=0.5,
     )
 
-    for row, query_length in enumerate((3, 2)):
+    for start, query_length in ((0, 3), (3, 2)):
         for offset in range(query_length):
             expected = _dense_attention(
-                first_query[row, offset],
-                first_key[row, : offset + 1],
-                first_value[row, : offset + 1],
+                first_query[start + offset],
+                first_key[start : start + offset + 1],
+                first_value[start : start + offset + 1],
             )
-            torch.testing.assert_close(first_output[row, offset], expected)
-    assert first_output[1, 2].count_nonzero() == 0
+            torch.testing.assert_close(first_output[start + offset], expected)
 
     decode_metadata = PagedAttentionMetadata(
         block_tables=((2, 0), (1, 3)),
         num_computed_tokens=(3, 2),
         query_layouts=_layouts(1, 1),
     )
-    decode_query = torch.randn(2, 1, 2, 4)
-    decode_key = torch.randn(2, 1, 2, 4)
-    decode_value = torch.randn(2, 1, 2, 4)
+    decode_query = torch.randn(2, 2, 4)
+    decode_key = torch.randn(2, 2, 4)
+    decode_value = torch.randn(2, 2, 4)
 
     decode_output = TorchPagedAttention(cache, decode_metadata).forward(
         "attention",
@@ -248,10 +275,13 @@ def test_paged_attention_matches_dense_attention_across_blocks_and_requests() ->
     )
 
     for row, previous_length in enumerate((3, 2)):
-        keys = torch.cat((first_key[row, :previous_length], decode_key[row]), dim=0)
-        values = torch.cat((first_value[row, :previous_length], decode_value[row]), dim=0)
-        expected = _dense_attention(decode_query[row, 0], keys, values)
-        torch.testing.assert_close(decode_output[row, 0], expected)
+        start = 0 if row == 0 else 3
+        keys = torch.cat((first_key[start : start + previous_length], decode_key[row : row + 1]))
+        values = torch.cat(
+            (first_value[start : start + previous_length], decode_value[row : row + 1])
+        )
+        expected = _dense_attention(decode_query[row], keys, values)
+        torch.testing.assert_close(decode_output[row], expected)
 
 
 def test_paged_attention_supports_grouped_query_heads() -> None:
@@ -262,9 +292,9 @@ def test_paged_attention_supports_grouped_query_heads() -> None:
         num_computed_tokens=(0,),
         query_layouts=_layouts(3),
     )
-    query = torch.randn(1, 3, 4, 4)
-    key = torch.randn(1, 3, 2, 4)
-    value = torch.randn(1, 3, 2, 4)
+    query = torch.randn(3, 4, 4)
+    key = torch.randn(3, 2, 4)
+    value = torch.randn(3, 2, 4)
 
     output = TorchPagedAttention(cache, metadata).forward(
         "attention",
@@ -275,8 +305,8 @@ def test_paged_attention_supports_grouped_query_heads() -> None:
     )
 
     for offset in range(3):
-        expected = _dense_attention(query[0, offset], key[0, : offset + 1], value[0, : offset + 1])
-        torch.testing.assert_close(output[0, offset], expected)
+        expected = _dense_attention(query[offset], key[: offset + 1], value[: offset + 1])
+        torch.testing.assert_close(output[offset], expected)
 
 
 def test_slot_mapping_rejects_a_block_table_that_does_not_cover_the_query() -> None:
@@ -287,7 +317,7 @@ def test_slot_mapping_rejects_a_block_table_that_does_not_cover_the_query() -> N
     )
 
     with pytest.raises(KVCacheError, match="block table does not cover"):
-        metadata.slot_mapping(block_size=2, query_width=2, device=torch.device("cpu"))
+        metadata.slot_mapping(block_size=2, device=torch.device("cpu"))
 
 
 def test_paged_attention_rejects_an_out_of_range_history_block() -> None:
@@ -302,9 +332,9 @@ def test_paged_attention_rejects_an_out_of_range_history_block() -> None:
     with pytest.raises(KVCacheError, match="out-of-range physical block"):
         TorchPagedAttention(cache, metadata).forward(
             "attention",
-            torch.randn(1, 1, 2, 4),
-            torch.randn(1, 1, 2, 4),
-            torch.randn(1, 1, 2, 4),
+            torch.randn(1, 2, 4),
+            torch.randn(1, 2, 4),
+            torch.randn(1, 2, 4),
             scale=0.5,
         )
 
@@ -320,9 +350,9 @@ def test_paged_attention_rejects_an_aliased_block_within_one_request() -> None:
     with pytest.raises(KVCacheError, match="aliases a physical block within one request"):
         TorchPagedAttention(cache, metadata).forward(
             "attention",
-            torch.randn(1, 1, 2, 4),
-            torch.randn(1, 1, 2, 4),
-            torch.randn(1, 1, 2, 4),
+            torch.randn(1, 2, 4),
+            torch.randn(1, 2, 4),
+            torch.randn(1, 2, 4),
             scale=0.5,
         )
 
@@ -339,9 +369,9 @@ def test_paged_attention_rejects_aliased_blocks_across_requests() -> None:
     with pytest.raises(KVCacheError, match="alias a physical block across requests"):
         TorchPagedAttention(cache, metadata).forward(
             "attention",
-            torch.randn(2, 1, 2, 4),
-            torch.randn(2, 1, 2, 4),
-            torch.randn(2, 1, 2, 4),
+            torch.randn(2, 2, 4),
+            torch.randn(2, 2, 4),
+            torch.randn(2, 2, 4),
             scale=0.5,
         )
 
@@ -349,18 +379,18 @@ def test_paged_attention_rejects_aliased_blocks_across_requests() -> None:
 def test_paged_attention_allows_the_same_readonly_prefix_position() -> None:
     torch.manual_seed(29)
     cache = _cache()
-    past_keys = torch.randn(1, 2, 2, 4)
-    past_values = torch.randn(1, 2, 2, 4)
-    cache.write("attention", past_keys, past_values, torch.tensor([[0, 1]]))
+    past_keys = torch.randn(2, 2, 4)
+    past_values = torch.randn(2, 2, 4)
+    cache.write("attention", past_keys, past_values, torch.tensor([0, 1]))
     metadata = PagedAttentionMetadata(
         block_tables=((0, 1), (0, 2)),
         num_computed_tokens=(2, 2),
         query_layouts=_layouts(1, 1),
         num_readonly_prefix_blocks=(1, 1),
     )
-    query = torch.randn(2, 1, 2, 4)
-    key = torch.randn(2, 1, 2, 4)
-    value = torch.randn(2, 1, 2, 4)
+    query = torch.randn(2, 2, 4)
+    key = torch.randn(2, 2, 4)
+    value = torch.randn(2, 2, 4)
 
     output = TorchPagedAttention(cache, metadata).forward(
         "attention",
@@ -372,11 +402,11 @@ def test_paged_attention_allows_the_same_readonly_prefix_position() -> None:
 
     for row in range(2):
         expected = _dense_attention(
-            query[row, 0],
-            torch.cat((past_keys[0], key[row]), dim=0),
-            torch.cat((past_values[0], value[row]), dim=0),
+            query[row],
+            torch.cat((past_keys, key[row : row + 1]), dim=0),
+            torch.cat((past_values, value[row : row + 1]), dim=0),
         )
-        torch.testing.assert_close(output[row, 0], expected)
+        torch.testing.assert_close(output[row], expected)
 
 
 @pytest.mark.parametrize(
@@ -426,11 +456,10 @@ def test_paged_attention_keeps_unused_lookahead_as_an_explicit_reservation() -> 
     metadata.validate_block_tables(num_blocks=3, block_size=1)
     mapping = metadata.slot_mapping(
         block_size=1,
-        query_width=1,
         device=torch.device("cpu"),
     )
 
-    assert mapping.tolist() == [[0]]
+    assert mapping.tolist() == [0]
 
 
 @pytest.mark.parametrize(
@@ -455,8 +484,8 @@ def test_paged_attention_rejects_unused_trailing_blocks(
     with pytest.raises(KVCacheError, match="unused physical blocks"):
         TorchPagedAttention(cache, metadata).forward(
             "attention",
-            torch.randn(batch_size, 1, 2, 4),
-            torch.randn(batch_size, 1, 2, 4),
-            torch.randn(batch_size, 1, 2, 4),
+            torch.randn(batch_size, 2, 4),
+            torch.randn(batch_size, 2, 4),
+            torch.randn(batch_size, 2, 4),
             scale=0.5,
         )

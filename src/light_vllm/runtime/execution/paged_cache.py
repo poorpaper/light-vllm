@@ -175,8 +175,8 @@ class PagedKVCache:
         synchronizations while direct cache callers keep defensive validation.
         """
 
-        if slot_mapping.ndim != 2:
-            raise KVCacheError("slot mapping must have shape [batch, query]")
+        if slot_mapping.ndim != 1:
+            raise KVCacheError("slot mapping must have one entry per packed query token")
         if slot_mapping.device != self._config.device:
             raise KVCacheError("slot mapping device must match the cache")
         active = slot_mapping >= 0
@@ -207,13 +207,11 @@ class PagedKVCache:
         layer = self.layer(layer_id)
         spec = self.layer_spec(layer_id)
         expected_tail = (spec.num_kv_heads, spec.head_size)
-        if key.ndim != 4 or key.shape[2:] != expected_tail:
-            raise KVCacheError(
-                "paged KV update must have shape [batch, query, kv_heads, head_size]"
-            )
+        if key.ndim != 3 or key.shape[1:] != expected_tail:
+            raise KVCacheError("paged KV update must have shape [tokens, kv_heads, head_size]")
         if value.shape != key.shape:
             raise KVCacheError("paged K/V updates must have the same shape")
-        if mapping.active.shape != key.shape[:2]:
+        if mapping.active.shape != key.shape[:1]:
             raise KVCacheError("slot mapping must have one entry per query token")
         if key.dtype != self._config.dtype or key.device != self._config.device:
             raise KVCacheError("paged KV update dtype and device must match the cache")
@@ -231,8 +229,8 @@ class PagedKVCache:
         num_slots = self._config.num_blocks * self._config.block_size
         flat_keys = layer.keys.view(num_slots, *expected_tail)
         flat_values = layer.values.view(num_slots, *expected_tail)
-        query_keys = key.flatten(0, 1)
-        query_values = value.flatten(0, 1)
+        query_keys = key
+        query_values = value
         if mapping.source_indices.numel() != mapping.active.numel():
             query_keys = query_keys.index_select(0, mapping.source_indices)
             query_values = query_values.index_select(0, mapping.source_indices)

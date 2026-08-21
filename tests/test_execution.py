@@ -79,7 +79,7 @@ class IncrementingForwarder:
         logits = torch.full((*batch.input_ids.shape, self.vocab_size), -1.0)
         logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
         if batch.attention is not None:
-            keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
+            keys = batch.input_ids.to(torch.float32).reshape(-1, 1, 1)
             batch.attention.forward(
                 "attention",
                 keys,
@@ -104,7 +104,7 @@ class InvalidOutputForwarder:
     max_model_tokens = None
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
-        return ModelOutput(logits=torch.zeros(1, 8))
+        return ModelOutput(logits=torch.zeros(2, 8))
 
 
 class FixedSampler:
@@ -274,8 +274,8 @@ def _paged_worker(
 
 
 def _dense_tiny_logits(model, token_ids: tuple[int, ...]) -> torch.Tensor:
-    input_ids = torch.tensor([token_ids])
-    positions = torch.arange(len(token_ids)).unsqueeze(0)
+    input_ids = torch.tensor(token_ids)
+    positions = torch.arange(len(token_ids))
     attention = TorchDenseAttention(
         model.kv_cache_spec,
         DenseAttentionMetadata(
@@ -390,10 +390,8 @@ def test_engine_ngram_speculation_matches_target_generation(
                 self.queries: list[tuple[int, ...]] = []
 
             def forward(self, batch: ForwardBatch) -> ModelOutput:
-                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
-                self.queries.append(
-                    tuple(int(value) for value in batch.input_ids[0, :query_length])
-                )
+                assert batch.query_start_loc is not None
+                self.queries.append(tuple(int(value) for value in batch.input_ids))
                 return super().forward(batch)
 
         forwarder = RecordingIncrementingForwarder()
@@ -454,10 +452,8 @@ def test_engine_tree_speculation_compacts_a_non_contiguous_root(
                 self.queries: list[tuple[int, ...]] = []
 
             def forward(self, batch: ForwardBatch) -> ModelOutput:
-                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
-                self.queries.append(
-                    tuple(int(value) for value in batch.input_ids[0, :query_length])
-                )
+                assert batch.query_start_loc is not None
+                self.queries.append(tuple(int(value) for value in batch.input_ids))
                 return super().forward(batch)
 
         forwarder = RecordingForwarder()
@@ -520,14 +516,14 @@ def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> No
     )
 
     expected_prefill = tuple(
-        int(_dense_tiny_logits(forwarder.model, tokens)[0, -1].argmax().item())
+        int(_dense_tiny_logits(forwarder.model, tokens)[-1].argmax().item())
         for tokens in ((1, 2, 3), (5, 6))
     )
     assert tuple(result.output_token_ids[0] for result in prefill.requests) == expected_prefill
     assert forwarder.calls == 1
     torch.testing.assert_close(
         forwarder.position_batches[0],
-        torch.tensor([[0, 1, 2], [0, 1, 0]]),
+        torch.tensor([0, 1, 2, 0, 1]),
     )
 
     decode = executor.execute(
@@ -539,7 +535,7 @@ def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> No
         )
     )
     expected_decode = tuple(
-        int(_dense_tiny_logits(forwarder.model, tokens + (generated,))[0, -1].argmax().item())
+        int(_dense_tiny_logits(forwarder.model, tokens + (generated,))[-1].argmax().item())
         for tokens, generated in zip(
             ((1, 2, 3), (5, 6)),
             expected_prefill,
@@ -549,7 +545,7 @@ def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> No
 
     assert tuple(result.output_token_ids[0] for result in decode.requests) == expected_decode
     assert forwarder.calls == 2
-    torch.testing.assert_close(forwarder.position_batches[1], torch.tensor([[3], [2]]))
+    torch.testing.assert_close(forwarder.position_batches[1], torch.tensor([3, 2]))
 
 
 def test_paged_step_rejects_execution_without_block_tables() -> None:

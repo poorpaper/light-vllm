@@ -91,7 +91,6 @@ class TinyAttentionCausalLM(nn.Module):
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.reshape(
             tensor.shape[0],
-            tensor.shape[1],
             self.config.num_heads,
             self.head_size,
         )

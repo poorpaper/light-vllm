@@ -123,7 +123,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回每请求有效 logits |
 | `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
 | `Sampler` | 从二维 `[batch, vocabulary]` logits 选择 token |
-| `ForwardBatch` / `ModelOutput` | token、绝对 position、attention 上下文、待投影 query 行与对应 logits 的统一模型边界 |
+| `ForwardBatch` / `ModelOutput` | 一维 token 流、请求边界、绝对 position、attention 上下文与对应 logits 的统一模型边界 |
 | `ModelKVCacheSpec` | 模型声明的逐 attention 层 K/V 形状 |
 | `AttentionContext` | 模型调用连续或分页 attention 后端的稳定边界 |
 | `EngineCapabilities` | 初始化后可发现的模型、KV、并发和单轮容量事实 |
@@ -138,7 +138,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 `SchedulerOutput` 和 `RequestOutput` 是扩展的关键：前者不包含模式名，后者不限制一次只能输出一个 token，
 并明确哪些输出已经写入 KV。chunked prefill、普通 decode 和投机验证因此共用同一循环。Decode Handler 还精确
 声明本轮会消费哪些 query 行的 logits：普通生成只选择每个请求最后一个有效输入，纯 prefill 选择空集，投机验证
-选择正式输入最后一行和全部草稿节点。模型在 vocabulary head 前收窄 hidden states，避免先对 padded query 全宽
+选择正式输入最后一行和全部草稿节点。模型在 vocabulary head 前收窄 hidden states，避免先对无用 query 行
 投影再由 Worker 丢弃。
 
 原生 Qwen family 模型也使用这组契约：`qwen2` 与 `qwen2.5` 注册名指向同一个 factory，官方 Qwen2.5
@@ -227,7 +227,8 @@ rollback API。
 
 分页 Step Handler 持有每层 `[block, offset, kv_head, head_size]` 的全局 K/V tensor。它把请求逻辑位置映射为
 `block_id * block_size + offset`，原位写入本轮 K/V，并按 block table 逐页完成 causal attention。不同长度
-请求会组成一个 padded forward batch，`sequence_lengths` 屏蔽 padding，`positions` 始终保存请求内绝对位置。
+请求会组成一维 token-major forward batch；`query_start_loc` 保存各请求的首尾边界，`positions` 始终保存请求内
+绝对位置。Q/K/V、hidden states 与 slot mapping 都只包含真实 token，不为 mixed prefill/decode 补齐宽度。
 连续与分页 Step Handler 都从模型唯一的 `ModelKVCacheSpec` 获取逐层 KV 形状，装配层不再重复配置层数、KV head 或
 head size。`QueryLayout` 将每个 query 的语义位置与物理 slot 分开：兄弟节点可以有相同 RoPE position，但只能读取
 已提交前缀、祖先和自身，并写入不同 slot。验收路径不是展平前缀时，Step Handler 先 gather/clone/scatter 压实 KV，
@@ -236,12 +237,13 @@ query 与显式 lookahead reservation，不携带未预留尾页。可选 prefix
 哈希链保留父摘要和本页精确 token，零引用页进入 LRU。跨请求只允许在相同逻辑位置共享双方都声明为只读的前缀页，
 query 与未填满尾页始终独占。命中时至少留一个 token 重新计算 logits；prompt 恰好整页时会重算最后一整页。
 
-Triton backend 在 context 创建时把 block table、已计算长度和 query 长度一次转成 GPU tensor，供所有模型层复用。
-普通线性 query 的可见性由 `key_query_offset <= query_offset` 直接表达，不再构造或上传 `[B, W, W]` 布尔矩阵；
-非线性草稿树仍使用 `QueryLayout` 推导的显式 visibility tensor。
+Triton backend 在 context 创建时把 block table、已计算长度、query 边界和 token 到请求的映射一次转成 GPU tensor，
+供所有模型层复用。普通线性 query 的可见性由 `key_query_offset <= query_offset` 直接表达，不构造 visibility；
+非线性草稿树把每个请求的方阵连续拼接成紧凑一维 visibility，不产生跨请求 padding。
 本轮 K/V 先写入物理页，再在同一 CUDA stream 启动 fused attention；两步不放进同一个 grid，避免 prefill 的某个
 query program 读取到另一个 program 尚未写完的 K/V。首版一个 program 负责一个 query token 的一个 query head，
-直接按逻辑位置查页表，并用 FP32 累计在线 softmax。这个结构便于检查，长上下文的分段并行与归并留给后续优化。
+grid 只覆盖 `(total_query_tokens, query_heads)`，直接按逻辑位置查页表，并用 FP32 累计在线 softmax。这个结构
+便于检查，长上下文的分段并行与归并留给后续优化。
 
 连续 Step Handler 为每个请求创建 `TorchDenseAttention`。它读取请求级连续历史，在模型逐层调用时完成 dense
 attention 并暂存本轮 K/V；只有模型 forward 和输出校验全部成功，Handler 才把所有层一次性追加到
@@ -388,14 +390,14 @@ flowchart LR
     Paged --> Capacity["capacity discovery + admission<br/>完成"]
     Capacity --> Prefix["Prefix cache<br/>完成"]
     Prefix --> Spec["Tree speculative decoding<br/>CPU 正确性完成"]
-    Spec --> Kernel["Triton tree mask<br/>代码/测试完成 · GPU 待验收"]
+    Spec --> Kernel["Packed Triton tree mask<br/>代码/测试完成 · GPU 待验收"]
     Kernel --> Metrics["性能指标 + Prometheus/Grafana/HPA<br/>完成"]
     Metrics --> SLO["短请求池 + TTFT 早拒 + 可选 self-resubmit<br/>完成"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
-Torch 2.8.0、Triton 3.4.0 环境完成既有线性场景的 JIT 和数值对照；树形 visibility kernel 与 padded parity
-测试已经加入，但仍需 CUDA 环境验收。长上下文性能、跨显卡和 chain/trie 端到端收益也仍是后续工作。
+Torch 2.8.0、Triton 3.4.0 环境完成既有线性场景的 JIT 和数值对照；packed tree visibility kernel 测试已经
+加入，但仍需 CUDA 环境验收。长上下文性能、跨显卡和 chain/trie 端到端收益也仍是后续工作。
 
 ## 13. 验证要求
 
@@ -415,8 +417,8 @@ prefix 命中/LRU/epoch、草稿树约束/兄弟隔离/非连续路径验收/com
 self-resubmit 的 prompt+1 block/global watermark、不重复输出/严格 fallback/资源归还、TTFT/ITL、step 延迟、
 两种 token backlog、KV 使用率、执行失败和
 取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
-Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、padded GQA、decode 历史、共享
-prefix、未使用 lookahead 和 padded mixed tree visibility。
+Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、packed mixed GQA、decode 历史、
+共享 prefix、未使用 lookahead 和 packed mixed tree visibility。
 
 边界命名与职责参考 [vLLM Architecture Overview](https://docs.vllm.ai/en/latest/design/arch_overview/)；分页布局与
 按需读取原则参考 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)。完整页哈希与 LRU 参考

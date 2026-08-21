@@ -79,16 +79,16 @@ def _loaded_qwen2():
 
 def _dense_forward(session, input_ids: torch.Tensor, *, past=None, logit_query_indices=None):
     assert session.kv_cache_spec is not None
-    positions = torch.arange(input_ids.shape[1]).expand(input_ids.shape[0], -1)
+    assert input_ids.ndim == 2 and input_ids.shape[0] == 1
+    input_ids = input_ids.flatten()
+    positions = torch.arange(input_ids.shape[0])
     if past is not None:
         positions = positions + past.num_tokens
     attention = TorchDenseAttention(
         session.kv_cache_spec,
         DenseAttentionMetadata(
             positions=positions,
-            query_layouts=tuple(
-                linear_query_layout(input_ids.shape[1]) for _ in range(input_ids.shape[0])
-            ),
+            query_layouts=(linear_query_layout(input_ids.shape[0]),),
         ),
         past,
     )
@@ -151,8 +151,8 @@ def test_qwen2_contiguous_kv_matches_full_sequence() -> None:
         past=prefill_attention.cache_updates,
     )
 
-    torch.testing.assert_close(prefill.logits, full.logits[:, :3], atol=1e-6, rtol=1e-5)
-    torch.testing.assert_close(decode.logits, full.logits[:, 3:], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(prefill.logits, full.logits[:3], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(decode.logits, full.logits[3:], atol=1e-6, rtol=1e-5)
 
 
 def test_qwen2_projects_only_requested_query_rows() -> None:
@@ -160,12 +160,12 @@ def test_qwen2_projects_only_requested_query_rows() -> None:
     input_ids = torch.tensor([[1, 5, 9, 13]])
     full, _ = _dense_forward(session, input_ids)
 
-    selected, _ = _dense_forward(session, input_ids, logit_query_indices=((3,),))
-    skipped, _ = _dense_forward(session, input_ids, logit_query_indices=((),))
+    selected, _ = _dense_forward(session, input_ids, logit_query_indices=(3,))
+    skipped, _ = _dense_forward(session, input_ids, logit_query_indices=())
 
-    assert selected.logits.shape == (1, 1, 64)
-    torch.testing.assert_close(selected.logits, full.logits[:, 3:])
-    assert skipped.logits.shape == (1, 0, 64)
+    assert selected.logits.shape == (1, 64)
+    torch.testing.assert_close(selected.logits, full.logits[3:])
+    assert skipped.logits.shape == (0, 64)
 
 
 def test_qwen2_paged_attention_matches_full_sequence() -> None:
@@ -191,7 +191,7 @@ def test_qwen2_paged_attention_matches_full_sequence() -> None:
         ),
     )
 
-    paged = session.forward(ForwardBatch(input_ids=input_ids, attention=attention))
+    paged = session.forward(ForwardBatch(input_ids=input_ids.flatten(), attention=attention))
 
     assert attention.layer_ids == frozenset(
         {"model.layers.0.self_attn", "model.layers.1.self_attn"}
@@ -287,4 +287,4 @@ def test_qwen2_logits_match_transformers_reference() -> None:
         expected = reference(input_ids=input_ids, use_cache=False).logits
         actual = _dense_forward(model, input_ids)[0].logits
 
-    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(actual, expected[0], atol=1e-6, rtol=1e-5)

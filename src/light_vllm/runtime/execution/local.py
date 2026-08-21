@@ -47,12 +47,12 @@ class _LocalTokenExecutionSession:
     def next_token(self, token_ids: tuple[int, ...]) -> int:
         if not token_ids:
             raise ExecutionError("token_ids must not be empty")
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self._device)
+        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self._device)
         positions = torch.arange(
             len(token_ids),
             dtype=torch.long,
             device=self._device,
-        ).unsqueeze(0)
+        )
         attention = None
         model_spec = self._model.kv_cache_spec
         if model_spec is not None:
@@ -74,7 +74,7 @@ class _LocalTokenExecutionSession:
             expected_layers = frozenset(layer.layer_id for layer in model_spec.layers)
             if attention.layer_ids != expected_layers:
                 raise ExecutionError("model did not execute every configured dense attention layer")
-        return self._sampler.sample(output.logits[:, -1])[0]
+        return self._sampler.sample(output.logits[-1:])[0]
 
 
 class LocalTokenExecutor:

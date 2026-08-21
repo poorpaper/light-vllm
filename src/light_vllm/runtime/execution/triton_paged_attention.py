@@ -33,10 +33,12 @@ if triton is not None:
         value_cache_ptr,
         block_table_ptr,
         computed_ptr,
+        query_start_loc_ptr,
+        request_indices_ptr,
         query_length_ptr,
         query_visibility_ptr,
+        visibility_start_ptr,
         output_ptr,
-        stride_query_batch,
         stride_query_token,
         stride_query_head,
         stride_query_dim,
@@ -49,10 +51,6 @@ if triton is not None:
         stride_value_head,
         stride_value_dim,
         stride_table_batch,
-        stride_visibility_batch,
-        stride_visibility_query,
-        stride_visibility_key,
-        stride_output_batch,
         stride_output_token,
         stride_output_head,
         stride_output_dim,
@@ -67,25 +65,24 @@ if triton is not None:
     ):
         """一个 program 计算一个 query token 的一个 query head。"""
 
-        batch_index = tl.program_id(0)
-        query_offset = tl.program_id(1)
-        query_head = tl.program_id(2)
+        token_index = tl.program_id(0)
+        query_head = tl.program_id(1)
+        batch_index = tl.load(request_indices_ptr + token_index)
+        query_offset = token_index - tl.load(query_start_loc_ptr + batch_index)
         query_length = tl.load(query_length_ptr + batch_index)
-        active_query = query_offset < query_length
         computed = tl.load(computed_ptr + batch_index)
         kv_head = query_head // GROUP_SIZE
 
         dim_offsets = tl.arange(0, BLOCK_D)
         dim_mask = dim_offsets < HEAD_SIZE
         query_offsets = (
-            batch_index * stride_query_batch
-            + query_offset * stride_query_token
+            token_index * stride_query_token
             + query_head * stride_query_head
             + dim_offsets * stride_query_dim
         )
         query = tl.load(
             query_ptr + query_offsets,
-            mask=active_query & dim_mask,
+            mask=dim_mask,
             other=0.0,
         ).to(tl.float32)
 
@@ -104,17 +101,17 @@ if triton is not None:
             else:
                 safe_key_query_offsets = tl.maximum(key_query_offsets, 0)
                 visibility_offsets = (
-                    batch_index * stride_visibility_batch
-                    + query_offset * stride_visibility_query
-                    + safe_key_query_offsets * stride_visibility_key
+                    tl.load(visibility_start_ptr + batch_index)
+                    + query_offset * query_length
+                    + safe_key_query_offsets
                 )
                 query_key_visible = tl.load(
                     query_visibility_ptr + visibility_offsets,
-                    mask=active_query & query_key_mask,
+                    mask=query_key_mask,
                     other=0,
                 ).to(tl.int1)
             # committed prefix 全部可见；本轮 query 只读取父链上的祖先和自身。
-            token_mask = active_query & ((positions < computed) | query_key_visible)
+            token_mask = (positions < computed) | query_key_visible
             logical_blocks = positions // PAGE_SIZE
             offsets_in_page = positions % PAGE_SIZE
             physical_blocks = tl.load(
@@ -159,14 +156,13 @@ if triton is not None:
             running_max = next_max
 
         output_offsets = (
-            batch_index * stride_output_batch
-            + query_offset * stride_output_token
+            token_index * stride_output_token
             + query_head * stride_output_head
             + dim_offsets * stride_output_dim
         )
         tl.store(
             output_ptr + output_offsets,
-            tl.where(active_query, running_value / running_sum, 0.0),
+            running_value / running_sum,
             mask=dim_mask,
         )
 
@@ -184,7 +180,7 @@ class TritonPagedAttention:
         self._slot_mapping: Tensor | None = None
         self._write_mapping: PagedKVWriteMapping | None = None
         self._query_visibility: Tensor | None = None
-        self._query_width: int | None = None
+        self._visibility_start: Tensor | None = None
         self._linear_query_layouts = metadata.has_only_linear_queries
 
         config = cache.config
@@ -214,6 +210,12 @@ class TritonPagedAttention:
             dtype=torch.int32,
             device=config.device,
         )
+        self._query_start_loc = torch.tensor(
+            metadata.query_start_loc,
+            dtype=torch.int32,
+            device=config.device,
+        )
+        self._request_indices = metadata.request_indices_tensor(device=config.device)
         self._max_sequence_length = max(
             computed + query_length
             for computed, query_length in zip(
@@ -253,20 +255,14 @@ class TritonPagedAttention:
         if layer_spec.head_size > 256:
             raise KVCacheError("Triton paged attention supports head sizes up to 256")
 
-        query_width = query.shape[1]
-        if self._query_width not in (None, query_width):
-            raise KVCacheError("all Triton attention layers must use the same query width")
-        self._query_width = query_width
         if self._slot_mapping is None:
             self._slot_mapping = self._metadata.slot_mapping(
                 block_size=config.block_size,
-                query_width=query_width,
                 device=config.device,
             )
             if not self._linear_query_layouts:
-                self._query_visibility = self._metadata.visibility_tensor(
-                    query_width=query_width,
-                    device=config.device,
+                self._query_visibility, self._visibility_start = self._metadata.visibility_tensor(
+                    device=config.device
                 )
             # validate_block_tables() in the constructor already proves that
             # generated writable slots are in range and do not alias.
@@ -278,9 +274,11 @@ class TritonPagedAttention:
 
         query_visibility = self._query_visibility
         if query_visibility is None:
-            # The linear kernel specializes away every visibility load. A
-            # three-dimensional view only supplies the otherwise unused pointer/strides.
+            # 线性 kernel 会编译掉 visibility 读取，这里只提供未使用的合法指针。
             query_visibility = query[..., 0]
+        visibility_start = self._visibility_start
+        if visibility_start is None:
+            visibility_start = self._query_start_loc
 
         # KV 写入和 attention 分成两个顺序步骤；同一 CUDA stream 保证读取前写入完成。
         layer = self._cache.layer(layer_id)
@@ -295,21 +293,23 @@ class TritonPagedAttention:
         # Keep query width out of the kernel specialization key. Production
         # prefill/decode batches see many different widths; specializing each
         # one causes a fresh Triton compile and large first-use latency spikes.
-        grid = (query.shape[0], query_width, layer_spec.num_query_heads)
+        grid = (query.shape[0], layer_spec.num_query_heads)
         _paged_attention_kernel[grid](
             query,
             layer.keys,
             layer.values,
             self._block_tables,
             self._num_computed_tokens,
+            self._query_start_loc,
+            self._request_indices,
             self._query_lengths,
             query_visibility,
+            visibility_start,
             output,
             *query.stride(),
             *layer.keys.stride(),
             *layer.values.stride(),
             self._block_tables.stride(0),
-            *query_visibility.stride(),
             *output.stride(),
             self._max_sequence_length,
             scale,

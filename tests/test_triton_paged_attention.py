@@ -96,7 +96,7 @@ def _assert_matches_torch(
         ),
     ),
 )
-def test_triton_paged_attention_matches_padded_gqa_prefill(
+def test_triton_paged_attention_matches_packed_gqa_prefill(
     head_size: int,
     dtype: torch.dtype,
 ) -> None:
@@ -107,14 +107,14 @@ def test_triton_paged_attention_matches_padded_gqa_prefill(
         num_computed_tokens=(0, 0),
         query_layouts=_layouts(6, 3),
     )
-    query = torch.randn(2, 6, 4, head_size, device=_DEVICE, dtype=dtype)
-    key = torch.randn(2, 6, 2, head_size, device=_DEVICE, dtype=dtype)
-    value = torch.randn(2, 6, 2, head_size, device=_DEVICE, dtype=dtype)
+    query = torch.randn(9, 4, head_size, device=_DEVICE, dtype=dtype)
+    key = torch.randn(9, 2, head_size, device=_DEVICE, dtype=dtype)
+    value = torch.randn(9, 2, head_size, device=_DEVICE, dtype=dtype)
 
     _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)
 
 
-def test_triton_paged_attention_matches_padded_tree_visibility() -> None:
+def test_triton_paged_attention_matches_packed_tree_visibility() -> None:
     torch.manual_seed(20260819)
     torch_cache, triton_cache = _caches(64, torch.float16)
     metadata = PagedAttentionMetadata(
@@ -125,9 +125,9 @@ def test_triton_paged_attention_matches_padded_tree_visibility() -> None:
             QueryLayout((-1, 0, 0)),
         ),
     )
-    query = torch.randn(2, 4, 4, 64, device=_DEVICE, dtype=torch.float16)
-    key = torch.randn(2, 4, 2, 64, device=_DEVICE, dtype=torch.float16)
-    value = torch.randn(2, 4, 2, 64, device=_DEVICE, dtype=torch.float16)
+    query = torch.randn(7, 4, 64, device=_DEVICE, dtype=torch.float16)
+    key = torch.randn(7, 2, 64, device=_DEVICE, dtype=torch.float16)
+    value = torch.randn(7, 2, 64, device=_DEVICE, dtype=torch.float16)
 
     _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)
 
@@ -140,9 +140,9 @@ def test_triton_paged_attention_matches_decode_after_prefill() -> None:
         num_computed_tokens=(0, 0),
         query_layouts=_layouts(5, 3),
     )
-    prefill_query = torch.randn(2, 5, 4, 64, device=_DEVICE, dtype=torch.float16)
-    prefill_key = torch.randn(2, 5, 2, 64, device=_DEVICE, dtype=torch.float16)
-    prefill_value = torch.randn(2, 5, 2, 64, device=_DEVICE, dtype=torch.float16)
+    prefill_query = torch.randn(8, 4, 64, device=_DEVICE, dtype=torch.float16)
+    prefill_key = torch.randn(8, 2, 64, device=_DEVICE, dtype=torch.float16)
+    prefill_value = torch.randn(8, 2, 64, device=_DEVICE, dtype=torch.float16)
     _assert_matches_torch(
         torch_cache,
         triton_cache,
@@ -157,9 +157,9 @@ def test_triton_paged_attention_matches_decode_after_prefill() -> None:
         num_computed_tokens=(5, 3),
         query_layouts=_layouts(1, 1),
     )
-    decode_query = torch.randn(2, 1, 4, 64, device=_DEVICE, dtype=torch.float16)
-    decode_key = torch.randn(2, 1, 2, 64, device=_DEVICE, dtype=torch.float16)
-    decode_value = torch.randn(2, 1, 2, 64, device=_DEVICE, dtype=torch.float16)
+    decode_query = torch.randn(2, 4, 64, device=_DEVICE, dtype=torch.float16)
+    decode_key = torch.randn(2, 2, 64, device=_DEVICE, dtype=torch.float16)
+    decode_value = torch.randn(2, 2, 64, device=_DEVICE, dtype=torch.float16)
 
     _assert_matches_torch(
         torch_cache,
@@ -174,9 +174,9 @@ def test_triton_paged_attention_matches_decode_after_prefill() -> None:
 def test_triton_paged_attention_reads_a_shared_readonly_prefix() -> None:
     torch.manual_seed(20260817)
     torch_cache, triton_cache = _caches(64, torch.float16)
-    prefix_key = torch.randn(1, 2, 2, 64, device=_DEVICE, dtype=torch.float16)
-    prefix_value = torch.randn(1, 2, 2, 64, device=_DEVICE, dtype=torch.float16)
-    prefix_slots = torch.tensor([[0, 1]], device=_DEVICE)
+    prefix_key = torch.randn(2, 2, 64, device=_DEVICE, dtype=torch.float16)
+    prefix_value = torch.randn(2, 2, 64, device=_DEVICE, dtype=torch.float16)
+    prefix_slots = torch.tensor([0, 1], device=_DEVICE)
     torch_cache.write("attention", prefix_key, prefix_value, prefix_slots)
     triton_cache.write("attention", prefix_key, prefix_value, prefix_slots)
     metadata = PagedAttentionMetadata(
@@ -185,9 +185,9 @@ def test_triton_paged_attention_reads_a_shared_readonly_prefix() -> None:
         query_layouts=_layouts(1, 1),
         num_readonly_prefix_blocks=(1, 1),
     )
-    query = torch.randn(2, 1, 4, 64, device=_DEVICE, dtype=torch.float16)
-    key = torch.randn(2, 1, 2, 64, device=_DEVICE, dtype=torch.float16)
-    value = torch.randn(2, 1, 2, 64, device=_DEVICE, dtype=torch.float16)
+    query = torch.randn(2, 4, 64, device=_DEVICE, dtype=torch.float16)
+    key = torch.randn(2, 2, 64, device=_DEVICE, dtype=torch.float16)
+    value = torch.randn(2, 2, 64, device=_DEVICE, dtype=torch.float16)
 
     _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)
 
@@ -201,8 +201,8 @@ def test_triton_paged_attention_ignores_unused_lookahead_slots() -> None:
         query_layouts=_layouts(3, 1),
         num_reserved_query_tokens=(5, 4),
     )
-    query = torch.randn(2, 3, 4, 64, device=_DEVICE, dtype=torch.float16)
-    key = torch.randn(2, 3, 2, 64, device=_DEVICE, dtype=torch.float16)
-    value = torch.randn(2, 3, 2, 64, device=_DEVICE, dtype=torch.float16)
+    query = torch.randn(4, 4, 64, device=_DEVICE, dtype=torch.float16)
+    key = torch.randn(4, 2, 64, device=_DEVICE, dtype=torch.float16)
+    value = torch.randn(4, 2, 64, device=_DEVICE, dtype=torch.float16)
 
     _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)

@@ -215,27 +215,26 @@ def apply_rotary(
         key_first, key_second = keys.chunk(2, dim=-1)
         rotated_queries = torch.cat((-query_second, query_first), dim=-1)
         rotated_keys = torch.cat((-key_second, key_first), dim=-1)
-        cosines = cosines.unsqueeze(2)
-        sines = sines.unsqueeze(2)
+        cosines = cosines.unsqueeze(1)
+        sines = sines.unsqueeze(1)
         return (
             queries * cosines + rotated_queries * sines,
             keys * cosines + rotated_keys * sines,
         )
 
-    batch_size, query_width, num_query_heads, head_size = queries.shape
-    num_kv_heads = keys.shape[2]
-    token_rows = batch_size * query_width
+    token_rows, num_query_heads, head_size = queries.shape
+    num_kv_heads = keys.shape[1]
     block_size = triton.next_power_of_2(head_size)
     _rotary_embedding_kernel[(token_rows, num_query_heads)](
         queries,
         keys,
         cosines,
         sines,
+        queries.stride(0),
         queries.stride(1),
-        queries.stride(2),
+        keys.stride(0),
         keys.stride(1),
-        keys.stride(2),
-        cosines.stride(1),
+        cosines.stride(0),
         num_kv_heads,
         HEAD_SIZE=head_size,
         BLOCK_SIZE=block_size,

@@ -65,9 +65,9 @@ def _model_kv_spec(*, num_kv_heads: int = 1, head_size: int = 1) -> ModelKVCache
 
 
 def _tiny_dense_forward(model, token_ids: tuple[int, ...], *, past=None):
-    input_ids = torch.tensor([token_ids])
+    input_ids = torch.tensor(token_ids)
     start = 0 if past is None else past.num_tokens
-    positions = torch.arange(start, start + len(token_ids)).unsqueeze(0)
+    positions = torch.arange(start, start + len(token_ids))
     attention = TorchDenseAttention(
         model.kv_cache_spec,
         DenseAttentionMetadata(
@@ -591,17 +591,17 @@ def test_tiny_attention_cached_logits_match_full_sequence_logits() -> None:
     model = TinyAttentionCausalLM(
         TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
     ).eval()
-    full = _tiny_dense_forward(model, (1, 2, 3))[0].logits[:, -1]
+    full = _tiny_dense_forward(model, (1, 2, 3))[0].logits[-1]
 
     prompt, prompt_attention = _tiny_dense_forward(model, (1, 2))
     cached = _tiny_dense_forward(
         model,
         (3,),
         past=prompt_attention.cache_updates,
-    )[0].logits[:, -1]
+    )[0].logits[-1]
 
     torch.testing.assert_close(cached, full)
-    assert prompt.logits.shape == (1, 2, 16)
+    assert prompt.logits.shape == (2, 16)
 
 
 def test_tiny_attention_requires_one_execution_attention_context() -> None:
@@ -610,7 +610,7 @@ def test_tiny_attention_requires_one_execution_attention_context() -> None:
     ).eval()
 
     with pytest.raises(ValueError, match="requires an attention context"):
-        model(ForwardBatch(input_ids=torch.tensor([[1, 2]])))
+        model(ForwardBatch(input_ids=torch.tensor([1, 2])))
 
 
 def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
@@ -620,7 +620,7 @@ def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
 
         def forward(self, layer_id, query, key, value, *, scale):
             self.layer_ids.append(layer_id)
-            assert query.shape == key.shape == value.shape == (1, 2, 2, 4)
+            assert query.shape == key.shape == value.shape == (2, 2, 4)
             assert scale == 0.5
             return query
 
@@ -629,9 +629,9 @@ def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
     ).eval()
     attention = RecordingAttention()
 
-    output = model(ForwardBatch(input_ids=torch.tensor([[1, 2]]), attention=attention))
+    output = model(ForwardBatch(input_ids=torch.tensor([1, 2]), attention=attention))
 
-    assert output.logits.shape == (1, 2, 16)
+    assert output.logits.shape == (2, 16)
     assert attention.layer_ids == ["attention"]
 
 
@@ -661,7 +661,7 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
         token_ids = list(request.input_ids)
         for _ in range(request.max_new_tokens):
             logits = _tiny_dense_forward(model, tuple(token_ids))[0].logits
-            token_id = int(logits[0, -1].argmax().item())
+            token_id = int(logits[-1].argmax().item())
             expected.append(token_id)
             token_ids.append(token_id)
 
@@ -712,8 +712,7 @@ def test_engine_reuses_a_shared_prompt_prefix_without_changing_generation() -> N
                 self.query_lengths: list[tuple[int, ...]] = []
 
             def forward(self, batch: ForwardBatch):
-                lengths = batch.sequence_lengths or (batch.input_ids.shape[1],)
-                self.query_lengths.append(lengths)
+                self.query_lengths.append(batch.query_lengths)
                 return model(batch)
 
         forwarder = Forwarder()
@@ -752,7 +751,7 @@ def test_engine_reuses_a_shared_prompt_prefix_without_changing_generation() -> N
         await engine.generate(GenerateRequest(input_ids=(1, 2, 3, 4, 5), max_new_tokens=1))
         second_prompt = (1, 2, 3, 4, 6)
         result = await engine.generate(GenerateRequest(input_ids=second_prompt, max_new_tokens=1))
-        expected = int(_tiny_dense_forward(model, second_prompt)[0].logits[0, -1].argmax())
+        expected = int(_tiny_dense_forward(model, second_prompt)[0].logits[-1].argmax())
         await engine.close()
 
         assert result.generated_token_ids == (expected,)
@@ -773,14 +772,11 @@ def test_engine_speculates_after_reusing_a_shared_prompt_prefix() -> None:
                 self.queries: list[tuple[int, ...]] = []
 
             def forward(self, batch: ForwardBatch) -> ModelOutput:
-                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
-                self.queries.append(
-                    tuple(int(value) for value in batch.input_ids[0, :query_length])
-                )
+                self.queries.append(tuple(int(value) for value in batch.input_ids))
                 next_ids = (batch.input_ids + 1) % 16
                 logits = torch.full((*batch.input_ids.shape, 16), -1.0)
                 logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
-                keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
+                keys = batch.input_ids.to(torch.float32).reshape(-1, 1, 1)
                 assert batch.attention is not None
                 batch.attention.forward("attention", keys, keys, keys, scale=1.0)
                 return ModelOutput(logits=select_query_states(logits, batch))

@@ -17,7 +17,7 @@ from light_vllm.runtime.kv_cache import KVCacheError
 
 @dataclass(frozen=True, slots=True)
 class PagedAttentionMetadata:
-    """一个 padded query batch 访问分页 K/V 所需的事实。"""
+    """一个 packed query batch 访问分页 K/V 所需的事实。"""
 
     block_tables: tuple[tuple[int, ...], ...]
     num_computed_tokens: tuple[int, ...]
@@ -75,6 +75,17 @@ class PagedAttentionMetadata:
         return tuple(len(layout) for layout in self.query_layouts)
 
     @property
+    def query_start_loc(self) -> tuple[int, ...]:
+        starts = [0]
+        for length in self.query_lengths:
+            starts.append(starts[-1] + length)
+        return tuple(starts)
+
+    @property
+    def num_query_tokens(self) -> int:
+        return self.query_start_loc[-1]
+
+    @property
     def has_only_linear_queries(self) -> bool:
         """Whether every query layout is the ordinary causal chain."""
 
@@ -90,12 +101,11 @@ class PagedAttentionMetadata:
         self,
         *,
         block_size: int,
-        query_width: int,
         device: torch.device,
     ) -> Tensor:
-        """把每个 query token 的展平位置转换成物理 cache slot。"""
+        """把一维 query token 流转换成物理 cache slot。"""
 
-        mapping: list[list[int]] = []
+        mapping: list[int] = []
         for table, computed, layout, reserved in zip(
             self.block_tables,
             self.num_computed_tokens,
@@ -103,10 +113,7 @@ class PagedAttentionMetadata:
             self.num_reserved_query_tokens,
             strict=True,
         ):
-            row = [-1] * query_width
             query_length = len(layout)
-            if query_length > query_width:
-                raise KVCacheError("query length exceeds the padded query width")
             required_blocks = (computed + reserved + block_size - 1) // block_size
             if len(table) < required_blocks:
                 raise KVCacheError("block table does not cover all scheduled tokens")
@@ -115,8 +122,7 @@ class PagedAttentionMetadata:
             for query_offset in range(query_length):
                 logical_position = computed + query_offset
                 block_id = table[logical_position // block_size]
-                row[query_offset] = block_id * block_size + logical_position % block_size
-            mapping.append(row)
+                mapping.append(block_id * block_size + logical_position % block_size)
         return torch.tensor(mapping, dtype=torch.long, device=device)
 
     def validate_block_tables(
@@ -155,20 +161,29 @@ class PagedAttentionMetadata:
                     raise KVCacheError("block tables alias a physical block across requests")
                 block_owners[block_id] = (logical_index, readonly)
 
-    def visibility_tensor(self, *, query_width: int, device: torch.device) -> Tensor:
-        """构造 backend 内部使用的 padded query visibility。"""
+    def visibility_tensor(self, *, device: torch.device) -> tuple[Tensor, Tensor]:
+        """紧凑存放各请求的树形可见性及其一维起点。"""
 
-        visibility: list[list[list[bool]]] = []
+        visibility: list[bool] = []
+        starts = [0]
         for layout in self.query_layouts:
-            length = len(layout)
-            if length > query_width:
-                raise KVCacheError("query layout exceeds the padded query width")
-            visible_queries = query_visibility(layout)
-            visibility.append(
-                [list(row) + [False] * (query_width - length) for row in visible_queries]
-                + [[False] * query_width for _ in range(query_width - length)]
-            )
-        return torch.tensor(visibility, dtype=torch.bool, device=device)
+            for row in query_visibility(layout):
+                visibility.extend(row)
+            starts.append(len(visibility))
+        return (
+            torch.tensor(visibility, dtype=torch.bool, device=device),
+            torch.tensor(starts, dtype=torch.int32, device=device),
+        )
+
+    def request_indices_tensor(self, *, device: torch.device) -> Tensor:
+        """为每个 packed token 标记其请求下标。"""
+
+        request_indices = [
+            request_index
+            for request_index, length in enumerate(self.query_lengths)
+            for _ in range(length)
+        ]
+        return torch.tensor(request_indices, dtype=torch.int32, device=device)
 
     def visible_logical_positions(
         self,
@@ -214,15 +229,15 @@ def _validate_paged_attention_tensors(
     """让不同 backend 共用同一套形状与页表校验。"""
 
     layer_spec = cache.layer_spec(layer_id)
-    if query.ndim != 4:
-        raise KVCacheError("paged attention query must have four dimensions")
-    if query.shape[:2] != key.shape[:2] or value.shape != key.shape:
-        raise KVCacheError("paged attention Q/K/V batch and query dimensions must match")
-    if query.shape[0] != metadata.batch_size:
-        raise KVCacheError("paged attention metadata batch size does not match query")
-    if query.shape[2:] != (layer_spec.num_query_heads, layer_spec.head_size):
+    if query.ndim != 3:
+        raise KVCacheError("paged attention query must have three dimensions")
+    if query.shape[0] != key.shape[0] or value.shape != key.shape:
+        raise KVCacheError("paged attention Q/K/V token dimensions must match")
+    if query.shape[0] != metadata.num_query_tokens:
+        raise KVCacheError("paged attention metadata token count does not match query")
+    if query.shape[1:] != (layer_spec.num_query_heads, layer_spec.head_size):
         raise KVCacheError("paged attention query shape does not match the layer spec")
-    if key.shape[2:] != (layer_spec.num_kv_heads, layer_spec.head_size):
+    if key.shape[1:] != (layer_spec.num_kv_heads, layer_spec.head_size):
         raise KVCacheError("paged attention K/V shape does not match the layer spec")
     return layer_spec
 
@@ -274,7 +289,6 @@ class TorchPagedAttention:
         if self._write_mapping is None:
             slot_mapping = self._metadata.slot_mapping(
                 block_size=config.block_size,
-                query_width=query.shape[1],
                 device=config.device,
             )
             self._write_mapping = self._cache.prepare_write(slot_mapping, validate=False)
@@ -282,18 +296,19 @@ class TorchPagedAttention:
         self._cache.write_prepared(layer_id, key, value, self._write_mapping)
 
         output = torch.zeros_like(query)
-        for row, (table, query_length) in enumerate(
+        for row, (table, start, end) in enumerate(
             zip(
                 self._metadata.block_tables,
-                self._metadata.query_lengths,
+                self._metadata.query_start_loc[:-1],
+                self._metadata.query_start_loc[1:],
                 strict=True,
             )
         ):
             logical_positions_by_query = self._metadata.visible_logical_positions(row)
-            for query_offset in range(query_length):
-                output[row, query_offset] = self._attend_query_token(
+            for query_offset, token_index in enumerate(range(start, end)):
+                output[token_index] = self._attend_query_token(
                     layer_id,
-                    query[row, query_offset],
+                    query[token_index],
                     table,
                     logical_positions_by_query[query_offset],
                     scale,

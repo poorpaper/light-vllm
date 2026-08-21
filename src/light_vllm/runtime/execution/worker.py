@@ -57,8 +57,7 @@ def _forward(model: ModelSession, batch: ForwardBatch) -> ModelOutput:
         raise ExecutionNotReadyError("load a model before executing") from exc
     if not isinstance(output, ModelOutput):
         raise ExecutionError("model forwarder must return ModelOutput")
-    expected_shape = (batch.input_ids.shape[0], batch.logits_width)
-    if output.logits.ndim != 3 or output.logits.shape[:2] != expected_shape:
+    if output.logits.ndim != 2 or output.logits.shape[0] != batch.logits_width:
         raise ExecutionError("model logits must cover the requested query rows")
     return output
 
@@ -110,17 +109,15 @@ class ContiguousStepHandler:
                         "physical KV length must match the scheduled computed-token count"
                     )
                 input_ids = torch.tensor(
-                    [request.query_token_ids],
+                    request.query_token_ids,
                     dtype=torch.long,
                     device=self._device,
                 )
                 positions = torch.tensor(
-                    [
-                        semantic_positions(
-                            request.query_layout,
-                            prefix_length=request.num_computed_tokens,
-                        )
-                    ],
+                    semantic_positions(
+                        request.query_layout,
+                        prefix_length=request.num_computed_tokens,
+                    ),
                     dtype=torch.long,
                     device=self._device,
                 )
@@ -138,9 +135,7 @@ class ContiguousStepHandler:
                         input_ids=input_ids,
                         positions=positions,
                         attention=attention,
-                        logit_query_indices=(request.logit_query_indices,)
-                        if request.logit_query_indices is not None
-                        else None,
+                        logit_query_indices=request.logit_query_indices,
                     ),
                 )
                 # AttentionContext 先暂存各层 K/V；整个 forward 成功后再统一追加。
@@ -150,7 +145,7 @@ class ContiguousStepHandler:
                 self._cache.append(request.request_id, updates)
             except KVCacheError as exc:
                 raise ExecutionError(str(exc)) from exc
-            logits.append(output.logits[0])
+            logits.append(output.logits)
         return tuple(logits)
 
     def compact(
@@ -220,26 +215,27 @@ class PagedStepHandler:
             if request.block_ids is None:
                 raise ExecutionError("paged model step requires a block table for every request")
 
-        # 不同请求的 query 长度可以不同；补零后用 layout 长度屏蔽 padding。
-        query_width = max(len(request.query_token_ids) for request in batch.requests)
-        input_rows: list[tuple[int, ...]] = []
-        position_rows: list[tuple[int, ...]] = []
-        query_lengths: list[int] = []
-        logit_query_indices = tuple(_requested_logit_indices(request) for request in batch.requests)
+        # 一维 token 流让 mixed prefill/decode 只计算真实 query，不启动 padding 行。
+        input_token_ids: list[int] = []
+        positions_by_token: list[int] = []
+        query_start_loc = [0]
+        global_logit_indices: list[int] = []
+        requested_logits_per_request: list[int] = []
         for request in batch.requests:
-            query_length = len(request.query_token_ids)
-            query_lengths.append(query_length)
-            padding = (0,) * (query_width - query_length)
-            input_rows.append(request.query_token_ids + padding)
-            position_rows.append(
+            start = query_start_loc[-1]
+            input_token_ids.extend(request.query_token_ids)
+            positions_by_token.extend(
                 semantic_positions(
                     request.query_layout,
                     prefix_length=request.num_computed_tokens,
                 )
-                + padding
             )
-        input_ids = torch.tensor(input_rows, dtype=torch.long, device=self._device)
-        positions = torch.tensor(position_rows, dtype=torch.long, device=self._device)
+            requested = _requested_logit_indices(request)
+            requested_logits_per_request.append(len(requested))
+            global_logit_indices.extend(start + index for index in requested)
+            query_start_loc.append(start + len(request.query_token_ids))
+        input_ids = torch.tensor(input_token_ids, dtype=torch.long, device=self._device)
+        positions = torch.tensor(positions_by_token, dtype=torch.long, device=self._device)
 
         metadata = PagedAttentionMetadata(
             block_tables=tuple(request.block_ids or () for request in batch.requests),
@@ -258,17 +254,20 @@ class PagedStepHandler:
             ForwardBatch(
                 input_ids=input_ids,
                 positions=positions,
-                sequence_lengths=tuple(query_lengths),
+                query_start_loc=tuple(query_start_loc),
                 attention=attention,
-                logit_query_indices=logit_query_indices,
+                logit_query_indices=tuple(global_logit_indices),
             ),
         )
         expected_layers = frozenset(layer.layer_id for layer in self._cache.model_spec.layers)
         if attention.layer_ids != expected_layers:
             raise ExecutionError("model did not execute every configured paged attention layer")
-        return tuple(
-            output.logits[row, : len(indices)] for row, indices in enumerate(logit_query_indices)
-        )
+        logits_by_request: list[torch.Tensor] = []
+        start = 0
+        for count in requested_logits_per_request:
+            logits_by_request.append(output.logits[start : start + count])
+            start += count
+        return tuple(logits_by_request)
 
     def compact(
         self,

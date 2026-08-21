@@ -32,6 +32,7 @@ from light_vllm.runtime.execution.worker import (
 )
 from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
 from light_vllm.runtime.sampling import GreedySampler
+from light_vllm.runtime.scheduler.interfaces import SchedulerStats
 from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 from light_vllm.serving import http as serving_http_module
 
@@ -82,6 +83,8 @@ class _StageProfiler:
         self._executor_records: list[tuple[int, int, int, int | None]] = []
         self._named_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
         self._batch_shapes: list[tuple[int, int, int]] = []
+        self._scheduler_shapes: list[tuple[int, int, int, int]] = []
+        self._request_lifecycle_ns: dict[str, dict[str, int]] = defaultdict(dict)
         self._cuda_event_ns = 0
         self._reset_wall_ns = 0
         self._reset_process_cpu_ns = 0
@@ -97,6 +100,8 @@ class _StageProfiler:
             self._executor_records.clear()
             self._named_intervals.clear()
             self._batch_shapes.clear()
+            self._scheduler_shapes.clear()
+            self._request_lifecycle_ns.clear()
             self._cuda_event_ns = 0
             self._reset_wall_ns = time.perf_counter_ns()
             self._reset_process_cpu_ns = time.process_time_ns()
@@ -108,6 +113,31 @@ class _StageProfiler:
         with self._lock:
             if self._active:
                 self._batch_shapes.append((batch_size, query_width, model_tokens))
+
+    def record_scheduler_shape(
+        self,
+        before: SchedulerStats,
+        after: SchedulerStats,
+    ) -> None:
+        if not self._active:
+            return
+        with self._lock:
+            if self._active:
+                self._scheduler_shapes.append(
+                    (
+                        before.waiting_requests,
+                        before.running_requests,
+                        after.waiting_requests,
+                        after.running_requests,
+                    )
+                )
+
+    def record_request_event(self, request_id: str, event: str) -> None:
+        if not self._active:
+            return
+        with self._lock:
+            if self._active:
+                self._request_lifecycle_ns[request_id].setdefault(event, time.perf_counter_ns())
 
     def record(
         self,
@@ -161,6 +191,11 @@ class _StageProfiler:
             executor_records = list(self._executor_records)
             named_intervals = {name: list(values) for name, values in self._named_intervals.items()}
             batch_shapes = list(self._batch_shapes)
+            scheduler_shapes = list(self._scheduler_shapes)
+            request_lifecycle_ns = {
+                request_id: dict(events)
+                for request_id, events in self._request_lifecycle_ns.items()
+            }
             cuda_event_ns = self._cuda_event_ns
             reset_wall_ns = self._reset_wall_ns
             reset_process_cpu_ns = self._reset_process_cpu_ns
@@ -223,6 +258,9 @@ class _StageProfiler:
             batch_size = query_width = model_tokens = None
             if index < len(batch_shapes):
                 batch_size, query_width, model_tokens = batch_shapes[index]
+            scheduler_shape = (
+                scheduler_shapes[index] if index < len(scheduler_shapes) else (None,) * 4
+            )
             step_records.append(
                 {
                     "step_id": index,
@@ -238,6 +276,10 @@ class _StageProfiler:
                     "batch_size": batch_size,
                     "query_width": query_width,
                     "model_tokens": model_tokens,
+                    "waiting_before": scheduler_shape[0],
+                    "running_before": scheduler_shape[1],
+                    "waiting_after": scheduler_shape[2],
+                    "running_after": scheduler_shape[3],
                 }
             )
             previous_finished_ns = finished_ns
@@ -272,6 +314,13 @@ class _StageProfiler:
             "interval_overlap": interval_overlap,
             "batch_shapes": _summarize_batch_shapes(batch_shapes),
             "steps": step_records,
+            "request_lifecycle": {
+                request_id: {
+                    event: (timestamp_ns - reset_wall_ns) / 1_000_000
+                    for event, timestamp_ns in events.items()
+                }
+                for request_id, events in request_lifecycle_ns.items()
+            },
             "stages": stages,
             "raw_stages": raw_stages,
         }
@@ -290,8 +339,15 @@ def _summarize_batch_shapes(shapes: list[tuple[int, int, int]]) -> dict[str, obj
         query_width_histogram[str(query_width)] += 1
         batch_size_histogram[str(batch_size)] += 1
     return {
+        "execution_layout": "token-major",
         "steps": len(shapes),
         "model_tokens": model_tokens,
+        "executed_query_positions": model_tokens,
+        "legacy_padded_positions": padded_tokens,
+        "avoided_padding_positions": padded_tokens - model_tokens,
+        "legacy_padding_factor": padded_tokens / model_tokens,
+        "legacy_padding_waste_percent": 100.0 * (padded_tokens - model_tokens) / padded_tokens,
+        # 保留旧字段，便于同一分析脚本读取改造前后的 profile。
         "padded_tokens": padded_tokens,
         "padding_factor": padded_tokens / model_tokens,
         "padding_waste_percent": 100.0 * (padded_tokens - model_tokens) / padded_tokens,
@@ -367,7 +423,6 @@ def _timed_async(
 
 def _install(profiler: _StageProfiler, *, detail: str) -> None:
     stages = [
-        (TokenBudgetScheduler, "schedule", "scheduler.schedule"),
         (EngineCore, "_build_execution_batch_locked", "engine.build_batch"),
         (EngineCore, "_apply_output_locked", "engine.apply_output"),
         (EngineCore, "_finish_execution_locked", "engine.finish_execution"),
@@ -439,6 +494,8 @@ def _install(profiler: _StageProfiler, *, detail: str) -> None:
     @wraps(original_paged_forward)
     def profiled_paged_forward(self: PagedStepHandler, model: Any, batch: Any) -> Any:
         if profiler.active:
+            for request in batch.requests:
+                profiler.record_request_event(request.request_id, "first_forward_ms")
             query_lengths = [len(request.query_token_ids) for request in batch.requests]
             profiler.record_batch_shape(
                 batch_size=len(query_lengths),
@@ -448,8 +505,53 @@ def _install(profiler: _StageProfiler, *, detail: str) -> None:
         return original_paged_forward(self, model, batch)
 
     PagedStepHandler.forward = profiled_paged_forward
+    original_schedule = TokenBudgetScheduler.schedule
+    original_add = TokenBudgetScheduler.add
+
+    @wraps(original_add)
+    def profiled_add(self: TokenBudgetScheduler, request_id: str, *args: Any, **kwargs: Any) -> Any:
+        output = original_add(self, request_id, *args, **kwargs)
+        profiler.record_request_event(request_id, "registered_ms")
+        return output
+
+    TokenBudgetScheduler.add = profiled_add
+
+    @wraps(original_schedule)
+    def profiled_schedule(self: TokenBudgetScheduler) -> Any:
+        if not profiler.active:
+            return original_schedule(self)
+        before = self.stats
+        wall_started = time.perf_counter_ns()
+        cpu_started = time.thread_time_ns()
+        try:
+            output = original_schedule(self)
+        finally:
+            wall_finished = time.perf_counter_ns()
+            profiler.record(
+                "scheduler.schedule",
+                wall_finished - wall_started,
+                time.thread_time_ns() - cpu_started,
+                started_ns=wall_started,
+            )
+        profiler.record_scheduler_shape(before, self.stats)
+        for request in output.requests:
+            profiler.record_request_event(request.request_id, "first_scheduled_ms")
+        return output
+
+    TokenBudgetScheduler.schedule = profiled_schedule
     for owner, attribute, stage in stages:
         _timed_sync(profiler, owner, attribute, stage)
+
+    original_apply_output = EngineCore._apply_output_locked
+
+    @wraps(original_apply_output)
+    def profiled_apply_output(self: EngineCore, scheduled: Any, output: Any) -> Any:
+        for request_id, result in output.items():
+            if result.output_token_ids:
+                profiler.record_request_event(request_id, "first_token_ready_ms")
+        return original_apply_output(self, scheduled, output)
+
+    EngineCore._apply_output_locked = profiled_apply_output
     if hasattr(EngineCore, "_execute_batch"):
         _timed_async(profiler, EngineCore, "_execute_batch", "engine.executor_future_total")
 
