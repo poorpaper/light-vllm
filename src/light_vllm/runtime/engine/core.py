@@ -270,6 +270,7 @@ class EngineCore:
                         self._driver_task = None
                         return
                     scheduled = self._scheduler.schedule()
+                    self._publish_scheduler_stats()
                     batch = self._build_execution_batch_locked(scheduled)
                     lease = self._executor.acquire(batch.request_ids)
                     self._executing_request_ids.update(batch.request_ids)
@@ -322,14 +323,11 @@ class EngineCore:
     async def _execute_batch(self, batch: ExecutionBatch) -> ExecutionOutput:
         """在线程池执行同步 Executor，并把等待边界留给 Engine。"""
 
-        pending = asyncio.get_running_loop().run_in_executor(
+        return await asyncio.get_running_loop().run_in_executor(
             None,
             self._executor.execute,
             batch,
         )
-        # 调度快照与模型计算相互独立；提交后再发布，避免它延后 GPU 起步。
-        self._publish_scheduler_stats()
-        return await pending
 
     def _build_execution_batch_locked(self, scheduled: SchedulerOutput) -> ExecutionBatch:
         requests: list[ExecutionRequest] = []
