@@ -8,6 +8,7 @@ import statistics
 import sys
 import threading
 import time
+import traceback
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from functools import wraps
@@ -590,6 +591,15 @@ def main() -> None:
     profiler = _StageProfiler(Path(raw_output), detail=detail)
     _install(profiler, detail=detail)
 
+    def dump_profile_safely() -> None:
+        try:
+            profiler.dump()
+        except Exception:
+            Path(f"{raw_output}.error.txt").write_text(
+                traceback.format_exc(),
+                encoding="utf-8",
+            )
+
     def reset_profile(_signum: int, _frame: Any) -> None:
         profiler.reset()
 
@@ -598,14 +608,14 @@ def main() -> None:
         # signal handler first keeps the asyncio server responsive and avoids doing
         # lock acquisition, allocation, and filesystem I/O in signal context.
         threading.Thread(
-            target=profiler.dump,
+            target=dump_profile_safely,
             name="light-vllm-profile-dump",
             daemon=True,
         ).start()
 
     signal.signal(signal.SIGUSR1, reset_profile)
     signal.signal(signal.SIGUSR2, dump_profile)
-    atexit.register(profiler.dump)
+    atexit.register(dump_profile_safely)
     http_entrypoint.main()
 
 
