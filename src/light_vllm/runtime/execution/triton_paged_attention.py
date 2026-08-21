@@ -59,7 +59,6 @@ if triton is not None:
         max_sequence_length,
         scale,
         LINEAR_QUERY_LAYOUTS: tl.constexpr,
-        QUERY_WIDTH: tl.constexpr,
         PAGE_SIZE: tl.constexpr,
         GROUP_SIZE: tl.constexpr,
         HEAD_SIZE: tl.constexpr,
@@ -68,10 +67,9 @@ if triton is not None:
     ):
         """一个 program 计算一个 query token 的一个 query head。"""
 
-        query_index = tl.program_id(0)
-        query_head = tl.program_id(1)
-        batch_index = query_index // QUERY_WIDTH
-        query_offset = query_index % QUERY_WIDTH
+        batch_index = tl.program_id(0)
+        query_offset = tl.program_id(1)
+        query_head = tl.program_id(2)
         query_length = tl.load(query_length_ptr + batch_index)
         active_query = query_offset < query_length
         computed = tl.load(computed_ptr + batch_index)
@@ -294,7 +292,10 @@ class TritonPagedAttention:
             max(64, triton.next_power_of_2(self._max_sequence_length)),
         )
         num_warps = 4
-        grid = (query.shape[0] * query_width, layer_spec.num_query_heads)
+        # Keep query width out of the kernel specialization key. Production
+        # prefill/decode batches see many different widths; specializing each
+        # one causes a fresh Triton compile and large first-use latency spikes.
+        grid = (query.shape[0], query_width, layer_spec.num_query_heads)
         _paged_attention_kernel[grid](
             query,
             layer.keys,
@@ -313,7 +314,6 @@ class TritonPagedAttention:
             self._max_sequence_length,
             scale,
             LINEAR_QUERY_LAYOUTS=self._linear_query_layouts,
-            QUERY_WIDTH=query_width,
             PAGE_SIZE=config.block_size,
             GROUP_SIZE=layer_spec.num_query_heads // layer_spec.num_kv_heads,
             HEAD_SIZE=layer_spec.head_size,
