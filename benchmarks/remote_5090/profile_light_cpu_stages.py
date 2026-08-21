@@ -8,6 +8,7 @@ import statistics
 import sys
 import threading
 import time
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from functools import wraps
 from pathlib import Path
@@ -44,6 +45,28 @@ def _percentile(values: list[float], quantile: float) -> float | None:
     upper = min(lower + 1, len(ordered) - 1)
     weight = position - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _overlap_ns(
+    started_ns: int,
+    finished_ns: int,
+    executor_starts: list[int],
+    executor_ends: list[int],
+    executor_duration_prefix: list[int],
+) -> int:
+    first = bisect_right(executor_ends, started_ns)
+    last = bisect_left(executor_starts, finished_ns)
+    if first >= last:
+        return 0
+    if first + 1 == last:
+        return max(
+            0,
+            min(finished_ns, executor_ends[first]) - max(started_ns, executor_starts[first]),
+        )
+    overlap = executor_ends[first] - max(started_ns, executor_starts[first])
+    overlap += min(finished_ns, executor_ends[last - 1]) - executor_starts[last - 1]
+    overlap += executor_duration_prefix[last - 1] - executor_duration_prefix[first + 1]
+    return overlap
 
 
 class _StageProfiler:
@@ -168,14 +191,24 @@ class _StageProfiler:
         executor_wall_ns = round(
             stages.get("executor.execute", {}).get("wall_total_ms", 0.0) * 1_000_000
         )
+        sorted_intervals = sorted(intervals)
+        executor_starts = [started_ns for started_ns, _ in sorted_intervals]
+        executor_ends = [finished_ns for _, finished_ns in sorted_intervals]
+        executor_duration_prefix = [0]
+        for started_ns, finished_ns in sorted_intervals:
+            executor_duration_prefix.append(executor_duration_prefix[-1] + finished_ns - started_ns)
         interval_overlap = {}
         for name, values in named_intervals.items():
-            inside_ns = 0
-            for started_ns, finished_ns in values:
-                inside_ns += sum(
-                    max(0, min(finished_ns, executor_end) - max(started_ns, executor_start))
-                    for executor_start, executor_end in intervals
+            inside_ns = sum(
+                _overlap_ns(
+                    started_ns,
+                    finished_ns,
+                    executor_starts,
+                    executor_ends,
+                    executor_duration_prefix,
                 )
+                for started_ns, finished_ns in values
+            )
             total_ns = sum(finished - started for started, finished in values)
             interval_overlap[name] = {
                 "total_ms": total_ns / 1_000_000,
