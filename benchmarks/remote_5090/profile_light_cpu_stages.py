@@ -415,7 +415,8 @@ def _install(profiler: _StageProfiler, *, detail: str) -> None:
     PagedStepHandler.forward = profiled_paged_forward
     for owner, attribute, stage in stages:
         _timed_sync(profiler, owner, attribute, stage)
-    _timed_async(profiler, EngineCore, "_execute_batch", "engine.executor_future_total")
+    if hasattr(EngineCore, "_execute_batch"):
+        _timed_async(profiler, EngineCore, "_execute_batch", "engine.executor_future_total")
 
     _timed_sync(profiler, engine_core_module, "_validated_output", "engine.validate_output")
     if detail == "full":
