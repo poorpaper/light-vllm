@@ -32,18 +32,21 @@ class CudaEventExecutionTimer:
         self._device = torch.device(device)
         if self._device.type != "cuda":
             raise ValueError("CUDA event timing requires a CUDA device")
+        with torch.cuda.device(self._device):
+            # Executor 串行调用 measure；复用 event 避免每个 decode step 都创建
+            # 两个 CUDA 对象，同时仍在边界同步得到设备真实耗时。
+            self._started = torch.cuda.Event(enable_timing=True)
+            self._finished = torch.cuda.Event(enable_timing=True)
 
     def measure(
         self,
         operation: Callable[[], ExecutionOutput],
     ) -> tuple[ExecutionOutput, float]:
         with torch.cuda.device(self._device):
-            started = torch.cuda.Event(enable_timing=True)
-            finished = torch.cuda.Event(enable_timing=True)
-            started.record()
+            self._started.record()
             output = operation()
-            finished.record()
+            self._finished.record()
             # 指标需要设备真实完成时间；等待只留在 CUDA Executor 边界。
-            finished.synchronize()
-            elapsed_seconds = started.elapsed_time(finished) / 1000.0
+            self._finished.synchronize()
+            elapsed_seconds = self._started.elapsed_time(self._finished) / 1000.0
         return output, elapsed_seconds

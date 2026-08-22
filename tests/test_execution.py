@@ -9,6 +9,7 @@ from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
     ModelNotLoadedError,
     ModelOutput,
+    select_query_states,
 )
 from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionCausalLM,
@@ -17,27 +18,35 @@ from light_vllm.modeling.models.tiny_attention import (
 from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
     DenseAttentionMetadata,
+    DraftTree,
     ExecutionBatch,
     ExecutionCapabilities,
     ExecutionError,
     ExecutionNotReadyError,
     ExecutionOutput,
     ExecutionRequest,
-    GreedyAcceptanceSampler,
+    GreedyTreeAcceptanceSampler,
     LocalModelExecutor,
     LocalModelWorker,
     LocalTokenExecutor,
-    NGramSpeculativeDecodeHandler,
-    NGramTokenProposer,
+    ModelStepBatch,
+    ModelStepOutput,
+    NGramChainProposer,
     PagedKVCacheConfig,
     RequestOutput,
+    SpeculativeDecodeHandler,
     TorchDenseAttention,
     TorchPagedAttentionBackend,
+)
+from light_vllm.runtime.execution.layout import (
+    linear_model_step_request,
+    linear_query_layout,
 )
 from light_vllm.runtime.execution.worker import (
     ContiguousStepHandler,
     PagedStepHandler,
     StandardDecodeHandler,
+    _validate_positions,
 )
 from light_vllm.runtime.generation import GenerateRequest
 from light_vllm.runtime.kv_cache import (
@@ -72,7 +81,7 @@ class IncrementingForwarder:
         logits = torch.full((*batch.input_ids.shape, self.vocab_size), -1.0)
         logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
         if batch.attention is not None:
-            keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
+            keys = batch.input_ids.to(torch.float32).reshape(-1, 1, 1)
             batch.attention.forward(
                 "attention",
                 keys,
@@ -80,7 +89,7 @@ class IncrementingForwarder:
                 keys,
                 scale=1.0,
             )
-        return ModelOutput(logits=logits)
+        return ModelOutput(logits=select_query_states(logits, batch))
 
 
 class UnloadedForwarder:
@@ -97,7 +106,7 @@ class InvalidOutputForwarder:
     max_model_tokens = None
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
-        return ModelOutput(logits=torch.zeros(1, 8))
+        return ModelOutput(logits=torch.zeros(2, 8))
 
 
 class FixedSampler:
@@ -197,6 +206,43 @@ def _execution_request(
     )
 
 
+def test_execution_request_allows_omitted_draft_context() -> None:
+    request = ExecutionRequest(
+        request_id="request",
+        input_token_ids=(3,),
+        context_token_ids=None,
+        num_computed_tokens=2,
+        num_lookahead_tokens=0,
+        max_output_tokens=1,
+        block_ids=None,
+    )
+
+    assert request.context_token_ids is None
+
+
+@pytest.mark.parametrize(
+    ("context_token_ids", "expected_error"),
+    [
+        ((1, -1, 3), "non-negative integers"),
+        ((1, 2, 4), "scheduled slice"),
+    ],
+)
+def test_execution_request_still_validates_present_draft_context(
+    context_token_ids: tuple[int, ...],
+    expected_error: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_error):
+        ExecutionRequest(
+            request_id="request",
+            input_token_ids=(3,),
+            context_token_ids=context_token_ids,
+            num_computed_tokens=2,
+            num_lookahead_tokens=1,
+            max_output_tokens=2,
+            block_ids=None,
+        )
+
+
 def _contiguous_worker(provider, decode_handler=None) -> LocalModelWorker:
     return LocalModelWorker(
         provider,
@@ -230,13 +276,13 @@ def _paged_worker(
 
 
 def _dense_tiny_logits(model, token_ids: tuple[int, ...]) -> torch.Tensor:
-    input_ids = torch.tensor([token_ids])
-    positions = torch.arange(len(token_ids)).unsqueeze(0)
+    input_ids = torch.tensor(token_ids)
+    positions = torch.arange(len(token_ids))
     attention = TorchDenseAttention(
         model.kv_cache_spec,
         DenseAttentionMetadata(
             positions=positions,
-            query_lengths=(len(token_ids),),
+            query_layouts=(linear_query_layout(len(token_ids)),),
         ),
     )
     return model(
@@ -246,6 +292,15 @@ def _dense_tiny_logits(model, token_ids: tuple[int, ...]) -> torch.Tensor:
             attention=attention,
         )
     ).logits
+
+
+def test_step_handler_validates_semantic_positions_before_h2d() -> None:
+    _validate_positions((0, 7), max_model_tokens=8)
+    _validate_positions((0, 8), max_model_tokens=None)
+
+    for positions in ((-1,), (8,), (True,)):
+        with pytest.raises(ExecutionError, match="position"):
+            _validate_positions(positions, max_model_tokens=8)
 
 
 def test_reference_executor_delegates_token_choice_to_sampler() -> None:
@@ -346,18 +401,16 @@ def test_engine_ngram_speculation_matches_target_generation(
                 self.queries: list[tuple[int, ...]] = []
 
             def forward(self, batch: ForwardBatch) -> ModelOutput:
-                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
-                self.queries.append(
-                    tuple(int(value) for value in batch.input_ids[0, :query_length])
-                )
+                assert batch.query_start_loc is not None
+                self.queries.append(tuple(int(value) for value in batch.input_ids))
                 return super().forward(batch)
 
         forwarder = RecordingIncrementingForwarder()
         provider = StaticSessionProvider(forwarder)
-        decode_handler = NGramSpeculativeDecodeHandler(
-            NGramTokenProposer(min_match_length=2, max_match_length=4),
+        decode_handler = SpeculativeDecodeHandler(
+            NGramChainProposer(min_match_length=2, max_match_length=4),
             GreedySampler(),
-            GreedyAcceptanceSampler(),
+            GreedyTreeAcceptanceSampler(),
         )
         if paged:
             worker = _paged_worker(
@@ -394,6 +447,68 @@ def test_engine_ngram_speculation_matches_target_generation(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+def test_engine_tree_speculation_compacts_a_non_contiguous_root(
+    paged: bool,
+) -> None:
+    async def run() -> None:
+        class FixedTreeProposer:
+            def propose(self, token_ids: tuple[int, ...], *, max_nodes: int) -> DraftTree:
+                tokens = (9, 6)[:max_nodes]
+                return DraftTree(tokens, (-1,) * len(tokens))
+
+        class RecordingForwarder(IncrementingForwarder):
+            def __init__(self) -> None:
+                super().__init__(vocab_size=16)
+                self.queries: list[tuple[int, ...]] = []
+
+            def forward(self, batch: ForwardBatch) -> ModelOutput:
+                assert batch.query_start_loc is not None
+                self.queries.append(tuple(int(value) for value in batch.input_ids))
+                return super().forward(batch)
+
+        forwarder = RecordingForwarder()
+        provider = StaticSessionProvider(forwarder)
+        decode_handler = SpeculativeDecodeHandler(
+            FixedTreeProposer(),
+            GreedySampler(),
+            GreedyTreeAcceptanceSampler(),
+        )
+        if paged:
+            worker = _paged_worker(
+                provider,
+                num_blocks=8,
+                block_size=2,
+                decode_handler=decode_handler,
+            )
+            logical_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=8, block_size=2))
+        else:
+            worker = _contiguous_worker(provider, decode_handler=decode_handler)
+            logical_cache = UnboundedKVCacheManager()
+        executor = LocalModelExecutor(worker)
+        executor.initialize()
+        engine = EngineCore(
+            executor,
+            TokenBudgetScheduler(
+                logical_cache,
+                max_num_sequences=1,
+                max_num_scheduled_tokens=8,
+                decoding_budget=DecodingBudget(
+                    num_lookahead_tokens=2,
+                    max_output_tokens=3,
+                ),
+            ),
+        )
+
+        result = await engine.generate(GenerateRequest(input_ids=(5,), max_new_tokens=3))
+        await engine.close()
+
+        assert result.generated_token_ids == (6, 7, 8)
+        assert forwarder.queries == [(5, 9, 6), (7,)]
+
+    asyncio.run(run())
+
+
 def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> None:
     torch.manual_seed(23)
     forwarder = CountingAttentionForwarder()
@@ -412,14 +527,14 @@ def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> No
     )
 
     expected_prefill = tuple(
-        int(_dense_tiny_logits(forwarder.model, tokens)[0, -1].argmax().item())
+        int(_dense_tiny_logits(forwarder.model, tokens)[-1].argmax().item())
         for tokens in ((1, 2, 3), (5, 6))
     )
     assert tuple(result.output_token_ids[0] for result in prefill.requests) == expected_prefill
     assert forwarder.calls == 1
     torch.testing.assert_close(
         forwarder.position_batches[0],
-        torch.tensor([[0, 1, 2], [0, 1, 0]]),
+        torch.tensor([0, 1, 2, 0, 1]),
     )
 
     decode = executor.execute(
@@ -431,7 +546,7 @@ def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> No
         )
     )
     expected_decode = tuple(
-        int(_dense_tiny_logits(forwarder.model, tokens + (generated,))[0, -1].argmax().item())
+        int(_dense_tiny_logits(forwarder.model, tokens + (generated,))[-1].argmax().item())
         for tokens, generated in zip(
             ((1, 2, 3), (5, 6)),
             expected_prefill,
@@ -441,7 +556,7 @@ def test_paged_step_batches_requests_and_matches_full_sequence_attention() -> No
 
     assert tuple(result.output_token_ids[0] for result in decode.requests) == expected_decode
     assert forwarder.calls == 2
-    torch.testing.assert_close(forwarder.position_batches[1], torch.tensor([[3], [2]]))
+    torch.testing.assert_close(forwarder.position_batches[1], torch.tensor([3, 2]))
 
 
 def test_paged_step_rejects_execution_without_block_tables() -> None:
@@ -539,22 +654,59 @@ def test_contiguous_step_can_resume_after_a_speculative_suffix_is_rejected() -> 
     model = IncrementingForwarder()
     step = ContiguousStepHandler(model, ContiguousKVCacheConfig())
     step.add_request("request", capacity=3)
-    step.forward(
-        model,
+    first = linear_model_step_request(
+        _execution_request("request", (1, 2), 0, None, max_output_tokens=0)
+    )
+    step.forward(model, ModelStepBatch((first,)))
+
+    step.compact(first, (0,))
+    second = linear_model_step_request(
+        _execution_request("request", (3,), 1, None, max_output_tokens=0)
+    )
+    output = step.forward(model, ModelStepBatch((second,)))
+
+    assert output.request_logits(0).shape == (0, model.vocab_size)
+
+
+def test_model_step_output_keeps_empty_request_slices() -> None:
+    logits = torch.zeros((2, 5))
+    output = ModelStepOutput(logits, (0, 1, 1, 2))
+
+    assert output.num_requests == 3
+    assert output.request_logits(0).shape == (1, 5)
+    assert output.request_logits(1).shape == (0, 5)
+    assert output.request_logits(2).shape == (1, 5)
+
+
+def test_standard_decode_samples_the_packed_logits_without_restacking() -> None:
+    logits = torch.tensor([[0.0, 2.0, 1.0], [3.0, 0.0, 1.0]])
+    model_output = ModelStepOutput(logits, (0, 1, 2))
+
+    class Step:
+        def forward(self, model, batch):
+            return model_output
+
+    class RecordingSampler:
+        seen = None
+
+        def sample(self, value):
+            self.seen = value
+            return (1, 0)
+
+    sampler = RecordingSampler()
+    output = StandardDecodeHandler(sampler).execute(
+        None,
         ExecutionBatch(
-            requests=(_execution_request("request", (1, 2), 0, None, max_output_tokens=0),)
+            requests=(
+                _execution_request("first", (1,), 0, None),
+                _execution_request("second", (2,), 0, None),
+            )
         ),
+        Step(),
     )
 
-    step.truncate("request", 1)
-    logits = step.forward(
-        model,
-        ExecutionBatch(
-            requests=(_execution_request("request", (3,), 1, None, max_output_tokens=0),)
-        ),
-    )
-
-    assert logits[0].shape == (1, model.vocab_size)
+    assert sampler.seen is logits
+    assert tuple(request.output_token_ids for request in output.requests) == ((1,), (0,))
 
 
 @pytest.mark.parametrize(
@@ -614,8 +766,8 @@ def test_worker_composes_step_and_decode_handlers_without_mode_branches() -> Non
         def forward(self, model, batch):
             raise AssertionError("decode handler controls when a model step runs")
 
-        def truncate(self, request_id: str, num_cached_tokens: int) -> None:
-            return
+        def compact(self, request, retained_query_indices: tuple[int, ...]) -> int:
+            return 0
 
     class MultiTokenDecode:
         def __init__(self) -> None:

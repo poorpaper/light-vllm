@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from itertools import count
 
 from light_vllm.runtime.engine.admission import CapacityAdmission, SafeTTFTAdmission
+from light_vllm.runtime.engine.execution_lane import ExecutionLane
 from light_vllm.runtime.engine.interfaces import (
     EngineCapabilities,
     RequestAdmission,
@@ -17,6 +18,7 @@ from light_vllm.runtime.engine.interfaces import (
 from light_vllm.runtime.execution.interfaces import (
     ExecutionBatch,
     ExecutionError,
+    ExecutionLease,
     ExecutionNotReadyError,
     ExecutionOutput,
     ExecutionRequest,
@@ -58,6 +60,28 @@ class _RequestState:
     token_ids: list[int]
     generated_count: int = 0
     events: asyncio.Queue[_QueueItem] = field(default_factory=asyncio.Queue)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedStep:
+    """锁内准备完成、可以交给 Executor 的单个模型步骤。"""
+
+    scheduled: SchedulerOutput
+    batch: ExecutionBatch
+    lease: ExecutionLease
+
+
+@dataclass(frozen=True, slots=True)
+class _CompletedStep:
+    """模型执行越过安全边界后，等待 Engine 原子提交的事实。"""
+
+    prepared: _PreparedStep
+    output: dict[str, RequestOutput] | None = None
+    error: Exception | None = None
+
+    def __post_init__(self) -> None:
+        if (self.output is None) == (self.error is None):
+            raise ValueError("completed step must contain exactly one output or error")
 
 
 def _execution_error(exc: Exception) -> GenerationError:
@@ -106,6 +130,20 @@ async def _await_safe_boundary(task: asyncio.Task[None]) -> None:
         raise
 
 
+async def _next_event_loop_turn() -> None:
+    """等当前已就绪任务前进一轮，不引入墙钟等待。"""
+
+    loop = asyncio.get_running_loop()
+    checkpoint: asyncio.Future[None] = loop.create_future()
+
+    def complete() -> None:
+        if not checkpoint.done():
+            checkpoint.set_result(None)
+
+    loop.call_soon(complete)
+    await checkpoint
+
+
 class EngineCore:
     """按 ``schedule → execute → update`` 驱动所有活动请求。
 
@@ -121,8 +159,11 @@ class EngineCore:
         admission: RequestAdmission | None = None,
         performance_observer: PerformanceObserver | None = None,
         ttft_admission: TTFTAdmission | None = None,
+        cooperative_inline: bool = False,
     ) -> None:
         self._executor = executor
+        self._cooperative_inline = cooperative_inline
+        self._execution_lane = None if cooperative_inline else ExecutionLane(executor)
         self._scheduler = scheduler
         self._admission = admission or CapacityAdmission()
         self._ttft_admission = SafeTTFTAdmission(ttft_admission)
@@ -201,8 +242,12 @@ class EngineCore:
                     )
                 self._publish_scheduler_stats()
             task = self._driver_task
-        if task is not None:
-            await _await_safe_boundary(task)
+        try:
+            if task is not None:
+                await _await_safe_boundary(task)
+        finally:
+            if self._execution_lane is not None:
+                self._execution_lane.close()
 
     async def _register(self, request: GenerateRequest) -> _RequestState:
         async with self._lock:
@@ -264,46 +309,43 @@ class EngineCore:
     async def _drive(self) -> None:
         current_task = asyncio.current_task()
         try:
+            completed: _CompletedStep | None = None
             while True:
-                await asyncio.sleep(0)
+                if self._cooperative_inline:
+                    # IPC reader 先唤醒 command pump，pump 再创建请求 stream。
+                    # 两轮只推进已经 ready 的控制任务，不增加固定延迟。
+                    await _next_event_loop_turn()
+                    await _next_event_loop_turn()
+
                 async with self._lock:
-                    if not self._scheduler.has_requests:
-                        self._driver_task = None
+                    prepared = self._advance_locked(completed)
+                    completed = None
+                    if prepared is None:
                         return
-                    scheduled = self._scheduler.schedule()
-                    self._publish_scheduler_stats()
-                    batch = self._build_execution_batch_locked(scheduled)
-                    lease = self._executor.acquire(batch.request_ids)
-                    self._executing_request_ids.update(batch.request_ids)
+
+                if self._cooperative_inline:
+                    # apply 已经发布 token；执行下一步前先让现有 stream 消费它。
+                    await _next_event_loop_turn()
 
                 # 锁内只生成计划并保留缓存；耗时的模型计算在线程和锁外执行。
                 try:
-                    raw_output = await asyncio.to_thread(self._executor.execute, batch)
-                    # 结果完整通过检查前，不更新请求进度，也不提交 KV cache。
-                    output = _validated_output(batch, raw_output)
-                    if raw_output.step_elapsed_seconds is not None:
-                        observation = StepObservation(
-                            num_model_tokens_computed=raw_output.num_model_tokens_computed,
-                            num_requests=len(batch.requests),
-                            elapsed_seconds=raw_output.step_elapsed_seconds,
-                        )
-                        # 控制组件和只读 Observer 消费同一个已完成 step 事实。
-                        self._ttft_admission.step_completed(observation)
-                        self._performance_observer.step_completed(observation)
-                except Exception as exc:
-                    async with self._lock:
-                        self._fail_batch_locked(scheduled.request_ids, exc)
-                    continue
-                finally:
+                    completed = await self._execute_prepared_step(prepared)
+                except BaseException:
                     try:
-                        # 等模型不再使用缓存后，调度器才可以回收对应 block。
-                        lease.release()
+                        prepared.lease.release()
                     finally:
                         async with self._lock:
-                            self._finish_execution_locked(batch.request_ids)
+                            self._finish_execution_locked(prepared.batch.request_ids)
+                            self._publish_scheduler_stats()
+                    raise
 
-                async with self._lock:
-                    self._apply_output_locked(scheduled, output)
+                try:
+                    # 等模型不再使用缓存后，调度器才可以回收对应 block。
+                    prepared.lease.release()
+                except Exception:
+                    async with self._lock:
+                        self._finish_execution_locked(prepared.batch.request_ids)
+                    raise
         except Exception as exc:
             async with self._lock:
                 self._fail_all_locked(exc)
@@ -313,6 +355,60 @@ class EngineCore:
                     self._driver_task = None
                     if self._scheduler.has_requests and not self._closed:
                         self._start_driver_locked()
+
+    def _advance_locked(self, completed: _CompletedStep | None) -> _PreparedStep | None:
+        """原子提交上一轮，并准备至多一个新的执行步骤。"""
+
+        if completed is not None:
+            request_ids = completed.prepared.batch.request_ids
+            self._finish_execution_locked(request_ids)
+            if completed.error is not None:
+                self._fail_batch_locked(request_ids, completed.error)
+            else:
+                assert completed.output is not None
+                self._apply_output_locked(completed.prepared.scheduled, completed.output)
+
+        if not self._scheduler.has_requests:
+            if completed is not None:
+                self._publish_scheduler_stats()
+            return None
+
+        scheduled = self._scheduler.schedule()
+        batch = self._build_execution_batch_locked(scheduled)
+        lease = self._executor.acquire(batch.request_ids)
+        self._executing_request_ids.update(batch.request_ids)
+        # apply 与下一轮 schedule 形成一个状态边界，只发布一次稳定快照。
+        self._publish_scheduler_stats()
+        return _PreparedStep(scheduled=scheduled, batch=batch, lease=lease)
+
+    async def _execute_prepared_step(self, prepared: _PreparedStep) -> _CompletedStep:
+        """锁外执行和校验；请求状态只由下一次 ``_advance_locked`` 提交。"""
+
+        try:
+            # Executor 不读取请求 ContextVar，直接提交线程池，省掉
+            # asyncio.to_thread 每轮复制上下文和包装 callable 的成本。
+            raw_output = await self._execute_batch(prepared.batch)
+            # 结果完整通过检查前，不更新请求进度，也不提交 KV cache。
+            output = _validated_output(prepared.batch, raw_output)
+            if raw_output.step_elapsed_seconds is not None:
+                observation = StepObservation(
+                    num_model_tokens_computed=raw_output.num_model_tokens_computed,
+                    num_requests=len(prepared.batch.requests),
+                    elapsed_seconds=raw_output.step_elapsed_seconds,
+                )
+                # 控制组件和只读 Observer 消费同一个已完成 step 事实。
+                self._ttft_admission.step_completed(observation)
+                self._performance_observer.step_completed(observation)
+            return _CompletedStep(prepared=prepared, output=output)
+        except Exception as exc:
+            return _CompletedStep(prepared=prepared, error=exc)
+
+    async def _execute_batch(self, batch: ExecutionBatch) -> ExecutionOutput:
+        """按装配好的 inline 或私有 lane 边界执行一个模型步骤。"""
+
+        if self._execution_lane is None:
+            return self._executor.execute(batch)
+        return await self._execution_lane.execute(batch)
 
     def _build_execution_batch_locked(self, scheduled: SchedulerOutput) -> ExecutionBatch:
         requests: list[ExecutionRequest] = []
@@ -327,7 +423,10 @@ class EngineCore:
                 ExecutionRequest(
                     request_id=item.request_id,
                     input_token_ids=input_token_ids,
-                    context_token_ids=tuple(state.token_ids),
+                    # 普通执行只消费本轮 input；完整 history 只为草稿 proposer 快照。
+                    context_token_ids=(
+                        tuple(state.token_ids) if item.num_lookahead_tokens else None
+                    ),
                     num_computed_tokens=item.num_computed_tokens,
                     num_lookahead_tokens=item.num_lookahead_tokens,
                     max_output_tokens=item.max_output_tokens,
@@ -371,7 +470,6 @@ class EngineCore:
                 state.events.put_nowait(TokenGenerated(token_id=token_id, position=position))
             if finish_reason is not None:
                 self._finish_locked(state, finish_reason)
-        self._publish_scheduler_stats()
 
     def _visible_tokens(
         self,
@@ -410,7 +508,6 @@ class EngineCore:
             if request_id in self._pending_scheduler_removals:
                 self._pending_scheduler_removals.remove(request_id)
                 self._scheduler.remove(request_id)
-        self._publish_scheduler_stats()
 
     def _fail_batch_locked(self, request_ids: tuple[str, ...], exc: Exception) -> None:
         for request_id in request_ids:

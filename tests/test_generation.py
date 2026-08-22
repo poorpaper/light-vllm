@@ -109,6 +109,9 @@ def test_execution_failure_is_exposed_as_generation_error() -> None:
         {"input_ids": (True,)},
         {"max_new_tokens": 0},
         {"eos_token_id": -1},
+        {"max_tolerable_ttft_seconds": 0},
+        {"max_tolerable_ttft_seconds": float("inf")},
+        {"max_tolerable_ttft_seconds": True},
     ],
 )
 def test_generate_request_rejects_invalid_values(changes: dict[str, object]) -> None:

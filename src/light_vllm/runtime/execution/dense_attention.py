@@ -8,6 +8,8 @@ import torch
 from torch import Tensor
 
 from light_vllm.modeling.attention.interfaces import AttentionContext, ModelKVCacheSpec
+from light_vllm.runtime.execution.interfaces import QueryLayout
+from light_vllm.runtime.execution.layout import query_visibility
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCacheState,
     ContiguousLayerKV,
@@ -17,35 +19,37 @@ from light_vllm.runtime.kv_cache import (
 
 @dataclass(frozen=True, slots=True)
 class DenseAttentionMetadata:
-    """dense attention 需要的 query 位置和有效长度。"""
+    """dense attention 需要的 query 位置和父链布局。"""
 
     positions: Tensor
-    query_lengths: tuple[int, ...]
+    query_layouts: tuple[QueryLayout, ...]
 
     def __post_init__(self) -> None:
-        lengths = tuple(self.query_lengths)
-        if self.positions.ndim != 2:
-            raise ValueError("dense attention positions must have two dimensions")
+        layouts = tuple(self.query_layouts)
+        if self.positions.ndim != 1:
+            raise ValueError("dense attention positions must be one-dimensional")
         if self.positions.dtype != torch.long:
             raise ValueError("dense attention positions must use torch.long")
         if bool(torch.any(self.positions < 0)):
             raise ValueError("dense attention positions must not be negative")
-        if len(lengths) != self.positions.shape[0]:
-            raise ValueError("dense attention needs one query length per batch row")
-        if any(
-            type(length) is not int or length <= 0 or length > self.positions.shape[1]
-            for length in lengths
-        ):
-            raise ValueError("dense attention query lengths must fit the padded width")
-        object.__setattr__(self, "query_lengths", lengths)
+        if not layouts or sum(len(layout) for layout in layouts) != self.positions.shape[0]:
+            raise ValueError("dense attention layouts must cover the packed token stream")
+        object.__setattr__(self, "query_layouts", layouts)
 
     @property
     def batch_size(self) -> int:
-        return self.positions.shape[0]
+        return len(self.query_layouts)
 
     @property
-    def query_width(self) -> int:
-        return self.positions.shape[1]
+    def query_lengths(self) -> tuple[int, ...]:
+        return tuple(len(layout) for layout in self.query_layouts)
+
+    @property
+    def query_start_loc(self) -> tuple[int, ...]:
+        starts = [0]
+        for length in self.query_lengths:
+            starts.append(starts[-1] + length)
+        return tuple(starts)
 
 
 class TorchDenseAttention(AttentionContext):
@@ -85,8 +89,8 @@ class TorchDenseAttention(AttentionContext):
         expected = frozenset(self._layer_specs)
         if self.layer_ids != expected:
             raise KVCacheError("model did not execute every configured dense attention layer")
-        if any(length != self._metadata.query_width for length in self._metadata.query_lengths):
-            raise KVCacheError("padded dense batches cannot be appended to one contiguous cache")
+        if self._metadata.batch_size != 1:
+            raise KVCacheError("multiple packed requests cannot share one contiguous cache state")
         return ContiguousKVCacheState(
             layers=tuple(self._updates[layer.layer_id] for layer in self._model_spec.layers)
         )
@@ -109,75 +113,73 @@ class TorchDenseAttention(AttentionContext):
         self._validate_inputs(query, key, value, layer_spec)
 
         past = self._past_by_layer.get(layer_id)
-        past_length = 0
-        keys = key
-        values = value
-        if past is not None:
-            self._validate_past(past, key, layer_spec)
-            past_length = past.keys.shape[1]
-            keys = torch.cat((past.keys, key), dim=1)
-            values = torch.cat((past.values, value), dim=1)
+        if past is not None and self._metadata.batch_size != 1:
+            raise KVCacheError("one contiguous history cannot serve multiple packed requests")
 
+        output = torch.empty_like(query)
         repeats = layer_spec.num_query_heads // layer_spec.num_kv_heads
-        if repeats > 1:
-            keys = keys.repeat_interleave(repeats, dim=2)
-            values = values.repeat_interleave(repeats, dim=2)
+        for start, end, layout in zip(
+            self._metadata.query_start_loc[:-1],
+            self._metadata.query_start_loc[1:],
+            self._metadata.query_layouts,
+            strict=True,
+        ):
+            query_row = query[start:end]
+            keys = key[start:end]
+            values = value[start:end]
+            past_length = 0
+            if past is not None:
+                self._validate_past(past, key, layer_spec)
+                past_length = past.keys.shape[1]
+                keys = torch.cat((past.keys[0], keys), dim=0)
+                values = torch.cat((past.values[0], values), dim=0)
+            if repeats > 1:
+                keys = keys.repeat_interleave(repeats, dim=1)
+                values = values.repeat_interleave(repeats, dim=1)
+            scores = torch.einsum("qhd,khd->hqk", query_row, keys) * scale
+            visibility = torch.tensor(
+                query_visibility(layout),
+                dtype=torch.bool,
+                device=query.device,
+            )
+            if past_length:
+                visibility = torch.cat(
+                    (
+                        torch.ones(
+                            (end - start, past_length), dtype=torch.bool, device=query.device
+                        ),
+                        visibility,
+                    ),
+                    dim=1,
+                )
+            scores = scores.masked_fill(~visibility.unsqueeze(0), torch.finfo(scores.dtype).min)
+            probabilities = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+            output[start:end] = torch.einsum("hqk,khd->qhd", probabilities, values)
 
-        scores = torch.einsum("bqhd,bkhd->bhqk", query, keys) * scale
-        mask = self._causal_mask(past_length, query.device)
-        scores = scores.masked_fill(~mask.unsqueeze(1), torch.finfo(scores.dtype).min)
-        probabilities = torch.softmax(scores.float(), dim=-1).to(query.dtype)
-
-        # 这里只暂存引用；模型完整成功后，连续缓存再统一校验并复制所有层。
-        self._updates[layer_id] = ContiguousLayerKV(keys=key, values=value)
-        return torch.einsum("bhqk,bkhd->bqhd", probabilities, values)
-
-    def _causal_mask(self, past_length: int, device: torch.device) -> Tensor:
-        positions = self._metadata.positions
-        past_positions = torch.arange(
-            past_length,
-            dtype=torch.long,
-            device=device,
-        ).expand(self._metadata.batch_size, -1)
-        key_positions = torch.cat((past_positions, positions), dim=1)
-        query_offsets = torch.arange(self._metadata.query_width, device=device)
-        lengths = torch.tensor(self._metadata.query_lengths, device=device).unsqueeze(1)
-        valid_new_keys = query_offsets.unsqueeze(0) < lengths
-        valid_keys = torch.cat(
-            (
-                torch.ones(
-                    (self._metadata.batch_size, past_length),
-                    dtype=torch.bool,
-                    device=device,
-                ),
-                valid_new_keys,
-            ),
-            dim=1,
+        # 连续缓存仍按单请求保存 batch 维；模型与 attention 接口保持 token-major。
+        self._updates[layer_id] = ContiguousLayerKV(
+            keys=key.unsqueeze(0),
+            values=value.unsqueeze(0),
         )
-        # padding 位置可以经过模型其他层，但不能成为有效 query 的历史。
-        causal = key_positions.unsqueeze(1) <= positions.unsqueeze(2)
-        return causal & valid_keys.unsqueeze(1)
+        return output
 
     def _validate_inputs(self, query, key, value, layer_spec) -> None:
-        if query.ndim != 4:
-            raise KVCacheError("dense attention query must have four dimensions")
-        if query.shape[:2] != key.shape[:2] or value.shape != key.shape:
-            raise KVCacheError("dense attention Q/K/V batch and query dimensions must match")
-        if query.shape[:2] != (
-            self._metadata.batch_size,
-            self._metadata.query_width,
-        ):
+        if query.ndim != 3:
+            raise KVCacheError("dense attention query must have three dimensions")
+        if query.shape[0] != key.shape[0] or value.shape != key.shape:
+            raise KVCacheError("dense attention Q/K/V token dimensions must match")
+        if query.shape[0] != self._metadata.positions.shape[0]:
             raise KVCacheError("dense attention metadata does not match the query")
         if self._metadata.positions.device != query.device:
             raise KVCacheError("dense attention positions must use the query device")
-        if query.shape[2:] != (layer_spec.num_query_heads, layer_spec.head_size):
+        if query.shape[1:] != (layer_spec.num_query_heads, layer_spec.head_size):
             raise KVCacheError("dense attention query shape does not match the layer spec")
-        if key.shape[2:] != (layer_spec.num_kv_heads, layer_spec.head_size):
+        if key.shape[1:] != (layer_spec.num_kv_heads, layer_spec.head_size):
             raise KVCacheError("dense attention K/V shape does not match the layer spec")
 
     def _validate_past(self, past, key, layer_spec) -> None:
         expected_tail = (layer_spec.num_kv_heads, layer_spec.head_size)
-        if past.keys.shape[0] != self._metadata.batch_size:
+        if past.keys.shape[0] != 1:
             raise KVCacheError("dense KV cache batch size does not match the query")
         if past.keys.shape[2:] != expected_tail:
             raise KVCacheError("dense KV cache shape does not match the layer spec")

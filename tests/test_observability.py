@@ -11,6 +11,7 @@ from light_vllm import (
     GenerateResult,
     GenerationFinished,
 )
+from light_vllm.runtime.execution import SpeculativeDecodeObservation
 from light_vllm.runtime.kv_cache import FixedKVBlockCapacity, PagedKVCacheManager
 from light_vllm.runtime.observability import InMemoryPerformanceObserver, StepObservation
 from light_vllm.runtime.observability.dispatch import SafeCompositePerformanceObserver
@@ -208,6 +209,17 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
             elapsed_seconds=0.04,
         )
     )
+    observer.speculation_completed(
+        SpeculativeDecodeObservation(
+            num_proposed_nodes=4,
+            num_accepted_nodes=2,
+            num_verified_tokens=3,
+            num_draft_roots=2,
+            num_branching_parents=1,
+            max_draft_depth=3,
+            num_compacted_tokens=1,
+        )
+    )
     client = TestClient(create_http_app(StubEngineClient(), performance_metrics=observer))
 
     response = client.get("/metrics")
@@ -221,6 +233,13 @@ def test_http_metrics_are_ready_for_prometheus_and_hpa() -> None:
     assert 'light_vllm_kv_cache_claimed_token_slots{model="qwen2"} 0' in response.text
     assert 'light_vllm_self_resubmits_total{model="qwen2"} 0' in response.text
     assert 'light_vllm_self_resubmit_rolled_back_tokens_total{model="qwen2"} 0' in response.text
+    assert 'light_vllm_speculation_attempts_total{model="qwen2"} 1' in response.text
+    assert 'light_vllm_speculation_hits_total{model="qwen2"} 1' in response.text
+    assert 'light_vllm_speculative_proposed_nodes_total{model="qwen2"} 4' in response.text
+    assert 'light_vllm_speculative_accepted_nodes_total{model="qwen2"} 2' in response.text
+    assert 'light_vllm_speculative_verified_tokens_total{model="qwen2"} 3' in response.text
+    assert 'light_vllm_speculative_compacted_tokens_total{model="qwen2"} 1' in response.text
+    assert 'light_vllm_speculative_max_draft_depth{model="qwen2"} 3' in response.text
     assert "light_vllm_time_to_first_token_seconds_bucket" in response.text
     assert (
         'light_vllm_engine_step_seconds_count{model="qwen2",model_tokens_computed_le="2"} 1'

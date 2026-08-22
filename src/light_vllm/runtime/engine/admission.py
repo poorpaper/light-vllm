@@ -98,7 +98,7 @@ class SlidingWindowStepLatencyPredictor:
 
 
 class PredictiveTTFTAdmission:
-    """请求入队前，用全系统当前 pending token 总量检查 TTFT SLO。
+    """请求入队前依次检查队列、KV 水位和预测 TTFT。
 
     每个请求只贡献眼下尚未处理的已知输入，因此 prefill 贡献剩余
     prompt，普通 decode 通常贡献 1；这里不把未来输出预算提前展开。
@@ -108,24 +108,81 @@ class PredictiveTTFTAdmission:
         self,
         predictor: StepLatencyPredictor,
         *,
-        max_tolerable_ttft_seconds: float,
+        max_tolerable_ttft_seconds: float | None = None,
+        max_pending_requests: int | None = None,
+        kv_cache_watermark: float | None = None,
     ) -> None:
-        if not isfinite(max_tolerable_ttft_seconds) or max_tolerable_ttft_seconds <= 0:
+        if max_tolerable_ttft_seconds is not None and (
+            isinstance(max_tolerable_ttft_seconds, bool)
+            or not isinstance(max_tolerable_ttft_seconds, (int, float))
+            or not isfinite(max_tolerable_ttft_seconds)
+            or max_tolerable_ttft_seconds <= 0
+        ):
             raise ValueError("max_tolerable_ttft_seconds must be finite and positive")
-        self._predictor = predictor
+        if max_pending_requests is not None and (
+            type(max_pending_requests) is not int or max_pending_requests <= 0
+        ):
+            raise ValueError("max_pending_requests must be a positive integer")
+        if kv_cache_watermark is not None and (
+            isinstance(kv_cache_watermark, bool)
+            or not isinstance(kv_cache_watermark, (int, float))
+            or not isfinite(kv_cache_watermark)
+            or not 0.0 < kv_cache_watermark <= 1.0
+        ):
+            raise ValueError("kv_cache_watermark must be within (0, 1]")
+        self._predictor: StepLatencyPredictor | None = predictor
         self._max_tolerable_ttft_seconds = max_tolerable_ttft_seconds
+        self._max_pending_requests = max_pending_requests
+        self._kv_cache_watermark = kv_cache_watermark
 
     def validate(self, request: GenerateRequest, stats: SchedulerStats) -> None:
-        pending_tokens = len(request.input_ids) + stats.current_pending_tokens
-        prediction = self._predictor.predict(pending_tokens)
-        if prediction is not None and prediction > self._max_tolerable_ttft_seconds:
+        active_requests = stats.waiting_requests + stats.running_requests
+        if self._max_pending_requests is not None and active_requests >= self._max_pending_requests:
             raise GenerationOverloadedError(
-                f"predicted TTFT {prediction:.3f}s exceeds "
-                f"the {self._max_tolerable_ttft_seconds:.3f}s SLO"
+                f"pending request limit {self._max_pending_requests} reached"
+            )
+        kv = stats.kv_cache
+        if (
+            self._kv_cache_watermark is not None
+            and kv.used_token_slots is not None
+            and kv.claimed_token_slots is not None
+            and kv.capacity_token_slots is not None
+            and (kv.used_token_slots + kv.claimed_token_slots) / kv.capacity_token_slots
+            >= self._kv_cache_watermark
+        ):
+            raise GenerationOverloadedError(
+                f"KV cache watermark {self._kv_cache_watermark:.3f} reached"
+            )
+        ttft_limit = (
+            request.max_tolerable_ttft_seconds
+            if request.max_tolerable_ttft_seconds is not None
+            else self._max_tolerable_ttft_seconds
+        )
+        if ttft_limit is None:
+            return
+        pending_tokens = len(request.input_ids) + stats.current_pending_tokens
+        predictor = self._predictor
+        if predictor is None:
+            return
+        try:
+            prediction = predictor.predict(pending_tokens)
+        except Exception:
+            # 只停用失效的预测器；队列和 KV 两级门控继续工作。
+            self._predictor = None
+            return
+        if prediction is not None and prediction > ttft_limit:
+            raise GenerationOverloadedError(
+                f"predicted TTFT {prediction:.3f}s exceeds the {ttft_limit:.3f}s SLO"
             )
 
     def step_completed(self, observation: StepObservation) -> None:
-        self._predictor.observe(observation)
+        predictor = self._predictor
+        if predictor is None:
+            return
+        try:
+            predictor.observe(observation)
+        except Exception:
+            self._predictor = None
 
 
 class SafeTTFTAdmission:

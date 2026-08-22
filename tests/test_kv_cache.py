@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from light_vllm.modeling.attention.interfaces import AttentionLayerSpec, ModelKVCacheSpec
-from light_vllm.modeling.models.interfaces import ForwardBatch, ModelOutput
+from light_vllm.modeling.models.interfaces import ForwardBatch, ModelOutput, select_query_states
 from light_vllm.modeling.models.tiny_attention import (
     TinyAttentionCausalLM,
     TinyAttentionConfig,
@@ -15,15 +15,16 @@ from light_vllm.modeling.models.tiny_attention import (
 from light_vllm.runtime.engine import EngineCore
 from light_vllm.runtime.execution import (
     DenseAttentionMetadata,
-    GreedyAcceptanceSampler,
+    GreedyTreeAcceptanceSampler,
     LocalModelExecutor,
     LocalModelWorker,
-    NGramSpeculativeDecodeHandler,
-    NGramTokenProposer,
+    NGramChainProposer,
     PagedKVCacheConfig,
+    SpeculativeDecodeHandler,
     TorchDenseAttention,
     TorchPagedAttentionBackend,
 )
+from light_vllm.runtime.execution.layout import linear_query_layout
 from light_vllm.runtime.execution.worker import (
     PagedStepHandler,
     StandardDecodeHandler,
@@ -64,14 +65,14 @@ def _model_kv_spec(*, num_kv_heads: int = 1, head_size: int = 1) -> ModelKVCache
 
 
 def _tiny_dense_forward(model, token_ids: tuple[int, ...], *, past=None):
-    input_ids = torch.tensor([token_ids])
+    input_ids = torch.tensor(token_ids)
     start = 0 if past is None else past.num_tokens
-    positions = torch.arange(start, start + len(token_ids)).unsqueeze(0)
+    positions = torch.arange(start, start + len(token_ids))
     attention = TorchDenseAttention(
         model.kv_cache_spec,
         DenseAttentionMetadata(
             positions=positions,
-            query_lengths=(len(token_ids),),
+            query_layouts=(linear_query_layout(len(token_ids)),),
         ),
         past,
     )
@@ -253,6 +254,99 @@ def test_best_effort_can_fill_an_existing_block_below_its_watermark() -> None:
     assert strict is not None
     second = manager.reserve("best-effort", 1)
     assert second.block_ids == first.block_ids
+
+
+def test_optimistic_admission_claims_prompt_plus_one_block() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=10, block_size=2))
+    admitted = manager.try_add_request(
+        "optimistic",
+        token_ids=(1, 2, 3),
+        max_num_committed_tokens=9,
+        cache_epoch=1,
+        initial_extra_blocks=1,
+        guarantee_completion=False,
+    )
+    assert admitted is not None
+    # prompt=3，再加一个 2-token block，按页向上覆盖到 3 blocks。
+    assert manager.stats.claimed_token_slots == 6
+
+    manager.reserve("optimistic", 3)
+    manager.commit("optimistic", 3)
+    assert manager.stats.used_token_slots == 4
+    assert manager.stats.claimed_token_slots == 2
+    manager.reserve("optimistic", 2)
+    manager.commit("optimistic", 2)
+    assert manager.stats.used_token_slots == 6
+    assert manager.stats.claimed_token_slots == 0
+
+    # 初始 claim 用完后，运行中的请求仍可使用 admission 水位外的 decode 余量。
+    reservation = manager.reserve("optimistic", 2)
+    assert reservation.num_committed_tokens == 5
+
+
+def test_optimistic_initial_claims_return_after_partial_commit_and_free() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=6, block_size=2))
+    admitted = manager.try_add_request(
+        "optimistic",
+        token_ids=(1, 2, 3),
+        max_num_committed_tokens=9,
+        cache_epoch=1,
+        initial_extra_blocks=1,
+        guarantee_completion=False,
+    )
+    assert admitted is not None
+
+    manager.reserve("optimistic", 3)
+    manager.commit("optimistic", 1)
+    assert manager.stats.used_token_slots == 2
+    assert manager.stats.claimed_token_slots == 4
+
+    assert manager.free("optimistic")
+    assert manager.stats.used_token_slots == 0
+    assert manager.stats.claimed_token_slots == 0
+    assert manager.num_free_blocks == 6
+
+
+def test_optimistic_admission_keeps_a_global_decode_watermark() -> None:
+    manager = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=10, block_size=1))
+    for index in range(3):
+        admitted = manager.try_add_request(
+            str(index),
+            token_ids=(index, index + 1),
+            max_num_committed_tokens=8,
+            cache_epoch=1,
+            admission_min_free_token_slots=1,
+            initial_extra_blocks=1,
+            guarantee_completion=False,
+        )
+        assert admitted is not None
+
+    assert manager.stats.claimed_token_slots == 9
+    assert (
+        manager.try_add_request(
+            "blocked",
+            token_ids=(8, 9),
+            max_num_committed_tokens=8,
+            cache_epoch=1,
+            admission_min_free_token_slots=1,
+            initial_extra_blocks=1,
+            guarantee_completion=False,
+        )
+        is None
+    )
+
+
+def test_prompt_block_key_plan_is_reused_for_the_same_request_tokens() -> None:
+    manager = PagedKVCacheManager(
+        FixedKVBlockCapacity(num_blocks=8, block_size=2),
+        enable_prefix_caching=True,
+    )
+    tokens = (1, 2, 3, 4, 5)
+
+    first = manager._prompt_block_keys(tokens, 1)
+    second = manager._prompt_block_keys(tokens, 1)
+
+    assert second is first
 
 
 def test_unbounded_manager_tracks_reservations_without_block_placement() -> None:
@@ -457,6 +551,28 @@ def test_contiguous_cache_can_truncate_a_rejected_suffix() -> None:
         cache.truncate("request", 2)
 
 
+def test_contiguous_cache_compacts_a_non_contiguous_overlapping_path() -> None:
+    cache = ContiguousKVCache(_model_kv_spec(), ContiguousKVCacheConfig())
+    cache.allocate("request", capacity=7)
+    cache.append("request", _updates(1, 2))
+    cache.append("request", _updates(10, 20, 30, 40, 50))
+
+    cache.compact(
+        "request",
+        num_computed_tokens=2,
+        retained_query_indices=(0, 2, 4),
+    )
+
+    assert cache.cached_tokens("request") == 5
+    assert cache.view("request").layers[0].keys.flatten().tolist() == [
+        1,
+        2,
+        10,
+        30,
+        50,
+    ]
+
+
 def test_cache_lease_defers_physical_release_until_execution_finishes() -> None:
     cache = ContiguousKVCache(_model_kv_spec(), ContiguousKVCacheConfig())
     cache.allocate("request", capacity=1)
@@ -475,17 +591,17 @@ def test_tiny_attention_cached_logits_match_full_sequence_logits() -> None:
     model = TinyAttentionCausalLM(
         TinyAttentionConfig(vocab_size=16, hidden_size=8, num_heads=2)
     ).eval()
-    full = _tiny_dense_forward(model, (1, 2, 3))[0].logits[:, -1]
+    full = _tiny_dense_forward(model, (1, 2, 3))[0].logits[-1]
 
     prompt, prompt_attention = _tiny_dense_forward(model, (1, 2))
     cached = _tiny_dense_forward(
         model,
         (3,),
         past=prompt_attention.cache_updates,
-    )[0].logits[:, -1]
+    )[0].logits[-1]
 
     torch.testing.assert_close(cached, full)
-    assert prompt.logits.shape == (1, 2, 16)
+    assert prompt.logits.shape == (2, 16)
 
 
 def test_tiny_attention_requires_one_execution_attention_context() -> None:
@@ -494,7 +610,7 @@ def test_tiny_attention_requires_one_execution_attention_context() -> None:
     ).eval()
 
     with pytest.raises(ValueError, match="requires an attention context"):
-        model(ForwardBatch(input_ids=torch.tensor([[1, 2]])))
+        model(ForwardBatch(input_ids=torch.tensor([1, 2])))
 
 
 def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
@@ -504,7 +620,7 @@ def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
 
         def forward(self, layer_id, query, key, value, *, scale):
             self.layer_ids.append(layer_id)
-            assert query.shape == key.shape == value.shape == (1, 2, 2, 4)
+            assert query.shape == key.shape == value.shape == (2, 2, 4)
             assert scale == 0.5
             return query
 
@@ -513,9 +629,9 @@ def test_tiny_attention_delegates_cache_layout_to_attention_context() -> None:
     ).eval()
     attention = RecordingAttention()
 
-    output = model(ForwardBatch(input_ids=torch.tensor([[1, 2]]), attention=attention))
+    output = model(ForwardBatch(input_ids=torch.tensor([1, 2]), attention=attention))
 
-    assert output.logits.shape == (1, 2, 16)
+    assert output.logits.shape == (2, 16)
     assert attention.layer_ids == ["attention"]
 
 
@@ -545,7 +661,7 @@ def test_engine_chunked_prefill_matches_full_sequence_greedy_generation() -> Non
         token_ids = list(request.input_ids)
         for _ in range(request.max_new_tokens):
             logits = _tiny_dense_forward(model, tuple(token_ids))[0].logits
-            token_id = int(logits[0, -1].argmax().item())
+            token_id = int(logits[-1].argmax().item())
             expected.append(token_id)
             token_ids.append(token_id)
 
@@ -596,8 +712,7 @@ def test_engine_reuses_a_shared_prompt_prefix_without_changing_generation() -> N
                 self.query_lengths: list[tuple[int, ...]] = []
 
             def forward(self, batch: ForwardBatch):
-                lengths = batch.sequence_lengths or (batch.input_ids.shape[1],)
-                self.query_lengths.append(lengths)
+                self.query_lengths.append(batch.query_lengths)
                 return model(batch)
 
         forwarder = Forwarder()
@@ -636,7 +751,7 @@ def test_engine_reuses_a_shared_prompt_prefix_without_changing_generation() -> N
         await engine.generate(GenerateRequest(input_ids=(1, 2, 3, 4, 5), max_new_tokens=1))
         second_prompt = (1, 2, 3, 4, 6)
         result = await engine.generate(GenerateRequest(input_ids=second_prompt, max_new_tokens=1))
-        expected = int(_tiny_dense_forward(model, second_prompt)[0].logits[0, -1].argmax())
+        expected = int(_tiny_dense_forward(model, second_prompt)[0].logits[-1].argmax())
         await engine.close()
 
         assert result.generated_token_ids == (expected,)
@@ -657,17 +772,14 @@ def test_engine_speculates_after_reusing_a_shared_prompt_prefix() -> None:
                 self.queries: list[tuple[int, ...]] = []
 
             def forward(self, batch: ForwardBatch) -> ModelOutput:
-                query_length = (batch.sequence_lengths or (batch.input_ids.shape[1],))[0]
-                self.queries.append(
-                    tuple(int(value) for value in batch.input_ids[0, :query_length])
-                )
+                self.queries.append(tuple(int(value) for value in batch.input_ids))
                 next_ids = (batch.input_ids + 1) % 16
                 logits = torch.full((*batch.input_ids.shape, 16), -1.0)
                 logits.scatter_(-1, next_ids.unsqueeze(-1), 1.0)
-                keys = batch.input_ids.to(torch.float32).reshape(1, -1, 1, 1)
+                keys = batch.input_ids.to(torch.float32).reshape(-1, 1, 1)
                 assert batch.attention is not None
                 batch.attention.forward("attention", keys, keys, keys, scale=1.0)
-                return ModelOutput(logits=logits)
+                return ModelOutput(logits=select_query_states(logits, batch))
 
         forwarder = Forwarder()
 
@@ -686,10 +798,10 @@ def test_engine_speculates_after_reusing_a_shared_prompt_prefix() -> None:
                 cache_planner=cache_config,
                 attention_backend=TorchPagedAttentionBackend(),
             ),
-            NGramSpeculativeDecodeHandler(
-                NGramTokenProposer(min_match_length=2, max_match_length=4),
+            SpeculativeDecodeHandler(
+                NGramChainProposer(min_match_length=2, max_match_length=4),
                 GreedySampler(),
-                GreedyAcceptanceSampler(),
+                GreedyTreeAcceptanceSampler(),
             ),
         )
         executor = LocalModelExecutor(worker)

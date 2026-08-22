@@ -7,6 +7,7 @@ from itertools import accumulate
 from threading import RLock
 from time import perf_counter
 
+from light_vllm.runtime.execution.interfaces import SpeculativeDecodeObservation
 from light_vllm.runtime.kv_cache import KVCacheStats
 from light_vllm.runtime.observability.interfaces import (
     AdmissionRejection,
@@ -113,6 +114,15 @@ class InMemoryPerformanceObserver:
             "capacity": 0,
             "overloaded": 0,
         }
+        self._speculation_attempts = 0
+        self._speculation_hits = 0
+        self._speculative_proposed_nodes = 0
+        self._speculative_accepted_nodes = 0
+        self._speculative_verified_tokens = 0
+        self._speculative_draft_roots = 0
+        self._speculative_branching_parents = 0
+        self._speculative_compacted_tokens = 0
+        self._speculative_max_draft_depth = 0
 
     def request_started(self, request_id: str, *, num_prompt_tokens: int) -> None:
         if not request_id:
@@ -176,6 +186,26 @@ class InMemoryPerformanceObserver:
             histogram = self._step_latency.setdefault(bucket, _Histogram(_LATENCY_BOUNDS))
             histogram.observe(observation.elapsed_seconds)
 
+    def speculation_completed(
+        self,
+        observation: SpeculativeDecodeObservation,
+    ) -> None:
+        if not isinstance(observation, SpeculativeDecodeObservation):
+            raise TypeError("observation must be SpeculativeDecodeObservation")
+        with self._lock:
+            self._speculation_attempts += 1
+            self._speculation_hits += int(observation.num_accepted_nodes > 0)
+            self._speculative_proposed_nodes += observation.num_proposed_nodes
+            self._speculative_accepted_nodes += observation.num_accepted_nodes
+            self._speculative_verified_tokens += observation.num_verified_tokens
+            self._speculative_draft_roots += observation.num_draft_roots
+            self._speculative_branching_parents += observation.num_branching_parents
+            self._speculative_compacted_tokens += observation.num_compacted_tokens
+            self._speculative_max_draft_depth = max(
+                self._speculative_max_draft_depth,
+                observation.max_draft_depth,
+            )
+
     def snapshot(self) -> PerformanceSnapshot:
         with self._lock:
             return PerformanceSnapshot(
@@ -203,6 +233,15 @@ class InMemoryPerformanceObserver:
                 cancelled_requests_total=self._request_outcomes["cancelled"],
                 rejected_requests_total=self._admission_rejections["capacity"],
                 overloaded_requests_total=self._admission_rejections["overloaded"],
+                speculation_attempts_total=self._speculation_attempts,
+                speculation_hits_total=self._speculation_hits,
+                speculative_proposed_nodes_total=self._speculative_proposed_nodes,
+                speculative_accepted_nodes_total=self._speculative_accepted_nodes,
+                speculative_verified_tokens_total=self._speculative_verified_tokens,
+                speculative_draft_roots_total=self._speculative_draft_roots,
+                speculative_branching_parents_total=self._speculative_branching_parents,
+                speculative_compacted_tokens_total=self._speculative_compacted_tokens,
+                speculative_max_draft_depth=self._speculative_max_draft_depth,
             )
 
     def _request(self, request_id: str) -> _RequestTiming:

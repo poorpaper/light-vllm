@@ -21,28 +21,84 @@ class ExecutionNotReadyError(ExecutionError):
 
 @dataclass(frozen=True, slots=True)
 class AcceptanceResult:
-    """候选验收后可见的输出，以及其中已经写入 KV 的前缀长度。"""
+    """候选验收后可见的输出，以及真正命中的草稿路径。"""
 
     output_token_ids: tuple[int, ...]
-    num_cached_output_tokens: int
+    accepted_draft_indices: tuple[int, ...]
 
     def __post_init__(self) -> None:
         output_token_ids = tuple(self.output_token_ids)
+        accepted_draft_indices = tuple(self.accepted_draft_indices)
         if not output_token_ids:
             raise ValueError("acceptance result must contain at least one output token")
         if any(type(token_id) is not int or token_id < 0 for token_id in output_token_ids):
             raise ValueError("output_token_ids must contain non-negative integers")
-        if type(self.num_cached_output_tokens) is not int or not (
-            0 <= self.num_cached_output_tokens < len(output_token_ids)
-        ):
-            raise ValueError("cached output count must leave one uncached output token")
+        if any(type(index) is not int or index < 0 for index in accepted_draft_indices):
+            raise ValueError("accepted_draft_indices must contain non-negative integers")
+        if len(set(accepted_draft_indices)) != len(accepted_draft_indices):
+            raise ValueError("accepted draft indices must be unique")
+        if len(output_token_ids) != len(accepted_draft_indices) + 1:
+            raise ValueError("acceptance result must leave one uncached output token")
         object.__setattr__(self, "output_token_ids", output_token_ids)
+        object.__setattr__(self, "accepted_draft_indices", accepted_draft_indices)
+
+    @property
+    def num_cached_output_tokens(self) -> int:
+        return len(self.accepted_draft_indices)
 
 
-class TokenProposer(Protocol):
-    """根据完整已知 token 历史提出少量候选 token。"""
+@dataclass(frozen=True, slots=True)
+class DraftTree:
+    """按父节点优先顺序展平的草稿树。"""
 
-    def propose(self, token_ids: tuple[int, ...], *, max_tokens: int) -> tuple[int, ...]: ...
+    token_ids: tuple[int, ...]
+    parent_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        token_ids = tuple(self.token_ids)
+        parent_indices = tuple(self.parent_indices)
+        if len(token_ids) != len(parent_indices):
+            raise ValueError("draft tokens and parents must have the same length")
+        if any(type(token_id) is not int or token_id < 0 for token_id in token_ids):
+            raise ValueError("draft tokens must be non-negative integers")
+        siblings: set[tuple[int, int]] = set()
+        for index, (token_id, parent) in enumerate(zip(token_ids, parent_indices, strict=True)):
+            if type(parent) is not int or not -1 <= parent < index:
+                raise ValueError("each draft parent must be -1 or precede its child")
+            sibling = (parent, token_id)
+            if sibling in siblings:
+                raise ValueError("draft siblings must use distinct token IDs")
+            siblings.add(sibling)
+        object.__setattr__(self, "token_ids", token_ids)
+        object.__setattr__(self, "parent_indices", parent_indices)
+
+    def __len__(self) -> int:
+        return len(self.token_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class QueryLayout:
+    """一次模型步骤内每个 query 对更早 query 的父依赖。"""
+
+    parent_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        parent_indices = tuple(self.parent_indices)
+        if not parent_indices:
+            raise ValueError("query layout must not be empty")
+        for index, parent in enumerate(parent_indices):
+            if type(parent) is not int or not -1 <= parent < index:
+                raise ValueError("each query parent must be -1 or precede its child")
+        object.__setattr__(self, "parent_indices", parent_indices)
+
+    def __len__(self) -> int:
+        return len(self.parent_indices)
+
+
+class DraftProposer(Protocol):
+    """根据完整已知 token 历史提出一棵有界草稿树。"""
+
+    def propose(self, token_ids: tuple[int, ...], *, max_nodes: int) -> DraftTree: ...
 
 
 class AcceptanceSampler(Protocol):
@@ -50,9 +106,57 @@ class AcceptanceSampler(Protocol):
 
     def accept(
         self,
-        draft_token_ids: tuple[int, ...],
+        draft: DraftTree,
         target_token_ids: tuple[int, ...],
     ) -> AcceptanceResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SpeculativeDecodeObservation:
+    """一次成功树验证产生的候选、验证产出和 KV 搬运事实。"""
+
+    num_proposed_nodes: int
+    num_accepted_nodes: int
+    # 包含命中的草稿节点和 target model 最终补出的一个 token。
+    num_verified_tokens: int
+    num_draft_roots: int
+    num_branching_parents: int
+    max_draft_depth: int
+    num_compacted_tokens: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.num_proposed_nodes,
+            self.num_accepted_nodes,
+            self.num_verified_tokens,
+            self.num_draft_roots,
+            self.num_branching_parents,
+            self.max_draft_depth,
+            self.num_compacted_tokens,
+        )
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError("speculative decode counters must be non-negative integers")
+        if self.num_accepted_nodes > self.num_proposed_nodes:
+            raise ValueError("accepted nodes must not exceed proposed nodes")
+        if self.num_verified_tokens != self.num_accepted_nodes + 1:
+            raise ValueError("verified tokens must contain accepted nodes plus one target token")
+        if self.num_draft_roots > self.num_proposed_nodes:
+            raise ValueError("draft roots must not exceed proposed nodes")
+        if self.num_branching_parents > self.num_proposed_nodes:
+            raise ValueError("branching parents must not exceed proposed nodes")
+        if self.max_draft_depth > self.num_proposed_nodes:
+            raise ValueError("draft depth must not exceed proposed nodes")
+        if self.num_compacted_tokens > self.num_accepted_nodes:
+            raise ValueError("compacted tokens must not exceed accepted nodes")
+
+
+class SpeculationObserver(Protocol):
+    """接收投机解码事实的轻量旁路端口。"""
+
+    def speculation_completed(
+        self,
+        observation: SpeculativeDecodeObservation,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +180,8 @@ class ExecutionRequest:
 
     request_id: str
     input_token_ids: tuple[int, ...]
-    # 从 prompt 开始到当前已知末尾的完整 token；proposer 只读，不得在执行中修改。
-    context_token_ids: tuple[int, ...]
+    # 只有草稿 proposer 需要从 prompt 开始的完整只读 token 快照；普通执行不携带它。
+    context_token_ids: tuple[int, ...] | None
     num_computed_tokens: int
     num_lookahead_tokens: int
     max_output_tokens: int
@@ -87,17 +191,12 @@ class ExecutionRequest:
 
     def __post_init__(self) -> None:
         input_token_ids = tuple(self.input_token_ids)
-        context_token_ids = tuple(self.context_token_ids)
         if not self.request_id:
             raise ValueError("request_id must not be empty")
         if not input_token_ids:
             raise ValueError("input_token_ids must not be empty")
         if any(type(token_id) is not int or token_id < 0 for token_id in input_token_ids):
             raise ValueError("input_token_ids must contain non-negative integers")
-        if not context_token_ids or any(
-            type(token_id) is not int or token_id < 0 for token_id in context_token_ids
-        ):
-            raise ValueError("context_token_ids must contain non-negative integers")
         if type(self.num_computed_tokens) is not int or self.num_computed_tokens < 0:
             raise ValueError("num_computed_tokens must be a non-negative integer")
         if type(self.num_lookahead_tokens) is not int or self.num_lookahead_tokens < 0:
@@ -106,11 +205,17 @@ class ExecutionRequest:
             raise ValueError("max_output_tokens must be a non-negative integer")
         if type(self.num_readonly_prefix_blocks) is not int or self.num_readonly_prefix_blocks < 0:
             raise ValueError("num_readonly_prefix_blocks must be a non-negative integer")
-        input_end = self.num_computed_tokens + len(input_token_ids)
-        if tuple(context_token_ids[self.num_computed_tokens : input_end]) != input_token_ids:
-            raise ValueError("input_token_ids must be the scheduled slice of context_token_ids")
         object.__setattr__(self, "input_token_ids", input_token_ids)
-        object.__setattr__(self, "context_token_ids", context_token_ids)
+        if self.context_token_ids is not None:
+            context_token_ids = tuple(self.context_token_ids)
+            if not context_token_ids or any(
+                type(token_id) is not int or token_id < 0 for token_id in context_token_ids
+            ):
+                raise ValueError("context_token_ids must contain non-negative integers")
+            input_end = self.num_computed_tokens + len(input_token_ids)
+            if tuple(context_token_ids[self.num_computed_tokens : input_end]) != input_token_ids:
+                raise ValueError("input_token_ids must be the scheduled slice of context_token_ids")
+            object.__setattr__(self, "context_token_ids", context_token_ids)
         if self.block_ids is None and self.num_readonly_prefix_blocks:
             raise ValueError("readonly prefix blocks require a block table")
         if self.block_ids is not None:
@@ -137,6 +242,112 @@ class ExecutionBatch:
     @property
     def request_ids(self) -> tuple[str, ...]:
         return tuple(request.request_id for request in self.requests)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStepRequest:
+    """Decode Handler 已经确定的一次具体模型计算。"""
+
+    request_id: str
+    query_token_ids: tuple[int, ...]
+    num_computed_tokens: int
+    # 包含正式输入和 speculative slots；未使用的槽位不进入模型 forward。
+    num_reserved_query_tokens: int
+    query_layout: QueryLayout
+    block_ids: tuple[int, ...] | None
+    num_readonly_prefix_blocks: int = 0
+    # None requests logits for every query. Decode handlers set the exact rows
+    # needed for sampling so prefill-only work can skip the vocabulary head.
+    logit_query_indices: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        query_token_ids = tuple(self.query_token_ids)
+        if not self.request_id:
+            raise ValueError("request_id must not be empty")
+        if not query_token_ids:
+            raise ValueError("query_token_ids must not be empty")
+        if any(type(token_id) is not int or token_id < 0 for token_id in query_token_ids):
+            raise ValueError("query_token_ids must contain non-negative integers")
+        if type(self.num_computed_tokens) is not int or self.num_computed_tokens < 0:
+            raise ValueError("num_computed_tokens must be a non-negative integer")
+        if type(self.num_reserved_query_tokens) is not int or self.num_reserved_query_tokens < len(
+            query_token_ids
+        ):
+            raise ValueError("reserved query tokens must cover every actual query")
+        if len(self.query_layout) != len(query_token_ids):
+            raise ValueError("query layout must contain one parent per query token")
+        if type(self.num_readonly_prefix_blocks) is not int or self.num_readonly_prefix_blocks < 0:
+            raise ValueError("num_readonly_prefix_blocks must be a non-negative integer")
+        logit_query_indices = self.logit_query_indices
+        if logit_query_indices is not None:
+            logit_query_indices = tuple(logit_query_indices)
+            if any(
+                type(index) is not int or not 0 <= index < len(query_token_ids)
+                for index in logit_query_indices
+            ):
+                raise ValueError("logit query indices must select valid query positions")
+        object.__setattr__(self, "query_token_ids", query_token_ids)
+        object.__setattr__(self, "logit_query_indices", logit_query_indices)
+        if self.block_ids is None and self.num_readonly_prefix_blocks:
+            raise ValueError("readonly prefix blocks require a block table")
+        if self.block_ids is not None:
+            block_ids = tuple(self.block_ids)
+            if self.num_readonly_prefix_blocks > len(block_ids):
+                raise ValueError("readonly prefix blocks must fit within the block table")
+            object.__setattr__(self, "block_ids", block_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStepBatch:
+    """一次目标模型 forward 包含的具体 query 请求。"""
+
+    requests: tuple[ModelStepRequest, ...]
+
+    def __post_init__(self) -> None:
+        requests = tuple(self.requests)
+        request_ids = tuple(request.request_id for request in requests)
+        if not requests:
+            raise ValueError("model step batch must not be empty")
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("model step request IDs must be unique")
+        object.__setattr__(self, "requests", requests)
+
+    @property
+    def request_ids(self) -> tuple[str, ...]:
+        return tuple(request.request_id for request in self.requests)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStepOutput:
+    """一次模型步骤的连续 logits，以及按请求切分它的边界。"""
+
+    logits: Tensor
+    logits_start_loc: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.logits.ndim != 2:
+            raise ValueError("model step logits must have shape [rows, vocabulary]")
+        starts = tuple(self.logits_start_loc)
+        if (
+            len(starts) < 2
+            or starts[0] != 0
+            or starts[-1] != self.logits.shape[0]
+            or any(type(index) is not int for index in starts)
+            or any(left > right for left, right in zip(starts, starts[1:], strict=False))
+        ):
+            raise ValueError("logits_start_loc must cover every logits row in request order")
+        object.__setattr__(self, "logits_start_loc", starts)
+
+    @property
+    def num_requests(self) -> int:
+        return len(self.logits_start_loc) - 1
+
+    def request_logits(self, request_index: int) -> Tensor:
+        if type(request_index) is not int or not 0 <= request_index < self.num_requests:
+            raise IndexError("model step request index is out of range")
+        start = self.logits_start_loc[request_index]
+        end = self.logits_start_loc[request_index + 1]
+        return self.logits[start:end]
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,14 +475,18 @@ class ModelStepHandler(Protocol):
     def forward(
         self,
         model: ModelSession,
-        batch: ExecutionBatch,
-    ) -> tuple[Tensor, ...]:
-        """返回每个请求有效位置的 ``[query, vocabulary]`` logits。"""
+        batch: ModelStepBatch,
+    ) -> ModelStepOutput:
+        """返回连续 logits，并保留按请求切分所需的边界。"""
 
         ...
 
-    def truncate(self, request_id: str, num_cached_tokens: int) -> None:
-        """丢弃尚未确认的物理 KV 尾部；没有长度状态的实现可以不处理。"""
+    def compact(
+        self,
+        request: ModelStepRequest,
+        retained_query_indices: tuple[int, ...],
+    ) -> int:
+        """按正式 token 顺序保留 query K/V，并返回实际搬运的 token 数。"""
 
         ...
 

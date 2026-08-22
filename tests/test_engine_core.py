@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
-from threading import Event
+from threading import Event, get_ident
 
 import pytest
 
 from light_vllm import (
     GenerateRequest,
+    GenerateResult,
     GenerationError,
     GenerationOverloadedError,
     TokenGenerated,
@@ -51,6 +52,7 @@ class RecordingExecutor:
     capabilities = ExecutionCapabilities(
         max_model_tokens=None,
         max_kv_cache_tokens=32,
+        kv_cache_epoch=0,
     )
 
     def __init__(
@@ -60,6 +62,8 @@ class RecordingExecutor:
         block_first_step: bool = False,
     ) -> None:
         self.history: list[tuple[tuple[int, ...], ...]] = []
+        self.context_history: list[tuple[tuple[int, ...] | None, ...]] = []
+        self.execution_thread_ids: list[int] = []
         self.active: set[str] = set()
         self.multiple_tokens = multiple_tokens
         self.block_first_step = block_first_step
@@ -82,8 +86,10 @@ class RecordingExecutor:
         self.lease_release_count += 1
 
     def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+        self.execution_thread_ids.append(get_ident())
         step = len(self.history)
         self.history.append(tuple(request.input_token_ids for request in batch.requests))
+        self.context_history.append(tuple(request.context_token_ids for request in batch.requests))
         if step == 0:
             self.first_step_started.set()
             if self.block_first_step:
@@ -124,6 +130,7 @@ def _engine(
     token_budget: int = 2,
     performance_observer: InMemoryPerformanceObserver | None = None,
     ttft_admission: TTFTAdmission | None = None,
+    cooperative_inline: bool = False,
 ) -> EngineCore:
     scheduler = TokenBudgetScheduler(
         PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2)),
@@ -140,7 +147,66 @@ def _engine(
         scheduler,
         performance_observer=performance_observer,
         ttft_admission=ttft_admission,
+        cooperative_inline=cooperative_inline,
     )
+
+
+def test_inline_driver_publishes_a_token_before_starting_the_next_step() -> None:
+    async def run() -> None:
+        executor = RecordingExecutor()
+        engine = _engine(executor, cooperative_inline=True)
+        events = engine.stream(GenerateRequest(input_ids=(1,), max_new_tokens=2))
+
+        event = await anext(events)
+
+        assert isinstance(event, TokenGenerated)
+        assert len(executor.history) == 1
+        await events.aclose()
+        await engine.close()
+
+    asyncio.run(run())
+
+
+def test_inline_driver_admits_ready_control_work_before_the_next_schedule() -> None:
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        second_task: asyncio.Task[GenerateResult] | None = None
+
+        def start_second_request() -> None:
+            nonlocal second_task
+            second_task = asyncio.create_task(
+                engine.generate(GenerateRequest(input_ids=(10,), max_new_tokens=1))
+            )
+
+        def relay_second_request() -> None:
+            # 复现进程 reader -> command pump -> stream task 的两级事件循环交接。
+            loop.call_soon(start_second_request)
+
+        class RelayingExecutor(RecordingExecutor):
+            def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+                output = super().execute(batch)
+                if len(self.history) == 1:
+                    loop.call_soon(relay_second_request)
+                return output
+
+        executor = RelayingExecutor()
+        engine = _engine(executor, token_budget=2, cooperative_inline=True)
+
+        first = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
+        assert second_task is not None
+        second = await second_task
+        await engine.close()
+
+        assert first.generated_token_ids == (2, 3, 4)
+        assert second.generated_token_ids == (11,)
+        first_batch_with_second_request = next(
+            index
+            for index, request_inputs in enumerate(executor.history)
+            if (10,) in request_inputs
+        )
+        assert first_batch_with_second_request == 1
+
+    asyncio.run(run())
 
 
 def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
@@ -287,6 +353,35 @@ def test_observer_failure_does_not_change_generation_or_leak_resources() -> None
     asyncio.run(run())
 
 
+def test_engine_publishes_one_scheduler_snapshot_per_state_boundary() -> None:
+    class RecordingStatsObserver(InMemoryPerformanceObserver):
+        def __init__(self) -> None:
+            super().__init__("test-model")
+            self.scheduler_states: list[tuple[int, int]] = []
+
+        def scheduler_updated(self, stats) -> None:
+            self.scheduler_states.append((stats.waiting_requests, stats.running_requests))
+            super().scheduler_updated(stats)
+
+    async def run() -> None:
+        observer = RecordingStatsObserver()
+        engine = _engine(RecordingExecutor(), performance_observer=observer)
+        try:
+            result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=2))
+
+            assert result.generated_token_ids == (2, 3)
+            assert observer.scheduler_states == [
+                (1, 0),
+                (0, 1),
+                (0, 1),
+                (0, 0),
+            ]
+        finally:
+            await engine.close()
+
+    asyncio.run(run())
+
+
 def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
     async def run() -> None:
         executor = RecordingExecutor()
@@ -301,10 +396,30 @@ def test_engine_chunks_prefill_then_streams_generated_tokens() -> None:
     asyncio.run(run())
 
 
+def test_engine_reuses_one_private_execution_thread() -> None:
+    async def run() -> None:
+        event_loop_thread_id = get_ident()
+        executor = RecordingExecutor()
+        engine = _engine(executor, token_budget=2)
+
+        result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
+        await engine.close()
+
+        assert result.generated_token_ids == (2, 3, 4)
+        assert len(executor.execution_thread_ids) == 3
+        assert set(executor.execution_thread_ids) != {event_loop_thread_id}
+        assert len(set(executor.execution_thread_ids)) == 1
+
+    asyncio.run(run())
+
+
 def test_engine_self_resubmit_preserves_visible_history_and_releases_kv() -> None:
     async def run() -> None:
         executor = RecordingExecutor(block_first_step=True)
-        kv_cache = PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=4, block_size=1))
+        kv_cache = PagedKVCacheManager(
+            FixedKVBlockCapacity(num_blocks=4, block_size=1),
+            enable_prefix_caching=True,
+        )
         scheduler = TokenBudgetScheduler(
             kv_cache,
             max_num_sequences=2,
@@ -312,6 +427,7 @@ def test_engine_self_resubmit_preserves_visible_history_and_releases_kv() -> Non
             self_resubmit_policy=SelfResubmitPolicy(
                 max_resubmits=1,
                 strict_fallback_rolled_back_tokens=100,
+                kv_admission_watermark=1.0,
             ),
         )
         engine = EngineCore(executor, scheduler)
@@ -374,6 +490,21 @@ def test_engine_accepts_multiple_committed_tokens_from_one_execution() -> None:
         assert result.generated_token_ids == (2, 3, 4)
         assert result.finish_reason == "length"
         assert executor.history == [((1,),), ((3,),)]
+        assert executor.context_history == [((1,),), (None,)]
+
+    asyncio.run(run())
+
+
+def test_engine_omits_complete_context_without_speculative_lookahead() -> None:
+    async def run() -> None:
+        executor = RecordingExecutor()
+        engine = _engine(executor, token_budget=8)
+
+        result = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
+        await engine.close()
+
+        assert result.generated_token_ids == (2, 3, 4)
+        assert executor.context_history == [(None,), (None,), (None,)]
 
     asyncio.run(run())
 
@@ -470,6 +601,23 @@ def test_execution_failure_is_delivered_to_the_request() -> None:
         await engine.close()
         assert executor.lease_release_count == 1
         assert observer.snapshot().failed_requests_total == 1
+
+    asyncio.run(run())
+
+
+def test_execution_lane_preserves_invalid_output_for_engine_validation() -> None:
+    class InvalidExecutor(RecordingExecutor):
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            return None  # type: ignore[return-value]
+
+    async def run() -> None:
+        engine = _engine(InvalidExecutor())
+        with pytest.raises(GenerationError, match="must return ExecutionOutput"):
+            await asyncio.wait_for(
+                engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1)),
+                timeout=1.0,
+            )
+        await engine.close()
 
     asyncio.run(run())
 

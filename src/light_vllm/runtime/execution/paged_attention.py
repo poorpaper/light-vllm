@@ -9,46 +9,49 @@ import torch
 from torch import Tensor
 
 from light_vllm.modeling.attention.interfaces import AttentionContext, AttentionLayerSpec
-from light_vllm.runtime.execution.paged_cache import PagedKVCache
+from light_vllm.runtime.execution.interfaces import QueryLayout
+from light_vllm.runtime.execution.layout import query_visibility
+from light_vllm.runtime.execution.paged_cache import PagedKVCache, PagedKVWriteMapping
 from light_vllm.runtime.kv_cache import KVCacheError
 
 
 @dataclass(frozen=True, slots=True)
 class PagedAttentionMetadata:
-    """一个 padded query batch 访问分页 K/V 所需的事实。"""
+    """一个 packed query batch 访问分页 K/V 所需的事实。"""
 
     block_tables: tuple[tuple[int, ...], ...]
     num_computed_tokens: tuple[int, ...]
-    query_lengths: tuple[int, ...]
-    # Scheduler 预留但本次 forward 没有实际 token 的位置数。
-    num_lookahead_tokens: tuple[int, ...] = ()
+    query_layouts: tuple[QueryLayout, ...]
+    # 包含实际 query 和 Scheduler 预留但未使用的 query slots。
+    num_reserved_query_tokens: tuple[int, ...] = ()
     num_readonly_prefix_blocks: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         block_tables = tuple(tuple(table) for table in self.block_tables)
         computed = tuple(self.num_computed_tokens)
-        query_lengths = tuple(self.query_lengths)
-        lookahead = tuple(self.num_lookahead_tokens)
+        layouts = tuple(self.query_layouts)
+        reserved = tuple(self.num_reserved_query_tokens)
         readonly = tuple(self.num_readonly_prefix_blocks)
         num_requests = len(block_tables)
         if num_requests == 0:
             raise ValueError("paged attention metadata must contain at least one request")
-        if len(computed) != num_requests or len(query_lengths) != num_requests:
+        if len(computed) != num_requests or len(layouts) != num_requests:
             raise ValueError("paged attention metadata fields must have the same batch size")
-        if not lookahead:
-            lookahead = (0,) * num_requests
-        if len(lookahead) != num_requests:
-            raise ValueError("lookahead counts must have the same batch size")
+        if not reserved:
+            reserved = tuple(len(layout) for layout in layouts)
+        if len(reserved) != num_requests:
+            raise ValueError("reserved query counts must have the same batch size")
         if not readonly:
             readonly = (0,) * num_requests
         if len(readonly) != num_requests:
             raise ValueError("readonly prefix counts must have the same batch size")
         if any(type(value) is not int or value < 0 for value in computed):
             raise ValueError("computed-token counts must be non-negative integers")
-        if any(type(value) is not int or value <= 0 for value in query_lengths):
-            raise ValueError("query lengths must be positive integers")
-        if any(type(value) is not int or value < 0 for value in lookahead):
-            raise ValueError("lookahead counts must be non-negative integers")
+        if any(
+            type(value) is not int or value < len(layout)
+            for value, layout in zip(reserved, layouts, strict=True)
+        ):
+            raise ValueError("reserved query counts must cover every actual query")
         if any(type(value) is not int or value < 0 for value in readonly):
             raise ValueError("readonly prefix counts must be non-negative integers")
         if any(
@@ -59,51 +62,78 @@ class PagedAttentionMetadata:
             raise ValueError("block tables must contain non-negative integers")
         object.__setattr__(self, "block_tables", block_tables)
         object.__setattr__(self, "num_computed_tokens", computed)
-        object.__setattr__(self, "query_lengths", query_lengths)
-        object.__setattr__(self, "num_lookahead_tokens", lookahead)
+        object.__setattr__(self, "query_layouts", layouts)
+        object.__setattr__(self, "num_reserved_query_tokens", reserved)
         object.__setattr__(self, "num_readonly_prefix_blocks", readonly)
 
     @property
     def batch_size(self) -> int:
         return len(self.block_tables)
 
+    @property
+    def query_lengths(self) -> tuple[int, ...]:
+        return tuple(len(layout) for layout in self.query_layouts)
+
+    @property
+    def query_start_loc(self) -> tuple[int, ...]:
+        starts = [0]
+        for length in self.query_lengths:
+            starts.append(starts[-1] + length)
+        return tuple(starts)
+
+    @property
+    def num_query_tokens(self) -> int:
+        return self.query_start_loc[-1]
+
+    @property
+    def has_only_linear_queries(self) -> bool:
+        """Whether every query layout is the ordinary causal chain."""
+
+        return all(
+            all(
+                parent == (-1 if index == 0 else index - 1)
+                for index, parent in enumerate(layout.parent_indices)
+            )
+            for layout in self.query_layouts
+        )
+
+    @property
+    def request_indices(self) -> tuple[int, ...]:
+        """为每个 packed token 标记其请求下标。"""
+
+        return tuple(
+            request_index
+            for request_index, length in enumerate(self.query_lengths)
+            for _ in range(length)
+        )
+
     def slot_mapping(
         self,
         *,
         block_size: int,
-        query_width: int,
         device: torch.device,
     ) -> Tensor:
-        """把每个 query token 的逻辑位置转换成物理 cache slot。"""
+        """把一维 query token 流转换成物理 cache slot。"""
 
-        mapping = torch.full(
-            (self.batch_size, query_width),
-            -1,
-            dtype=torch.long,
-            device=device,
-        )
-        for row, (table, computed, query_length, lookahead) in enumerate(
-            zip(
-                self.block_tables,
-                self.num_computed_tokens,
-                self.query_lengths,
-                self.num_lookahead_tokens,
-                strict=True,
-            )
+        mapping: list[int] = []
+        for table, computed, layout, reserved in zip(
+            self.block_tables,
+            self.num_computed_tokens,
+            self.query_layouts,
+            self.num_reserved_query_tokens,
+            strict=True,
         ):
-            if query_length > query_width:
-                raise KVCacheError("query length exceeds the padded query width")
-            total_tokens = computed + query_length + lookahead
-            required_blocks = (total_tokens + block_size - 1) // block_size
+            query_length = len(layout)
+            required_blocks = (computed + reserved + block_size - 1) // block_size
             if len(table) < required_blocks:
                 raise KVCacheError("block table does not cover all scheduled tokens")
             if len(table) > required_blocks:
                 raise KVCacheError("block table contains unused physical blocks")
             for query_offset in range(query_length):
-                position = computed + query_offset
-                block_id = table[position // block_size]
-                mapping[row, query_offset] = block_id * block_size + position % block_size
-        return mapping
+                logical_position = computed + query_offset
+                block_id = table[logical_position // block_size]
+                mapping.append(block_id * block_size + logical_position % block_size)
+        return torch.tensor(mapping, dtype=torch.long, device=device)
 
     def validate_block_tables(
         self,
@@ -111,18 +141,17 @@ class PagedAttentionMetadata:
         num_blocks: int,
         block_size: int,
     ) -> None:
-        """校验本轮可能读取的完整 block table 都落在物理页池内。"""
+        """校验本轮可能读取或写入的完整 block table。"""
 
         block_owners: dict[int, tuple[int, bool]] = {}
-        for table, computed, query_length, lookahead, num_readonly in zip(
+        for table, computed, reserved, num_readonly in zip(
             self.block_tables,
             self.num_computed_tokens,
-            self.query_lengths,
-            self.num_lookahead_tokens,
+            self.num_reserved_query_tokens,
             self.num_readonly_prefix_blocks,
             strict=True,
         ):
-            required_blocks = (computed + query_length + lookahead + block_size - 1) // block_size
+            required_blocks = (computed + reserved + block_size - 1) // block_size
             if len(table) < required_blocks:
                 raise KVCacheError("block table does not cover all scheduled tokens")
             if len(table) > required_blocks:
@@ -141,6 +170,40 @@ class PagedAttentionMetadata:
                 ):
                     raise KVCacheError("block tables alias a physical block across requests")
                 block_owners[block_id] = (logical_index, readonly)
+
+    def visibility_tensor(self, *, device: torch.device) -> tuple[Tensor, Tensor]:
+        """紧凑存放各请求的树形可见性及其一维起点。"""
+
+        visibility: list[bool] = []
+        starts = [0]
+        for layout in self.query_layouts:
+            for row in query_visibility(layout):
+                visibility.extend(row)
+            starts.append(len(visibility))
+        return (
+            torch.tensor(visibility, dtype=torch.bool, device=device),
+            torch.tensor(starts, dtype=torch.int32, device=device),
+        )
+
+    def request_indices_tensor(self, *, device: torch.device) -> Tensor:
+        """为每个 packed token 标记其请求下标。"""
+
+        return torch.tensor(self.request_indices, dtype=torch.int32, device=device)
+
+    def visible_logical_positions(
+        self,
+        row: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        """一次推导某请求全部 query 可读取的逻辑位置。"""
+
+        layout = self.query_layouts[row]
+        computed = self.num_computed_tokens[row]
+        prefix = tuple(range(computed))
+        return tuple(
+            prefix
+            + tuple(computed + offset for offset, visible in enumerate(visible_queries) if visible)
+            for visible_queries in query_visibility(layout)
+        )
 
 
 class PagedAttentionContext(AttentionContext, Protocol):
@@ -171,21 +234,16 @@ def _validate_paged_attention_tensors(
     """让不同 backend 共用同一套形状与页表校验。"""
 
     layer_spec = cache.layer_spec(layer_id)
-    config = cache.config
-    if query.ndim != 4:
-        raise KVCacheError("paged attention query must have four dimensions")
-    if query.shape[:2] != key.shape[:2] or value.shape != key.shape:
-        raise KVCacheError("paged attention Q/K/V batch and query dimensions must match")
-    if query.shape[0] != metadata.batch_size:
-        raise KVCacheError("paged attention metadata batch size does not match query")
-    if query.shape[2:] != (layer_spec.num_query_heads, layer_spec.head_size):
+    if query.ndim != 3:
+        raise KVCacheError("paged attention query must have three dimensions")
+    if query.shape[0] != key.shape[0] or value.shape != key.shape:
+        raise KVCacheError("paged attention Q/K/V token dimensions must match")
+    if query.shape[0] != metadata.num_query_tokens:
+        raise KVCacheError("paged attention metadata token count does not match query")
+    if query.shape[1:] != (layer_spec.num_query_heads, layer_spec.head_size):
         raise KVCacheError("paged attention query shape does not match the layer spec")
-    if key.shape[2:] != (layer_spec.num_kv_heads, layer_spec.head_size):
+    if key.shape[1:] != (layer_spec.num_kv_heads, layer_spec.head_size):
         raise KVCacheError("paged attention K/V shape does not match the layer spec")
-    metadata.validate_block_tables(
-        num_blocks=config.num_blocks,
-        block_size=config.block_size,
-    )
     return layer_spec
 
 
@@ -200,6 +258,12 @@ class TorchPagedAttention:
         self._cache = cache
         self._metadata = metadata
         self._layer_ids: set[str] = set()
+        self._write_mapping: PagedKVWriteMapping | None = None
+        config = cache.config
+        metadata.validate_block_tables(
+            num_blocks=config.num_blocks,
+            block_size=config.block_size,
+        )
 
     @property
     def layer_ids(self) -> frozenset[str]:
@@ -227,30 +291,31 @@ class TorchPagedAttention:
         )
         config = self._cache.config
 
-        slot_mapping = self._metadata.slot_mapping(
-            block_size=config.block_size,
-            query_width=query.shape[1],
-            device=config.device,
-        )
+        if self._write_mapping is None:
+            slot_mapping = self._metadata.slot_mapping(
+                block_size=config.block_size,
+                device=config.device,
+            )
+            self._write_mapping = self._cache.prepare_write(slot_mapping, validate=False)
         # 先写入本轮 K/V；因果注意力随后可读取到当前位置自身。
-        self._cache.write(layer_id, key, value, slot_mapping)
+        self._cache.write_prepared(layer_id, key, value, self._write_mapping)
 
         output = torch.zeros_like(query)
-        for row, (table, computed, query_length) in enumerate(
+        for row, (table, start, end) in enumerate(
             zip(
                 self._metadata.block_tables,
-                self._metadata.num_computed_tokens,
-                self._metadata.query_lengths,
+                self._metadata.query_start_loc[:-1],
+                self._metadata.query_start_loc[1:],
                 strict=True,
             )
         ):
-            for query_offset in range(query_length):
-                sequence_length = computed + query_offset + 1
-                output[row, query_offset] = self._attend_query_token(
+            logical_positions_by_query = self._metadata.visible_logical_positions(row)
+            for query_offset, token_index in enumerate(range(start, end)):
+                output[token_index] = self._attend_query_token(
                     layer_id,
-                    query[row, query_offset],
+                    query[token_index],
                     table,
-                    sequence_length,
+                    logical_positions_by_query[query_offset],
                     scale,
                 )
         return output
@@ -260,10 +325,10 @@ class TorchPagedAttention:
         layer_id: str,
         query: Tensor,
         block_table: tuple[int, ...],
-        sequence_length: int,
+        logical_positions: tuple[int, ...],
         scale: float,
     ) -> Tensor:
-        """让一个 query token 读取自己的分页历史 K/V。"""
+        """逐页读取一个 query 可见的 prefix、祖先和自身 K/V。"""
 
         layer = self._cache.layer(layer_id)
         layer_spec = self._cache.layer_spec(layer_id)
@@ -286,13 +351,16 @@ class TorchPagedAttention:
         )
         query_for_math = query.to(accumulator_dtype)
 
-        # 每读一页就更新 softmax 的累计值，不需要先拼出完整历史 K/V。
-        num_blocks = (sequence_length + block_size - 1) // block_size
-        for logical_block in range(num_blocks):
+        offsets_by_block: dict[int, list[int]] = {}
+        for logical_position in logical_positions:
+            logical_block = logical_position // block_size
+            offsets_by_block.setdefault(logical_block, []).append(logical_position % block_size)
+
+        # 不拼接完整历史；每次只读取当前 query 真正可见的一页内容。
+        for logical_block, offsets in offsets_by_block.items():
             block_id = block_table[logical_block]
-            tokens_in_block = min(block_size, sequence_length - logical_block * block_size)
-            keys = layer.keys[block_id, :tokens_in_block].to(accumulator_dtype)
-            values = layer.values[block_id, :tokens_in_block].to(accumulator_dtype)
+            keys = layer.keys[block_id, offsets].to(accumulator_dtype)
+            values = layer.values[block_id, offsets].to(accumulator_dtype)
             if repeats > 1:
                 keys = keys.repeat_interleave(repeats, dim=1)
                 values = values.repeat_interleave(repeats, dim=1)

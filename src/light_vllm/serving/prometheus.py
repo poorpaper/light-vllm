@@ -177,6 +177,57 @@ def render_prometheus(snapshot: PerformanceSnapshot) -> str:
         scheduler.self_resubmit_rolled_back_tokens_total,
         labels=labels,
     )
+    for name, help_text, value in (
+        (
+            "light_vllm_speculation_attempts_total",
+            "Completed speculative verification attempts.",
+            snapshot.speculation_attempts_total,
+        ),
+        (
+            "light_vllm_speculation_hits_total",
+            "Speculative attempts that accepted at least one draft node.",
+            snapshot.speculation_hits_total,
+        ),
+        (
+            "light_vllm_speculative_proposed_nodes_total",
+            "Draft tree nodes sent to the target model.",
+            snapshot.speculative_proposed_nodes_total,
+        ),
+        (
+            "light_vllm_speculative_accepted_nodes_total",
+            "Draft tree nodes accepted by the target model.",
+            snapshot.speculative_accepted_nodes_total,
+        ),
+        (
+            "light_vllm_speculative_verified_tokens_total",
+            "Tokens produced by speculative target verification, including the final target token.",
+            snapshot.speculative_verified_tokens_total,
+        ),
+        (
+            "light_vllm_speculative_draft_roots_total",
+            "Root nodes across proposed draft trees.",
+            snapshot.speculative_draft_roots_total,
+        ),
+        (
+            "light_vllm_speculative_branching_parents_total",
+            "Draft nodes that had more than one proposed child.",
+            snapshot.speculative_branching_parents_total,
+        ),
+        (
+            "light_vllm_speculative_compacted_tokens_total",
+            "Accepted draft tokens moved while compacting physical KV.",
+            snapshot.speculative_compacted_tokens_total,
+        ),
+    ):
+        _metric(lines, name, "counter", help_text, value, labels=labels)
+    _metric(
+        lines,
+        "light_vllm_speculative_max_draft_depth",
+        "gauge",
+        "Maximum observed draft tree depth.",
+        snapshot.speculative_max_draft_depth,
+        labels=labels,
+    )
 
     _histogram(
         lines,

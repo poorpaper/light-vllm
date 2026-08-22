@@ -17,7 +17,7 @@ from light_vllm import (
     ModelSpec,
     TokenGenerated,
 )
-from light_vllm.entrypoints.http import create_serving_app
+from light_vllm.entrypoints.http import _create_parser, create_serving_app
 from light_vllm.runtime.scheduler import ShortRequestPolicy
 from light_vllm.serving.http import _encoded_stream, create_http_app
 
@@ -36,6 +36,15 @@ class StubEngineClient:
             generated_token_ids=(7,),
             finish_reason="length",
         )
+
+
+class RecordingEngineClient(StubEngineClient):
+    def __init__(self) -> None:
+        self.requests: list[GenerateRequest] = []
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        self.requests.append(request)
+        return await super().generate(request)
 
 
 class UnreadyEngineClient(StubEngineClient):
@@ -123,6 +132,37 @@ def test_http_adapter_exposes_health_and_non_streaming_generation() -> None:
         "token_ids": [1, 2, 7],
         "finish_reason": "length",
     }
+
+
+def test_http_adapter_forwards_the_request_ttft_slo() -> None:
+    engine = RecordingEngineClient()
+    client = TestClient(create_http_app(engine))
+
+    response = client.post(
+        "/generate",
+        json={
+            "input_ids": [1, 2],
+            "max_new_tokens": 1,
+            "max_tolerable_ttft_seconds": 0.75,
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.requests[0].max_tolerable_ttft_seconds == 0.75
+
+
+def test_cli_can_disable_load_dependent_ttft_gates() -> None:
+    args = _create_parser().parse_args(
+        [
+            "--max-pending-requests",
+            "off",
+            "--ttft-kv-cache-watermark",
+            "off",
+        ]
+    )
+
+    assert args.max_pending_requests is None
+    assert args.ttft_kv_cache_watermark is None
 
 
 def test_http_adapter_streams_generation_events_as_sse() -> None:
@@ -324,6 +364,50 @@ def test_tiny_attention_model_serves_through_engine_core() -> None:
 
     assert response.status_code == 200
     assert len(response.json()["generated_token_ids"]) == 2
+
+
+def test_engine_runtime_composes_ngram_trie_speculation() -> None:
+    app = create_serving_app(
+        ModelSpec(
+            architecture="tiny-attention-causal-lm",
+            model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+        ),
+        runtime="engine",
+        max_num_sequences=1,
+        max_num_scheduled_tokens=8,
+        num_kv_blocks=256,
+        num_speculative_tokens=2,
+        speculative_proposer="trie",
+        speculative_ngram_min=2,
+        speculative_ngram_max=2,
+        speculative_max_depth=2,
+        speculative_max_branching=2,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/generate",
+            json={"input_ids": [1, 2, 3, 1, 2], "max_new_tokens": 2},
+        )
+        metrics = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert len(response.json()["generated_token_ids"]) == 2
+    assert "light_vllm_speculation_attempts_total" in metrics.text
+    assert "light_vllm_speculative_verified_tokens_total" in metrics.text
+
+
+def test_engine_runtime_rejects_an_unknown_speculative_proposer() -> None:
+    with pytest.raises(ValueError, match="unsupported speculative proposer"):
+        create_serving_app(
+            ModelSpec(
+                architecture="tiny-attention-causal-lm",
+                model_args={"vocab_size": 16, "hidden_size": 4, "num_heads": 1},
+            ),
+            runtime="engine",
+            num_kv_blocks=4,
+            speculative_proposer="unknown",
+        )
 
 
 def test_engine_runtime_accepts_short_request_policy() -> None:

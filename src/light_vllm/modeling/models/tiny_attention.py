@@ -13,6 +13,7 @@ from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
     ModelOutput,
     ModelSpec,
+    select_query_states,
 )
 
 
@@ -83,13 +84,13 @@ class TinyAttentionCausalLM(nn.Module):
         )
 
         attended = attended.reshape(*hidden_states.shape)
-        logits = self.lm_head(self.output(attended))
+        hidden_states = select_query_states(self.output(attended), batch)
+        logits = self.lm_head(hidden_states)
         return ModelOutput(logits=logits)
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.reshape(
             tensor.shape[0],
-            tensor.shape[1],
             self.config.num_heads,
             self.head_size,
         )

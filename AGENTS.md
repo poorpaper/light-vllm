@@ -20,33 +20,52 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `ModelRunner` 通过 `Catalog` 中的 model/loader 注册表加载并原子替换模型；`open_session()` 固定模型对象和
   generation，一个生成请求不得跨 session。
 - 原生 `Qwen2ForCausalLM` 支持 Qwen2/Qwen2.5 的 full-attention、default-RoPE 配置；HF 与 ModelScope 下载的
-  兼容目录共用 `SafetensorsModelLoader`，不进入 Runner 或 Worker 分支。
+  兼容目录共用 `SafetensorsModelLoader`，不进入 Runner 或 Worker 分支。loader 在权重就绪后调用可选的模型自有
+  `prepare_for_inference()` hook；Qwen 用它准备打包权重和 RoPE table。
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
-- `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流。
+- `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流；每次至多保留一个不可变
+  `PreparedStep` 在模型侧执行。上一轮结果、执行结束状态和下一轮计划在同一个锁区原子推进，并只发布一次稳定
+  Scheduler 快照。默认同步 Executor 固定在 Engine 私有的单在途 `ExecutionLane`；独立 Engine 进程使用协作式
+  inline 执行，在状态推进前接收已到达控制任务，并在下一步模型执行前交付已发布事件，不引入墙钟 sleep。
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode；可选短请求策略同时预留
   scheduled token、KV token slot 和 sequence，首 token 后回到通用 round-robin，常规请求用真实 waiting step aging。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
-  `PagedKVCacheManager` 额外按容量分配 block table。严格准入使用 completion claim；可选 self-resubmit 只允许
-  常规请求 best-effort 准入，撞墙者释放自己的 KV 并带完整 token 历史回到 PREFILL。
+  `PagedKVCacheManager` 额外按容量分配 block table。严格准入使用 completion claim；可选 self-resubmit 让常规
+  请求先领取 `prompt + 1 block` 的初始 claim，并只允许新准入使用全局 90% KV。撞墙者释放自己的 KV、保留完整
+  token 历史并回到 PREFILL；该模式强制启用 prefix cache，以找回已提交的完整 prompt 页。
 - 可选 prefix cache 由 `PagedKVCacheManager` 管理：只复用已提交的完整 prompt 页，缓存页使用哈希链、
   引用计数和 LRU；共享前缀只读，各请求尾页独占。
 - composition root 通过 `kv_reservation=blocks|unbounded` 同时选择匹配的逻辑 manager 和
   `ModelStepHandler`；该选择不得进入 Engine、Executor 或 Worker 热路径。
 - `LocalModelExecutor` 只把执行端口委托给一个 `LocalModelWorker`。Worker 固定当前模型版本和请求生命周期；
   `ContiguousStepHandler` / `PagedStepHandler` 分别负责连续与分页 KV 的输入准备、物理缓存和模型 forward。
-- `StandardDecodeHandler` 负责普通单 token 解码；`NGramSpeculativeDecodeHandler` 组合历史候选、目标验证和贪心验收，
-  两者替换同一 Handler，不新增模式专用 Worker。
+- `StandardDecodeHandler` 负责普通单 token 解码；`SpeculativeDecodeHandler` 组合 `DraftProposer`、目标验证和
+  `AcceptanceSampler`。`NGramChainProposer` 与 `NGramTrieProposer` 共用同一树形执行流程，不新增模式专用 Worker。
+- `DraftTree` 只表达候选父子关系；`QueryLayout` 把正式输入与草稿树降为一次 model step 的位置和可见性事实。
+  Dense/Paged 后端只允许 query 读取已提交前缀、祖先和自身；验收后 Step Handler 在返回前压实命中路径 KV。
+- Step Handler 把不同请求的 query 拼成一维 token 流；`ForwardBatch.query_start_loc` 保存请求边界，Q/K/V、
+  slot mapping 和模型 hidden states 都不包含 padding 行。Step Handler 在 H2D 前验证由语义布局生成的绝对位置，
+  `ForwardBatch` 用显式信任标记避免模型在 CUDA 热路径重复检查。`QueryLayout` 仍只表达单请求内部语义。
 - 固定页数或 CUDA 空闲显存策略在模型加载后解析成同一个分页容量对象，同时供逻辑 manager 与物理页池使用。
 - 可缓存模型只通过 `AttentionContext` 执行 attention，不内置 dense/paged fallback。reference 与连续缓存使用
   `TorchDenseAttention`；分页缓存默认使用逐页读取 K/V 的 `TorchPagedAttention`，也可装配直接读取 block table、
-  融合 QK/在线 softmax/PV 的 `TritonPagedAttention`。
+  融合 QK/在线 softmax/PV 的 `TritonPagedAttention`。普通线性 query 直接使用因果位置关系，不物化树形
+  visibility tensor；只有非线性草稿树使用显式可见性矩阵。
 - `RequestOutput` 分开表达本轮输入计算量、零到多个确认输出，以及已经写入 KV 的输出前缀。
 - `ExecutionOutput` 额外报告实际进入模型 forward 的 token 数；未产出的投机 lookahead 只保留为调度预留，
   不进入 step 延迟样本。
+- Decode Handler 通过 `ModelStepRequest` 精确声明要消费 logits 的 query 行，Step Handler 把选择传入
+  `ForwardBatch`；普通生成只投影每个请求的最后有效行，纯 prefill 不执行 vocabulary head，投机验证只投影
+  正式输入最后一行和草稿节点行。`ModelStepOutput` 保留连续 logits 及其请求边界，普通采样不得先按请求切开再
+  `stack` 回同一矩阵。
+- `ExecutionRequest` 的完整 `context_token_ids` 快照只为草稿 proposer 物化；普通执行只携带本轮
+  `input_token_ids`，不得在每个 decode step 复制和校验完整历史。
 - `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
-- 可选 `PredictiveTTFTAdmission` 用 `prompt + waiting pending + running pending` 的全局当前工作量和真实 step 延迟
-  做动态早拒；prefill 贡献剩余 prompt，普通 decode 通常贡献当前 1 个 token，不提前展开未来输出预算。
-  它是独立控制组件，不属于只读 `PerformanceObserver`。HTTP 分别把容量拒绝和 SLO 过载表达为 422/429。
+- `PredictiveTTFTAdmission` 先检查 pending 请求数与 KV 水位，再用
+  `prompt + waiting pending + running pending` 的全局当前工作量和真实 step 延迟做动态早拒；prefill 贡献剩余
+  prompt，普通 decode 通常贡献当前 1 个 token，不提前展开未来输出预算。预测器冷启动时 fail-open，但前两级
+  门控仍生效；请求可以覆盖全局 TTFT SLO。它是独立控制组件，不属于只读 `PerformanceObserver`。HTTP 分别把
+  容量拒绝和当前负载过载表达为 422/429。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
 - `PerformanceObserver` 在 Engine 已生效的生命周期边界记录 TTFT、可见 token 间隔、step 延迟与请求结果，只读取
   Scheduler/KV 不可变快照；Prometheus、Grafana 和 HPA 不进入推理热路径。
@@ -75,7 +94,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/runtime/kv_cache.py` | 逻辑 block manager 与连续 K/V tensor 存储 |
 | `src/light_vllm/runtime/scheduler/interfaces.py` | `SchedulerOutput` 等稳定调度契约 |
 | `src/light_vllm/runtime/scheduler/token_budget.py` | 分层 token-budget Scheduler、短请求资源池与可选 self-resubmit |
-| `src/light_vllm/runtime/execution/interfaces.py` | `ExecutionBatch`、`ExecutionOutput` 与 Executor 契约 |
+| `src/light_vllm/runtime/execution/interfaces.py` | 执行、model-step、草稿树与投机观测契约 |
+| `src/light_vllm/runtime/execution/layout.py` | 从父链推导线性/树形 query 的位置和可见性 |
 | `src/light_vllm/runtime/execution/local.py` | 本地 Executor 与 reference token 执行 |
 | `src/light_vllm/runtime/execution/worker.py` | 本地 Worker、Step Handler 与普通 Decode Handler |
 | `src/light_vllm/runtime/execution/dense_attention.py` | reference/连续缓存共用的 dense attention 上下文 |
@@ -84,6 +104,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/runtime/execution/triton_paged_attention.py` | 可选 Triton fused Paged Attention backend |
 | `src/light_vllm/runtime/engine/admission.py` | 确定性容量准入、step 延迟预测与 TTFT 早拒 |
 | `src/light_vllm/runtime/engine/core.py` | 请求状态、迭代循环、事件与安全取消 |
+| `src/light_vllm/runtime/engine/execution_lane.py` | 单在途同步 Executor 的常驻线程边界 |
 | `src/light_vllm/runtime/engine/in_process.py` | 同步 reference 到异步 Engine 的适配器 |
 | `src/light_vllm/runtime/engine/interfaces.py` | serving 使用的异步 `EngineClient` |
 | `src/light_vllm/runtime/observability/interfaces.py` | 性能快照、读取端口与观察者契约 |
@@ -97,12 +118,13 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 
 1. `ModelRunner` 不得按 architecture、loader 或具体模型类型写功能分支。
 2. 模型和 loader 必须经 `Catalog` 注册表解析；同名注册默认报错。
-3. 候选模型在生命周期锁外完整构造；成功后才在同一临界区替换模型并递增 generation。
+3. 候选模型在生命周期锁外完整构造，包括 loader 调用的可选 post-load inference preparation；成功后才在同一
+   临界区替换模型并递增 generation。
 4. 加载失败不得改变当前模型或 generation。
 5. `open_session()` 只在锁内复制模型引用和 generation；实际计算不持有生命周期锁。一个请求始终使用同一
    session，reload 后旧 session 继续引用旧模型。
-6. 所有模型接受 `ForwardBatch`，返回只包含 logits 的 `ModelOutput`；K/V 读写由 `AttentionContext` 和 Step Handler
-   完成，loader 负责 device、dtype 与 `eval()`。
+6. 所有模型接受 `ForwardBatch`，返回只包含其中明确请求 query 行 logits 的 `ModelOutput`；未指定行选择时返回
+   全部有效 query。K/V 读写由 `AttentionContext` 和 Step Handler 完成，loader 负责 device、dtype 与 `eval()`。
 7. `ReferenceGenerationService` 只依赖 `TokenExecutor`，不得依赖 runner、torch 或具体模型。
 8. transport 的生成路由只依赖 `EngineClient`；监控路由可以额外依赖独立只读指标端口。HTTP/RPC schema、
    Prometheus 格式和 wire format 均不得进入核心契约。
@@ -122,17 +144,25 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
     Worker/Step Handler 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
 20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。
 21. 投机解码由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor 或 Worker。
+    proposer 只返回 `DraftTree`；Decode Handler 将其降为 `QueryLayout`，并在返回前调用 `compact()` 压实命中路径。
+    Engine、Scheduler、Executor、Worker 和模型不得理解具体树策略。
 22. 不为尚未实现的 attention、memory 或 prefix routing 创建空包。
 23. 内部代码从所属功能域的 `interfaces.py` 导入稳定契约；需要实现时直接导入实现模块。
 24. 不维护未发布架构的历史兼容别名、空 facade 或旧路径。
 25. `ForwardBatch.positions` 表示请求内绝对位置；连续与分页 Step Handler 都必须显式生成，模型不得从批次形态猜测。
+    `input_ids`、`positions` 和 attention Q/K/V 必须使用 token-major 一维布局；`query_start_loc` 必须从 0 开始、
+    严格递增并以总 query token 数结束。只有 Step Handler 在 CPU 侧按模型上限验证过位置后，才可设置
+    `positions_are_validated=True`；其他调用者仍由 `ForwardBatch` 和模型检查。不得在模型热路径重新引入
+    `[batch, max_query_width]` padding。
+    `ModelStepOutput.logits_start_loc` 允许空请求切片，但必须覆盖连续 logits 的全部行。
 26. 使用外部 KV 的模型必须声明 `ModelKVCacheSpec`；连续和分页 Step Handler 都从该规格初始化物理缓存，不再接受
     第二份层数、KV head 数或 head size 配置。
 27. `blocks` 必须装配 `PagedKVCacheManager + PagedStepHandler`，`unbounded` 必须装配
     `UnboundedKVCacheManager + ContiguousStepHandler`；两者共用 `LocalModelWorker`，其他组件不得按 KV 模式分支。
 28. Paged Attention 实现必须通过 `PagedAttentionBackend` 创建同一个 `AttentionContext`，并直接按 block table
     读取物理页；不得以拼接完整历史 tensor 冒充分页实现。
-29. block table 必须精确覆盖本轮 `computed + query + lookahead reservation` 所需物理页，不得携带未预留尾页
+29. block table 必须精确覆盖 `computed + num_reserved_query_tokens` 所需物理页；后者包含本轮正式输入和全部
+    speculative slot reservation。不得携带未预留尾页
     或在单请求内重复页；跨请求只能在相同逻辑位置共享双方都声明为只读的完整前缀页，可写尾页必须独占。
 30. `LocalModelWorker` 初始化时固定一个 `ModelSession`。reload 后活动请求继续使用旧 session，Worker 拒绝新请求；活动
     请求清空后才可按新 generation 重建物理缓存。
@@ -150,10 +180,14 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 37. `ExecutionOutput` 必须报告实际进入模型 forward 的 token 数；Engine 用它构造同一个已完成
     `StepObservation` 并显式交给 TTFT 控制器和 Observer。预测器失败应 fail-open，Observer 失败不得改变控制状态。
 38. self-resubmit 只能回滚撞墙者自己，不得挑选第三方 victim；Engine 保留已经可见的 token 历史，重算不得
-    重复发出旧 token，也不得让回滚凭空获得 aging。
+    重复发出旧 token，也不得让回滚凭空获得 aging。该策略必须强制开启 prefix cache，至少复用已经提交的完整
+    prompt 页。
 39. self-resubmit 必须有 strict fallback：达到次数或累计回滚进度阈值后，下一次准入领取 completion claim；
     整轮均无进展时最早回滚者也必须进入严格恢复路径。
-40. `PerformanceObserver` 只能接收请求生命周期、完成的 step 和 Scheduler/KV 不可变事实；它不得执行 I/O、修改
+40. 乐观 self-resubmit 准入默认只承诺 `prompt + 1 block`，并把新准入限制在全局 KV 容量的 90%；初始 claim 必须
+    与 completion claim 一起计入容量账本。该 10% 是只限制新准入的全局 decode 余量，不是每个请求的滚动 claim；
+    已经 running 的请求可以继续使用这部分余量，真正撞墙时再执行 self-resubmit。
+41. `PerformanceObserver` 只能接收请求生命周期、完成的 step 和 Scheduler/KV 不可变事实；它不得执行 I/O、修改
     运行时状态或按 architecture/模型尺寸分支。安全组合器必须在 observer 首次失败后停用它，且不得在 Engine
     热路径同步写日志或让指标故障改变推理结果。
     Prometheus/Grafana/HPA 表达必须留在控制面 adapter。
@@ -168,10 +202,17 @@ reference 的请求不占用 worker thread，并让同步 iterator 的创建、`
 
 `EngineCore` 的异步锁保护请求状态、Scheduler 状态和 driver 生命周期。模型执行发生在锁外；执行前通过
 Executor lease 固定物理资源，取消只标记释放，tensor 等 lease 退出后再销毁。正在执行的分页请求被取消时，
-Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边界。
+Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边界。锁外只传递 `PreparedStep` 与
+`CompletedStep` 事实；lease 释放后，Engine 在一个锁区内完成上一轮提交并准备下一轮，不允许 Executor 或
+Observer 反向修改请求和 Scheduler 状态。`ExecutionLane` 只跨线程传递 `ExecutionBatch` 与
+`ExecutionOutput`，不得提交 Scheduler 状态或提前释放 lease；Engine 关闭时先等待 driver 越过安全边界，再回收
+lane 的常驻线程。独立 Engine 进程可以省略 lane，但必须在同步模型步骤之间通过事件循环检查点给 IPC command
+pump 和请求 stream 公平执行机会；检查点只能推进已经 ready 的任务，不得用固定时长 sleep 调节吞吐或 TTFT。
 
 `TTFTAdmission` 是控制组件：在 Engine 锁内读取一次 Scheduler 快照做准入，在 step 完成后消费真实延迟；
-`PerformanceObserver` 只记录同一事实。两者不得互相调用，任一旁路故障也不得持有模型执行锁或执行 I/O。
+`PerformanceObserver` 只记录同一事实。投机细节通过独立 `SpeculationObserver` 端口上报，包括候选/命中节点、
+验证产出 token、树形状和 KV 搬运；其首次失败后必须停用。
+这些旁路不得互相调用、持有模型执行锁、执行 I/O 或改变生成结果。
 
 `InMemoryPerformanceObserver` 只有独立短临界区，记录单调时钟与计数；CPU step 用墙钟，CUDA step 用执行层 event
 等待实际设备完成。它不持有 Engine 锁做 I/O，也不是未来性能 Guardian。Guardian 如需自动调参，必须通过单独
@@ -189,8 +230,9 @@ Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边
 新增本地 KV 布局或 attention 后端：实现 `ModelStepHandler`，创建相应 `AttentionContext`，分页 kernel 再通过
 `PagedAttentionBackend` 组合；模型保持唯一调用入口，并继续只声明 `ModelKVCacheSpec`。
 
-新增普通或投机解码流程：实现 `DecodeHandler`，组合 proposer、target verify 与 acceptance sampler；复用同一
-`LocalModelWorker` 和 Step Handler，不修改 Scheduler、Engine 或模型分发。
+新增投机候选策略：实现 `DraftProposer` 并返回有界 `DraftTree`，在 composition root 注入通用
+`SpeculativeDecodeHandler`；只有验收语义变化时才新增 `AcceptanceSampler`。复用同一 Worker、Step Handler 和
+`QueryLayout`，不修改 Scheduler、Engine 或模型分发。
 
 新增 serving 协议：只消费 `EngineClient`，在 adapter 内转换请求、结果、错误和 wire format。
 
@@ -210,5 +252,6 @@ git diff --check
 
 ## 下一步
 
-下一阶段针对长上下文把 Triton backend 改成分段计算与归并，并补充跨显卡性能验收；之后继续实现
+下一阶段先完成 Triton tree visibility 的 CUDA 数值验收，再针对长上下文实现分段计算与归并并补充跨显卡
+性能验收；之后继续实现
 Scheduler-owned victim preemption。两项能力都不得改变 EngineClient、generation 事件或 HTTP adapter。

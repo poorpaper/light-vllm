@@ -54,9 +54,9 @@ EngineClient.generate ──> collect the same stream ──> GenerateResult
 - `PagedStepHandler`：消费 block table，使用全局物理页与可替换的 PyTorch/Triton Paged Attention。
 - `ContiguousStepHandler`：保留请求级连续 K/V 的无分页正确性基线。
 - `StandardDecodeHandler`：处理普通 prefill 和单 token decode。
-- `NGramSpeculativeDecodeHandler`：从当前请求历史提出候选，由同一个目标模型一次验证，不新增 Worker。
+- `SpeculativeDecodeHandler`：把 chain/trie 草稿树交给同一个目标模型并行验证，验收后压实命中路径 KV，不新增 Worker。
 - `PerformanceObserver`：在统一 Engine 边界记录 TTFT、可见 token 间隔、step 延迟、队列与 KV 使用率。
-- `PredictiveTTFTAdmission`：用真实 step 延迟滑窗预测排队 TTFT，并在超过全局 SLO 时早拒。
+- `PredictiveTTFTAdmission`：依次用队列、KV 水位和真实 step 延迟预测做动态早拒，支持请求级 TTFT SLO。
 - `GreedySampler`：独立于 Executor 的贪心采样策略。
 - FastAPI adapter：生成路由只依赖 `EngineClient`，`/metrics` 只依赖独立的性能快照读取端口。
 
@@ -133,7 +133,7 @@ light-vllm-serve \
   --runtime engine \
   --kv-reservation blocks \
   --max-num-sequences 8 \
-  --max-num-scheduled-tokens 256 \
+  --max-num-scheduled-tokens 2048 \
   --model-args '{"vocab_size": 128, "hidden_size": 32, "num_heads": 4}'
 ```
 
@@ -163,17 +163,19 @@ light-vllm-serve \
   --model-args '{"vocab_size": 128, "hidden_size": 32, "num_heads": 4}'
 ```
 
-首版 Triton kernel 支持 FP16/BF16、MHA/GQA、padded batch 和不超过 256 的 head size。K/V 写入与 attention
-读取分成同一 CUDA stream 上的两个顺序步骤，避免 prefill 读取尚未写完的数据。RTX 5090 上的 FP16/BF16
-prefill、decode、共享 prefix 和投机多 query 数值对照已经通过；长上下文性能和跨显卡调优仍待验收，默认
-backend 因此保持为 `torch`。
+首版 Triton kernel 支持 FP16/BF16、MHA/GQA、padded batch、树形 ancestor visibility 和不超过 256 的 head size。
+K/V 写入与 attention 读取分成同一 CUDA stream 上的两个顺序步骤，避免 query 读取尚未写完的 KV。线性
+prefill、decode、共享 prefix 和投机多 query 已在 RTX 5090 完成数值对照；树形 padded parity 测试已加入，
+仍需在 CUDA 环境完成验收。长上下文性能和跨显卡调优也仍待完成，默认 backend 因此保持为 `torch`。
 
 增加 `--enable-prefix-caching` 后，Engine 会按 token 内容复用已经算完的完整 prompt 页。共享页只读，
 每个请求继续使用自己的可写尾页；模型重新加载后 cache epoch 改变，旧页索引会自动清空。
 
-增加 `--num-speculative-tokens 3` 后，Engine 会从当前请求的重复 token 片段提出最多 3 个候选，再用目标模型
-一次验证。`--speculative-ngram-min` 和 `--speculative-ngram-max` 控制匹配长度；找不到重复片段时自动退化为
-普通单 token 解码。该能力同时支持连续和分页 KV。
+增加 `--num-speculative-tokens 3` 后，Engine 会把这 3 个位置作为单轮草稿节点预算，并用目标模型一次验证。
+默认 `--speculative-proposer chain` 保持线性 N-Gram 行为；选择 `trie` 后，会把最长重复后缀的多个历史续写
+按频次、最近位置和 token ID 确定性裁剪为草稿树。`--speculative-ngram-min/max` 控制匹配长度，
+`--speculative-max-depth` 和 `--speculative-max-branching` 控制树形上限。找不到重复片段时自动退化为普通
+单 token 解码。两种 proposer 共用连续/分页 KV、树形 attention 和验收压实流程。
 
 `--kv-reservation unbounded` 装配无 block manager 与 `ContiguousStepHandler`，不限制逻辑 KV 容量。它保留
 无 Paged Attention 的请求级连续 tensor 路径，主要用于测试和结果对照，不是生产容量保护机制。两种 Handler
@@ -199,7 +201,9 @@ light-vllm-serve \
   --short-request-reserved-kv-token-slots 63 \
   --short-request-reserved-sequences 1 \
   --regular-request-aging-steps 8 \
-  --max-tolerable-ttft-seconds 1.5
+  --max-tolerable-ttft-seconds 1.5 \
+  --max-pending-requests 128 \
+  --ttft-kv-cache-watermark 0.9
 ```
 
 短请求按 prefix 命中后的有效 prompt 和最大总长度分类；scheduled token、KV slot 和 sequence 都有独立预留。
@@ -207,12 +211,19 @@ light-vllm-serve \
 TTFT 预测使用 `新 prompt + waiting pending + running pending` 的全局当前工作量：prefill 贡献尚未计算的 prompt，
 普通 decode 通常贡献当前待算的 1 个 token，所有请求再统一求和；未来 `max_new_tokens` 不会提前展开。延迟表按
 每个 step 实际进入模型 forward 的 token 数更新，默认取 p90 并构造单调包络，可用
-`--ttft-prediction-quantile` 调整；样本不足时放行。确定性容量不足返回 422，预测超过 SLO 返回可重试的 429。
+`--ttft-prediction-quantile` 调整；默认积累 100 个 step 后才启用预测。队列上限和 KV 水位不依赖预测器冷启动，
+会始终生效。请求也可以用 JSON 字段 `max_tolerable_ttft_seconds` 覆盖全局 SLO。确定性容量不足返回 422，
+当前负载不满足准入条件返回可重试的 429。
+压测 Scheduler 本身时可把 `--max-pending-requests` 或 `--ttft-kv-cache-watermark` 设为 `off`，避免把早拒收益
+误算成调度收益；生产默认仍分别是 128 和 0.9。
 
-实验性 `--enable-self-resubmit` 会允许常规请求 best-effort 使用 KV；撞墙者只释放自己的 KV 并从 PREFILL 重算，
-不会回滚第三方，也不会重复输出已经可见的 token。它默认关闭且仅支持 `blocks`。可用
+实验性 `--enable-self-resubmit` 改用乐观准入：每个常规请求先领取覆盖 `prompt + 1 block` 的小额 claim，
+新请求合计最多使用全局 90% KV，余下 10% 留给已经运行的 decode 增长。decode 需要新页但空间不足时，
+撞墙者只释放自己的 KV 并重新排队，不回滚第三方，也不重复输出已经可见的 token。该模式会强制开启 prefix cache，
+因此重算可以找回已提交的完整 prompt 页；生成阶段的 KV 仍需重算。它默认关闭且仅支持 `blocks`。可用
 `--max-self-resubmits` 和 `--self-resubmit-strict-fallback-rolled-back-tokens` 控制何时恢复严格 completion claim，
-从而给活锁一个有界退出路径。
+从而给活锁一个有界退出路径。`--self-resubmit-initial-extra-blocks` 和
+`--self-resubmit-kv-admission-watermark` 可以调整上述两个乐观准入参数。
 
 当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
 
@@ -241,7 +252,10 @@ curl http://127.0.0.1:8000/metrics
 ```
 
 它包含 TTFT、可见 token 间隔、真实完成的 step 延迟、waiting/running 请求、短请求首 token lane、两种 token
-backlog、KV cache 使用率/claim、self-resubmit 回滚进度、准入拒绝和 token 吞吐。`pending_tokens` 只统计当前
+backlog、KV cache 使用率/claim、self-resubmit 回滚进度、准入拒绝和 token 吞吐，也包含投机尝试、命中节点、
+验证产出 token、草稿根/分支、最大深度和 KV 搬运计数。平均验证产出长度可用
+`rate(light_vllm_speculative_verified_tokens_total[5m]) / rate(light_vllm_speculation_attempts_total[5m])`
+计算。`pending_tokens` 只统计当前
 已知输入；`max_remaining_tokens` 还包含最大输出预算，适合保守扩缩容，二者不会混用。
 指标来自同一套 Engine/Scheduler/KV 事实，与 `qwen2`、`qwen2.5` 或具体模型尺寸无关；`reference`
 runtime 没有 Scheduler 和固定 KV 容量，因此不伪造这些指标。
@@ -272,7 +286,7 @@ catalog.loaders.register("my-format", my_loader)
 ## 当前非目标
 
 当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback、独立 Greedy
-Sampler、原生 Qwen2 子集、整页 prefix cache、简单 n-gram 投机解码、PyTorch Paged Attention correctness backend
+Sampler、原生 Qwen2 子集、整页 prefix cache、chain/trie 树形投机解码、PyTorch Paged Attention correctness backend
 和可选的首版 Triton fused attention。Tokenizer、文本 prompt、随机 sampling、经过长上下文调优和跨显卡验收的
 生产级 attention kernel、第三方 victim preemption、分布式执行和 OpenAI-compatible API 仍是后续能力。多进程实现将新增
 `EngineClient` / Worker 拓扑，而不改 HTTP。

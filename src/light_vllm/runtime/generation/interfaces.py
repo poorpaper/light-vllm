@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from math import isfinite
 from typing import Literal, Protocol, TypeAlias
 
 FinishReason: TypeAlias = Literal["length", "eos"]
@@ -30,6 +31,7 @@ class GenerateRequest:
     input_ids: tuple[int, ...]
     max_new_tokens: int = 16
     eos_token_id: int | None = None
+    max_tolerable_ttft_seconds: float | None = None
 
     def __post_init__(self) -> None:
         input_ids = tuple(self.input_ids)
@@ -43,6 +45,13 @@ class GenerateRequest:
             type(self.eos_token_id) is not int or self.eos_token_id < 0
         ):
             raise ValueError("eos_token_id must be a non-negative integer")
+        if self.max_tolerable_ttft_seconds is not None and (
+            isinstance(self.max_tolerable_ttft_seconds, bool)
+            or not isinstance(self.max_tolerable_ttft_seconds, (int, float))
+            or not isfinite(self.max_tolerable_ttft_seconds)
+            or self.max_tolerable_ttft_seconds <= 0
+        ):
+            raise ValueError("max_tolerable_ttft_seconds must be finite and positive")
         object.__setattr__(self, "input_ids", input_ids)
 
 

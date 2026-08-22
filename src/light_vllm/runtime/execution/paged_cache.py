@@ -122,6 +122,15 @@ class PagedLayerCache:
     values: Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class PagedKVWriteMapping:
+    """一次模型 step 内供所有层复用的物理写入位置。"""
+
+    slots: Tensor
+    num_query_tokens: int
+    source_indices: Tensor | None = None
+
+
 class PagedKVCache:
     """所有请求共用的分页 K/V 张量池，通过 page ID 找到具体存储位置。"""
 
@@ -153,41 +162,168 @@ class PagedKVCache:
             raise KVCacheError(f"KV cache layer {layer_id!r} was not found") from exc
 
     @torch.inference_mode()
-    def write(self, layer_id: str, key: Tensor, value: Tensor, slot_mapping: Tensor) -> None:
-        """把有效 query token 的 K/V 原位写到指定物理 slot。"""
+    def prepare_write(
+        self,
+        slot_mapping: Tensor,
+        *,
+        validate: bool = True,
+    ) -> PagedKVWriteMapping:
+        """Normalize one batch mapping for reuse across all model layers.
+
+        Paged-attention metadata proves range and aliasing properties on the
+        CPU. Its backends can therefore skip CUDA reductions and host
+        synchronizations while direct cache callers keep defensive validation.
+        """
+
+        if slot_mapping.ndim != 1:
+            raise KVCacheError("slot mapping must have one entry per packed query token")
+        if slot_mapping.device != self._config.device:
+            raise KVCacheError("slot mapping device must match the cache")
+        flat_mapping = slot_mapping.flatten()
+        if not validate:
+            # PagedAttentionMetadata 已证明每个 packed query 都有唯一合法 slot。
+            # 热路径直接复用 dense mapping，避免每步额外的 CUDA nonzero/index_select。
+            return PagedKVWriteMapping(
+                slots=flat_mapping.to(torch.long),
+                num_query_tokens=flat_mapping.numel(),
+            )
+
+        active = flat_mapping >= 0
+        source_indices = torch.nonzero(active, as_tuple=False).flatten()
+        slots = flat_mapping.index_select(0, source_indices).to(torch.long)
+        if validate and slots.numel():
+            num_slots = self._config.num_blocks * self._config.block_size
+            if int(slots.min()) < 0 or int(slots.max()) >= num_slots:
+                raise KVCacheError("slot mapping contains an out-of-range physical slot")
+            if slots.unique().numel() != slots.numel():
+                raise KVCacheError("slot mapping must not write the same physical slot twice")
+        return PagedKVWriteMapping(
+            slots=slots,
+            num_query_tokens=flat_mapping.numel(),
+            source_indices=(
+                None if source_indices.numel() == flat_mapping.numel() else source_indices
+            ),
+        )
+
+    @torch.inference_mode()
+    def write_prepared(
+        self,
+        layer_id: str,
+        key: Tensor,
+        value: Tensor,
+        mapping: PagedKVWriteMapping,
+    ) -> None:
+        """Write K/V with a mapping prepared once for the model step."""
 
         layer = self.layer(layer_id)
         spec = self.layer_spec(layer_id)
         expected_tail = (spec.num_kv_heads, spec.head_size)
-        if key.ndim != 4 or key.shape[2:] != expected_tail:
-            raise KVCacheError(
-                "paged KV update must have shape [batch, query, kv_heads, head_size]"
-            )
+        if key.ndim != 3 or key.shape[1:] != expected_tail:
+            raise KVCacheError("paged KV update must have shape [tokens, kv_heads, head_size]")
         if value.shape != key.shape:
             raise KVCacheError("paged K/V updates must have the same shape")
-        if slot_mapping.shape != key.shape[:2]:
+        if mapping.num_query_tokens != key.shape[0]:
             raise KVCacheError("slot mapping must have one entry per query token")
         if key.dtype != self._config.dtype or key.device != self._config.device:
             raise KVCacheError("paged KV update dtype and device must match the cache")
         if value.dtype != key.dtype or value.device != key.device:
             raise KVCacheError("paged K/V updates must use the same dtype and device")
-        if slot_mapping.device != self._config.device:
-            raise KVCacheError("slot mapping device must match the cache")
-
-        active = slot_mapping >= 0
-        slots = slot_mapping[active].to(torch.long)
-        if slots.numel() == 0:
+        if mapping.slots.device != self._config.device or (
+            mapping.source_indices is not None
+            and mapping.source_indices.device != self._config.device
+        ):
+            raise KVCacheError("prepared slot mapping device must match the cache")
+        if mapping.slots.numel() == 0:
             return
-        num_slots = self._config.num_blocks * self._config.block_size
-        if int(slots.min()) < 0 or int(slots.max()) >= num_slots:
-            raise KVCacheError("slot mapping contains an out-of-range physical slot")
-        if slots.unique().numel() != slots.numel():
-            raise KVCacheError("slot mapping must not write the same physical slot twice")
 
+        num_slots = self._config.num_blocks * self._config.block_size
         flat_keys = layer.keys.view(num_slots, *expected_tail)
         flat_values = layer.values.view(num_slots, *expected_tail)
-        flat_keys.index_copy_(0, slots, key[active])
-        flat_values.index_copy_(0, slots, value[active])
+        query_keys = key
+        query_values = value
+        if mapping.source_indices is not None:
+            query_keys = query_keys.index_select(0, mapping.source_indices)
+            query_values = query_values.index_select(0, mapping.source_indices)
+        flat_keys.index_copy_(0, mapping.slots, query_keys)
+        flat_values.index_copy_(0, mapping.slots, query_values)
+
+    @torch.inference_mode()
+    def write(self, layer_id: str, key: Tensor, value: Tensor, slot_mapping: Tensor) -> None:
+        """把有效 query token 的 K/V 原位写到指定物理 slot。"""
+
+        self.write_prepared(layer_id, key, value, self.prepare_write(slot_mapping))
+
+    @torch.inference_mode()
+    def compact(
+        self,
+        block_ids: tuple[int, ...],
+        *,
+        num_computed_tokens: int,
+        num_query_tokens: int,
+        num_reserved_query_tokens: int,
+        retained_query_indices: tuple[int, ...],
+        num_readonly_prefix_blocks: int = 0,
+    ) -> int:
+        """把命中路径从展平 query slots 搬到连续正式尾部。"""
+
+        block_ids = tuple(block_ids)
+        retained = tuple(retained_query_indices)
+        values = (
+            num_computed_tokens,
+            num_query_tokens,
+            num_reserved_query_tokens,
+            num_readonly_prefix_blocks,
+        )
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError("paged compact counts must be non-negative integers")
+        if num_reserved_query_tokens < num_query_tokens:
+            raise ValueError("reserved query tokens must cover every actual query")
+        if any(type(index) is not int or index < 0 for index in retained):
+            raise ValueError("retained query indices must be non-negative integers")
+        if len(set(retained)) != len(retained):
+            raise ValueError("retained query indices must be unique")
+        if any(index >= num_query_tokens for index in retained):
+            raise KVCacheError("retained query index exceeds the paged KV tail")
+
+        config = self._config
+        required_blocks = (
+            num_computed_tokens + num_reserved_query_tokens + config.block_size - 1
+        ) // config.block_size
+        if len(block_ids) != required_blocks:
+            raise KVCacheError("block table does not exactly cover the reserved query slots")
+        if any(
+            type(block_id) is not int or not 0 <= block_id < config.num_blocks
+            for block_id in block_ids
+        ):
+            raise KVCacheError("block table contains an invalid physical block")
+        if len(set(block_ids)) != len(block_ids):
+            raise KVCacheError("block table aliases a physical block within one request")
+        if num_readonly_prefix_blocks * config.block_size > num_computed_tokens:
+            raise KVCacheError("readonly prefix blocks exceed the computed prefix")
+
+        def physical_slot(logical_position: int) -> int:
+            block_id = block_ids[logical_position // config.block_size]
+            return block_id * config.block_size + logical_position % config.block_size
+
+        source_slots = tuple(physical_slot(num_computed_tokens + index) for index in retained)
+        target_slots = tuple(
+            physical_slot(num_computed_tokens + index) for index in range(len(retained))
+        )
+        if source_slots == target_slots:
+            return 0
+
+        source = torch.tensor(source_slots, dtype=torch.long, device=config.device)
+        target = torch.tensor(target_slots, dtype=torch.long, device=config.device)
+        num_slots = config.num_blocks * config.block_size
+        for layer in self._layers.values():
+            flat_keys = layer.keys.view(num_slots, *layer.keys.shape[2:])
+            flat_values = layer.values.view(num_slots, *layer.values.shape[2:])
+            # 所有 source 先复制完成，再写 target，保证跨页重叠搬运正确。
+            keys = flat_keys.index_select(0, source).clone()
+            values = flat_values.index_select(0, source).clone()
+            flat_keys.index_copy_(0, target, keys)
+            flat_values.index_copy_(0, target, values)
+        return sum(left != right for left, right in zip(source_slots, target_slots, strict=True))
 
     def _allocate_layer(self, spec: AttentionLayerSpec) -> PagedLayerCache:
         shape = (

@@ -4,7 +4,12 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from light_vllm.modeling.models.interfaces import ForwardBatch, ModelOutput, ModelSpec
+from light_vllm.modeling.models.interfaces import (
+    ForwardBatch,
+    ModelOutput,
+    ModelSpec,
+    select_query_states,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,4 +32,5 @@ class TinyCausalLM(nn.Module):
 
     def forward(self, batch: ForwardBatch) -> ModelOutput:
         hidden_states = self.token_embedding(batch.input_ids)
+        hidden_states = select_query_states(hidden_states, batch)
         return ModelOutput(logits=self.lm_head(hidden_states))

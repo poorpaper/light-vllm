@@ -14,10 +14,16 @@ from light_vllm.modeling.attention.interfaces import (
     AttentionLayerSpec,
     ModelKVCacheSpec,
 )
+from light_vllm.modeling.models._qwen2_kernels import (
+    apply_rotary,
+    fused_add_rms_norm,
+    silu_and_mul,
+)
 from light_vllm.modeling.models.interfaces import (
     ForwardBatch,
     ModelOutput,
     ModelSpec,
+    select_query_states,
 )
 
 
@@ -145,11 +151,16 @@ class Qwen2RMSNorm(nn.Module):
         self._eps = eps
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        input_dtype = hidden_states.dtype
-        values = hidden_states.float()
-        variance = values.square().mean(dim=-1, keepdim=True)
-        normalized = values * torch.rsqrt(variance + self._eps)
-        return self.weight * normalized.to(input_dtype)
+        return F.rms_norm(
+            hidden_states,
+            (hidden_states.shape[-1],),
+            self.weight,
+            self._eps,
+        )
+
+    @property
+    def eps(self) -> float:
+        return self._eps
 
 
 class Qwen2MLP(nn.Module):
@@ -182,32 +193,33 @@ class Qwen2MLP(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        self.register_buffer("_merged_gate_up_weight", None, persistent=False)
+        self.register_buffer("_merged_gate_up_weight_t", None, persistent=False)
+        self.register_buffer("_down_proj_weight_t", None, persistent=False)
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+        merged_weight = self._merged_gate_up_weight
+        merged_weight_t = self._merged_gate_up_weight_t
+        down_weight_t = self._down_proj_weight_t
+        if merged_weight is None or merged_weight_t is None or down_weight_t is None:
+            gate = self.gate_proj(hidden_states)
+            up = self.up_proj(hidden_states)
+            return self.down_proj(silu_and_mul(gate, up))
+        else:
+            gate, up = torch.mm(hidden_states, merged_weight_t).chunk(2, dim=-1)
+        return torch.mm(silu_and_mul(gate, up), down_weight_t)
 
+    def prepare_for_inference(self) -> None:
+        """Pack checkpoint-compatible Gate/Up weights into one inference GEMM."""
 
-def _rotate_half(values: Tensor) -> Tensor:
-    """交换并旋转向量的前后两半，供 RoPE 使用。"""
-
-    first, second = values.chunk(2, dim=-1)
-    return torch.cat((-second, first), dim=-1)
-
-
-def _apply_rotary(
-    queries: Tensor,
-    keys: Tensor,
-    cosines: Tensor,
-    sines: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """把绝对位置编码到 query 和 key。"""
-
-    cosines = cosines.unsqueeze(2)
-    sines = sines.unsqueeze(2)
-    return (
-        queries * cosines + _rotate_half(queries) * sines,
-        keys * cosines + _rotate_half(keys) * sines,
-    )
+        with torch.no_grad():
+            self._merged_gate_up_weight = torch.cat(
+                (self.gate_proj.weight, self.up_proj.weight),
+                dim=0,
+            ).contiguous()
+            # 只缓存共享存储的转置 view，避免每个 step 为固定权重重复建 view。
+            self._merged_gate_up_weight_t = self._merged_gate_up_weight.t()
+            self._down_proj_weight_t = self.down_proj.weight.t()
 
 
 class Qwen2Attention(nn.Module):
@@ -252,6 +264,10 @@ class Qwen2Attention(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        self.register_buffer("_merged_qkv_weight", None, persistent=False)
+        self.register_buffer("_merged_qkv_weight_t", None, persistent=False)
+        self.register_buffer("_merged_qkv_bias", None, persistent=False)
+        self.register_buffer("_o_proj_weight_t", None, persistent=False)
 
     def forward(
         self,
@@ -260,21 +276,40 @@ class Qwen2Attention(nn.Module):
         cosines: Tensor,
         sines: Tensor,
     ) -> Tensor:
-        batch_size, query_width, _ = hidden_states.shape
-        queries = self.q_proj(hidden_states).view(
-            batch_size,
-            query_width,
+        num_tokens = hidden_states.shape[0]
+        merged_weight = self._merged_qkv_weight
+        merged_weight_t = self._merged_qkv_weight_t
+        merged_bias = self._merged_qkv_bias
+        output_weight_t = self._o_proj_weight_t
+        if (
+            merged_weight is None
+            or merged_weight_t is None
+            or merged_bias is None
+            or output_weight_t is None
+        ):
+            query_projection = self.q_proj(hidden_states)
+            key_projection = self.k_proj(hidden_states)
+            value_projection = self.v_proj(hidden_states)
+        else:
+            projections = torch.addmm(merged_bias, hidden_states, merged_weight_t)
+            query_size = self._num_query_heads * self._head_size
+            kv_size = self._num_kv_heads * self._head_size
+            query_projection, key_projection, value_projection = projections.split(
+                (query_size, kv_size, kv_size),
+                dim=-1,
+            )
+        queries = query_projection.view(
+            num_tokens,
             self._num_query_heads,
             self._head_size,
         )
-        keys = self.k_proj(hidden_states).view(
-            batch_size,
-            query_width,
+        keys = key_projection.view(
+            num_tokens,
             self._num_kv_heads,
             self._head_size,
         )
-        values = self.v_proj(hidden_states).view_as(keys)
-        queries, keys = _apply_rotary(queries, keys, cosines, sines)
+        values = value_projection.view_as(keys)
+        queries, keys = apply_rotary(queries, keys, cosines, sines)
 
         attention = batch.attention
         if attention is None:
@@ -287,8 +322,28 @@ class Qwen2Attention(nn.Module):
             values,
             scale=self._scale,
         )
-        output = self.o_proj(attended.reshape(batch_size, query_width, -1))
+        attended = attended.reshape(num_tokens, -1)
+        output = (
+            self.o_proj(attended)
+            if output_weight_t is None
+            else torch.mm(attended, output_weight_t)
+        )
         return output
+
+    def prepare_for_inference(self) -> None:
+        """Pack checkpoint-compatible Q/K/V weights into one inference GEMM."""
+
+        with torch.no_grad():
+            self._merged_qkv_weight = torch.cat(
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
+                dim=0,
+            ).contiguous()
+            self._merged_qkv_weight_t = self._merged_qkv_weight.t()
+            self._merged_qkv_bias = torch.cat(
+                (self.q_proj.bias, self.k_proj.bias, self.v_proj.bias),
+                dim=0,
+            ).contiguous()
+            self._o_proj_weight_t = self.o_proj.weight.t()
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -320,21 +375,38 @@ class Qwen2DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
+        residual: Tensor | None,
         batch: ForwardBatch,
         cosines: Tensor,
         sines: Tensor,
-    ) -> Tensor:
-        residual = hidden_states
+    ) -> tuple[Tensor, Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+            )
         hidden_states = self.self_attn(
-            self.input_layernorm(hidden_states),
+            hidden_states,
             batch,
             cosines,
             sines,
         )
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
-        return residual + hidden_states
+        hidden_states, residual = fused_add_rms_norm(
+            hidden_states,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+        return self.mlp(hidden_states), residual
+
+    def prepare_for_inference(self) -> None:
+        self.self_attn.prepare_for_inference()
+        self.mlp.prepare_for_inference()
 
 
 class Qwen2Model(nn.Module):
@@ -382,6 +454,9 @@ class Qwen2ForCausalLM(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        self.register_buffer("_rope_cosines", None, persistent=False)
+        self.register_buffer("_rope_sines", None, persistent=False)
+        self.register_buffer("_lm_head_weight_t", None, persistent=False)
         self.apply(self._initialize_weights)
         if config.tie_word_embeddings:
             # 输入词向量和输出分类层可以共用同一份参数。
@@ -431,19 +506,71 @@ class Qwen2ForCausalLM(nn.Module):
 
         positions = batch.positions
         assert positions is not None
-        if bool(torch.any(positions >= self.config.max_position_embeddings)):
-            raise ValueError("Qwen2 position exceeds max_position_embeddings")
+        if not batch.positions_are_validated:
+            positions_in_range = torch.all(positions < self.config.max_position_embeddings)
+            if positions.device.type == "cuda":
+                torch._assert_async(
+                    positions_in_range,
+                    "Qwen2 position exceeds max_position_embeddings",
+                )
+            elif not bool(positions_in_range):
+                raise ValueError("Qwen2 position exceeds max_position_embeddings")
         hidden_states = self.model.embed_tokens(batch.input_ids)
         cosines, sines = self._rotary_embeddings(positions, hidden_states.dtype)
+        residual = None
         for layer in self.model.layers:
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 hidden_states,
+                residual,
                 batch,
                 cosines,
                 sines,
             )
-        logits = self.lm_head(self.model.norm(hidden_states))
+        assert residual is not None
+        hidden_states, _ = fused_add_rms_norm(
+            hidden_states,
+            residual,
+            self.model.norm.weight,
+            self.model.norm.eps,
+        )
+        hidden_states = select_query_states(hidden_states, batch)
+        logits = (
+            self.lm_head(hidden_states)
+            if self._lm_head_weight_t is None
+            else torch.mm(hidden_states, self._lm_head_weight_t)
+        )
         return ModelOutput(logits=logits)
+
+    def prepare_for_inference(self) -> None:
+        """Build model-owned packed weights after checkpoint loading completes."""
+
+        for layer in self.model.layers:
+            layer.prepare_for_inference()
+        # lm_head 与 embedding 可能共享参数；转置 view 不复制这份大权重。
+        self._lm_head_weight_t = self.lm_head.weight.t()
+        positions = torch.arange(
+            self.config.max_position_embeddings,
+            dtype=torch.float32,
+            device=self.model.embed_tokens.weight.device,
+        )
+        frequencies = 1.0 / (
+            self.config.rope_theta
+            ** (
+                torch.arange(
+                    0,
+                    self.config.head_size,
+                    2,
+                    dtype=torch.float32,
+                    device=positions.device,
+                )
+                / self.config.head_size
+            )
+        )
+        angles = torch.outer(positions, frequencies)
+        embeddings = torch.cat((angles, angles), dim=-1)
+        dtype = self.model.embed_tokens.weight.dtype
+        self._rope_cosines = embeddings.cos().to(dtype)
+        self._rope_sines = embeddings.sin().to(dtype)
 
     def _rotary_embeddings(
         self,
@@ -451,6 +578,9 @@ class Qwen2ForCausalLM(nn.Module):
         dtype: torch.dtype,
     ) -> tuple[Tensor, Tensor]:
         """按绝对位置生成 RoPE 使用的正弦和余弦。"""
+
+        if self._rope_cosines is not None and self._rope_sines is not None:
+            return self._rope_cosines[positions], self._rope_sines[positions]
 
         frequencies = 1.0 / (
             self.config.rope_theta
@@ -465,7 +595,7 @@ class Qwen2ForCausalLM(nn.Module):
                 / self.config.head_size
             )
         )
-        angles = torch.einsum("bs,d->bsd", positions.float(), frequencies)
+        angles = torch.einsum("s,d->sd", positions.float(), frequencies)
         embeddings = torch.cat((angles, angles), dim=-1)
         return embeddings.cos().to(dtype), embeddings.sin().to(dtype)
 
