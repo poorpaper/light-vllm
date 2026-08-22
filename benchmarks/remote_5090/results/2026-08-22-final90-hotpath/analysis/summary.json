@@ -1,0 +1,247 @@
+{
+  "aggregation": "median of three per-run benchmark summaries",
+  "cases": {
+    "normal-loaded": {
+      "baseline": {
+        "runs": 3,
+        "all_requests_successful": true,
+        "successful_requests_per_run": [
+          64,
+          64,
+          64
+        ],
+        "throughput_tok_s_runs": [
+          611.8356457343411,
+          615.7437332790457,
+          615.9348091914969
+        ],
+        "ttft_p95_ms_runs": [
+          88.89215013477951,
+          86.19150401791556,
+          86.62362387403846
+        ],
+        "tpot_p50_ms_runs": [
+          12.314097501324769,
+          12.130816636296727,
+          12.17441727634665
+        ],
+        "tpot_p95_ms_runs": [
+          12.872358040198314,
+          12.67003031281308,
+          12.666742642509885
+        ],
+        "throughput_tok_s": 615.7437332790457,
+        "ttft_p95_ms": 86.62362387403846,
+        "tpot_p50_ms": 12.17441727634665,
+        "tpot_p95_ms": 12.67003031281308
+      },
+      "candidate": {
+        "runs": 3,
+        "all_requests_successful": true,
+        "successful_requests_per_run": [
+          64,
+          64,
+          64
+        ],
+        "throughput_tok_s_runs": [
+          623.3753919151965,
+          624.1540421703074,
+          622.1843258044224
+        ],
+        "ttft_p95_ms_runs": [
+          80.00355720287186,
+          78.40421957662329,
+          76.22563098557292
+        ],
+        "tpot_p50_ms_runs": [
+          11.836205909939316,
+          11.848387587322362,
+          11.870845048300302
+        ],
+        "tpot_p95_ms_runs": [
+          12.214240648072574,
+          12.219921326984398,
+          12.362287577149162
+        ],
+        "throughput_tok_s": 623.3753919151965,
+        "ttft_p95_ms": 78.40421957662329,
+        "tpot_p50_ms": 11.848387587322362,
+        "tpot_p95_ms": 12.219921326984398
+      },
+      "vllm_eager": {
+        "runs": 3,
+        "all_requests_successful": true,
+        "successful_requests_per_run": [
+          64,
+          64,
+          64
+        ],
+        "throughput_tok_s_runs": [
+          654.1369939639056,
+          653.7962879330717,
+          653.9342766160546
+        ],
+        "ttft_p95_ms_runs": [
+          54.569710837677114,
+          51.95551108336075,
+          52.21858550794422
+        ],
+        "tpot_p50_ms_runs": [
+          10.758027874773461,
+          10.767402772786566,
+          10.76845202124769
+        ],
+        "tpot_p95_ms_runs": [
+          11.496438481844962,
+          11.321237585174718,
+          11.424586494494577
+        ],
+        "throughput_tok_s": 653.9342766160546,
+        "ttft_p95_ms": 52.21858550794422,
+        "tpot_p50_ms": 10.767402772786566,
+        "tpot_p95_ms": 11.424586494494577
+      },
+      "ratios": {
+        "candidate_throughput_vs_vllm_percent": 95.32691804152051,
+        "candidate_tpot_speed_vs_vllm_percent": 90.87652385973229,
+        "candidate_ttft_p95_vs_vllm_ratio": 1.5014619567719878,
+        "candidate_throughput_gain_vs_baseline_percent": 1.2394212435601348,
+        "candidate_tpot_reduction_vs_baseline_percent": 2.6779900969693404,
+        "candidate_ttft_p95_reduction_vs_baseline_percent": 9.4886405461023
+      }
+    },
+    "normal-low": {
+      "baseline": {
+        "runs": 3,
+        "all_requests_successful": true,
+        "successful_requests_per_run": [
+          64,
+          64,
+          64
+        ],
+        "throughput_tok_s_runs": [
+          202.16961603297278,
+          202.22622196224725,
+          202.21828878595932
+        ],
+        "ttft_p95_ms_runs": [
+          76.2822428718209,
+          76.20466939406464,
+          85.58725521434094
+        ],
+        "tpot_p50_ms_runs": [
+          10.957265582342071,
+          11.02639922709337,
+          10.89581112480826
+        ],
+        "tpot_p95_ms_runs": [
+          11.555081758526958,
+          11.384447716397949,
+          11.365695901596899
+        ],
+        "throughput_tok_s": 202.21828878595932,
+        "ttft_p95_ms": 76.2822428718209,
+        "tpot_p50_ms": 10.957265582342071,
+        "tpot_p95_ms": 11.384447716397949
+      },
+      "candidate": {
+        "runs": 3,
+        "all_requests_successful": true,
+        "successful_requests_per_run": [
+          64,
+          64,
+          64
+        ],
+        "throughput_tok_s_runs": [
+          202.22179635966666,
+          202.24739741834088,
+          202.26931181936249
+        ],
+        "ttft_p95_ms_runs": [
+          65.1525103370659,
+          70.28889498906209,
+          73.08970207814126
+        ],
+        "tpot_p50_ms_runs": [
+          10.661226362028872,
+          10.692268545171444,
+          10.737292268054766
+        ],
+        "tpot_p95_ms_runs": [
+          10.896921981261132,
+          11.01849483520103,
+          10.995584056945518
+        ],
+        "throughput_tok_s": 202.24739741834088,
+        "ttft_p95_ms": 70.28889498906209,
+        "tpot_p50_ms": 10.692268545171444,
+        "tpot_p95_ms": 10.995584056945518
+      },
+      "vllm_eager": {
+        "runs": 3,
+        "all_requests_successful": true,
+        "successful_requests_per_run": [
+          64,
+          64,
+          64
+        ],
+        "throughput_tok_s_runs": [
+          202.44932447609202,
+          202.43743159109735,
+          202.38663575117766
+        ],
+        "ttft_p95_ms_runs": [
+          50.16321541042993,
+          41.906845197081566,
+          48.38125993264839
+        ],
+        "tpot_p50_ms_runs": [
+          9.910661977937925,
+          9.965587408654914,
+          9.891239544586803
+        ],
+        "tpot_p95_ms_runs": [
+          10.782511111964205,
+          10.65524438387141,
+          11.196017795009535
+        ],
+        "throughput_tok_s": 202.43743159109735,
+        "ttft_p95_ms": 48.38125993264839,
+        "tpot_p50_ms": 9.910661977937925,
+        "tpot_p95_ms": 10.782511111964205
+      },
+      "ratios": {
+        "candidate_throughput_vs_vllm_percent": 99.90612695919778,
+        "candidate_tpot_speed_vs_vllm_percent": 92.68998375853096,
+        "candidate_ttft_p95_vs_vllm_ratio": 1.452812413048179,
+        "candidate_throughput_gain_vs_baseline_percent": 0.014394658641569968,
+        "candidate_tpot_reduction_vs_baseline_percent": 2.418459561641695,
+        "candidate_ttft_p95_reduction_vs_baseline_percent": 7.856806062755117
+      }
+    }
+  },
+  "profiles": {
+    "boundary_note": "Light executor CUDA event and vLLM execute_model are independently instrumented boundaries, so compare them as diagnostic evidence, not as an exact kernel-to-kernel decomposition.",
+    "light": {
+      "steps": 1047,
+      "executor_wall_ms_per_step": 10.95428305635148,
+      "cuda_event_ms_per_step": 10.913368662846228,
+      "inter_executor_gap_ms_per_step": 0.5785115019120458,
+      "service_span_ms_per_step": 11.532242016236866,
+      "schedule_ms_per_step": 0.04538856064947469,
+      "advance_locked_ms_per_step": 0.19212620305052433,
+      "apply_output_ms_per_step": 0.05726934288443171
+    },
+    "vllm_eager": {
+      "steps": 1090,
+      "engine_step_wall_ms_per_step": 10.323280780733944,
+      "execute_model_ms_per_step": 8.860349182904413,
+      "inter_step_gap_ms_per_step": 0.2100424031221304,
+      "service_span_ms_per_step": 10.533130484403669,
+      "future_result_ms_per_step": 0.724316199078341,
+      "sample_tokens_ms_per_step": 0.5352956774193548,
+      "schedule_ms_per_step": 0.10906660110294118,
+      "update_output_ms_per_step": 0.05872519025735294
+    }
+  }
+}
