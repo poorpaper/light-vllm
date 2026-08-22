@@ -179,6 +179,9 @@ LIGHT_COMMON=(
   --max-pending-requests off
   --ttft-kv-cache-watermark off
 )
+if [[ "${ENGINE_PROCESS:-0}" == 1 ]]; then
+  LIGHT_COMMON+=(--engine-process)
+fi
 if [[ -n "$SHORT_REQUEST_RESERVED_SEQUENCES" ]]; then
   LIGHT_COMMON+=(
     --short-request-max-effective-prompt-tokens 256

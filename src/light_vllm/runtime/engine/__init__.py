@@ -12,14 +12,17 @@ from light_vllm.runtime.engine.interfaces import (
     StepLatencyPredictor,
     TTFTAdmission,
 )
+from light_vllm.runtime.engine.process import EngineProcessRuntime, ProcessEngineClient
 
 __all__ = [
     "CapacityAdmission",
     "EngineCapabilities",
     "EngineClient",
     "EngineCore",
+    "EngineProcessRuntime",
     "InProcessEngineClient",
     "PredictiveTTFTAdmission",
+    "ProcessEngineClient",
     "RequestAdmission",
     "SlidingWindowStepLatencyPredictor",
     "StepLatencyPredictor",

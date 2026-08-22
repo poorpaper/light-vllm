@@ -10,6 +10,7 @@ import argparse
 import json
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -25,6 +26,7 @@ from light_vllm.runtime.engine.admission import (
 from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
+from light_vllm.runtime.engine.process import EngineProcessRuntime, ProcessEngineClient
 from light_vllm.runtime.execution.interfaces import ExecutionTimer
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
 from light_vllm.runtime.execution.paged_attention import (
@@ -83,6 +85,43 @@ PagedAttentionBackendName = Literal["torch", "triton"]
 SpeculativeProposerName = Literal["chain", "trie"]
 
 
+@dataclass(frozen=True, slots=True)
+class _EngineRuntimeConfig:
+    kv_reservation: KVReservationMode
+    paged_attention_backend: PagedAttentionBackendName
+    max_num_sequences: int
+    max_num_scheduled_tokens: int
+    num_kv_blocks: int | None
+    kv_block_size: int
+    kv_cache_memory_fraction: float
+    enable_prefix_caching: bool
+    num_speculative_tokens: int
+    speculative_proposer: SpeculativeProposerName
+    speculative_ngram_min: int
+    speculative_ngram_max: int
+    speculative_max_depth: int
+    speculative_max_branching: int
+    short_request_policy: ShortRequestPolicy | None
+    max_tolerable_ttft_seconds: float | None
+    ttft_prediction_window_size: int
+    ttft_prediction_min_observations: int
+    ttft_prediction_quantile: float
+    max_pending_requests: int | None
+    ttft_kv_cache_watermark: float | None
+    enable_self_resubmit: bool
+    max_self_resubmits: int
+    self_resubmit_strict_fallback_rolled_back_tokens: int
+    self_resubmit_initial_extra_blocks: int
+    self_resubmit_kv_admission_watermark: float
+
+
+@dataclass(frozen=True, slots=True)
+class _EngineRuntime:
+    engine: EngineCore
+    performance_metrics: InMemoryPerformanceObserver
+    start: Callable[[], None]
+
+
 def _create_paged_cache_planner(
     spec: ModelSpec,
     *,
@@ -133,6 +172,140 @@ def _create_execution_timer(spec: ModelSpec) -> ExecutionTimer:
     return WallClockExecutionTimer()
 
 
+def _create_engine_runtime(spec: ModelSpec, config: _EngineRuntimeConfig) -> _EngineRuntime:
+    """装配一个 Engine；模型与 CUDA 资源留到 ``start`` 再初始化。"""
+
+    runner = create_runner()
+    performance_observer = InMemoryPerformanceObserver(spec.architecture)
+    if config.kv_reservation == "blocks":
+        cache_planner = _create_paged_cache_planner(
+            spec,
+            num_blocks=config.num_kv_blocks,
+            block_size=config.kv_block_size,
+            memory_fraction=config.kv_cache_memory_fraction,
+        )
+        logical_cache = PagedKVCacheManager(
+            cache_planner,
+            enable_prefix_caching=(config.enable_prefix_caching or config.enable_self_resubmit),
+        )
+        step_factory = partial(
+            PagedStepHandler,
+            cache_planner=cache_planner,
+            attention_backend=_create_paged_attention_backend(
+                config.paged_attention_backend,
+                spec,
+            ),
+        )
+    elif config.kv_reservation == "unbounded":
+        if config.enable_prefix_caching:
+            raise ValueError("prefix caching requires paged KV reservation")
+        if config.paged_attention_backend != "torch":
+            raise ValueError("Triton paged attention requires paged KV reservation")
+        logical_cache = UnboundedKVCacheManager()
+        step_factory = partial(
+            ContiguousStepHandler,
+            cache_config=ContiguousKVCacheConfig(
+                dtype=spec.dtype,
+                device=spec.device,
+            ),
+        )
+    else:
+        raise ValueError(f"unsupported KV reservation mode: {config.kv_reservation}")
+
+    if config.num_speculative_tokens:
+        if config.speculative_proposer == "chain":
+            proposer = NGramChainProposer(
+                min_match_length=config.speculative_ngram_min,
+                max_match_length=config.speculative_ngram_max,
+            )
+        else:
+            proposer = NGramTrieProposer(
+                min_match_length=config.speculative_ngram_min,
+                max_match_length=config.speculative_ngram_max,
+                max_depth=config.speculative_max_depth,
+                max_branching=config.speculative_max_branching,
+            )
+        decode_handler = SpeculativeDecodeHandler(
+            proposer,
+            GreedySampler(),
+            GreedyTreeAcceptanceSampler(),
+            performance_observer,
+        )
+        decoding_budget = DecodingBudget(
+            num_lookahead_tokens=config.num_speculative_tokens,
+            max_output_tokens=config.num_speculative_tokens + 1,
+        )
+    else:
+        decode_handler = StandardDecodeHandler(GreedySampler())
+        decoding_budget = None
+
+    worker = LocalModelWorker(runner, step_factory, decode_handler)
+    model_executor = LocalModelExecutor(
+        worker,
+        timer=_create_execution_timer(spec),
+    )
+    scheduler = TokenBudgetScheduler(
+        logical_cache,
+        max_num_sequences=config.max_num_sequences,
+        max_num_scheduled_tokens=config.max_num_scheduled_tokens,
+        decoding_budget=decoding_budget,
+        short_request_policy=config.short_request_policy,
+        self_resubmit_policy=(
+            SelfResubmitPolicy(
+                max_resubmits=config.max_self_resubmits,
+                strict_fallback_rolled_back_tokens=(
+                    config.self_resubmit_strict_fallback_rolled_back_tokens
+                ),
+                initial_extra_blocks=config.self_resubmit_initial_extra_blocks,
+                kv_admission_watermark=config.self_resubmit_kv_admission_watermark,
+            )
+            if config.enable_self_resubmit
+            else None
+        ),
+    )
+    ttft_admission = PredictiveTTFTAdmission(
+        SlidingWindowStepLatencyPredictor(
+            window_size=config.ttft_prediction_window_size,
+            min_observations=config.ttft_prediction_min_observations,
+            prediction_quantile=config.ttft_prediction_quantile,
+        ),
+        max_tolerable_ttft_seconds=config.max_tolerable_ttft_seconds,
+        max_pending_requests=config.max_pending_requests,
+        kv_cache_watermark=config.ttft_kv_cache_watermark,
+    )
+    engine = EngineCore(
+        model_executor,
+        scheduler,
+        performance_observer=performance_observer,
+        ttft_admission=ttft_admission,
+    )
+
+    def start() -> None:
+        runner.load(spec)
+        model_executor.initialize()
+        # CUDA KV 容量直到 executor 初始化后才确定。
+        engine.refresh_performance_metrics()
+
+    return _EngineRuntime(
+        engine=engine,
+        performance_metrics=performance_observer,
+        start=start,
+    )
+
+
+def _create_started_engine_process_runtime(
+    spec: ModelSpec,
+    config: _EngineRuntimeConfig,
+) -> EngineProcessRuntime:
+    runtime = _create_engine_runtime(spec, config)
+    runtime.start()
+    return EngineProcessRuntime(
+        engine=runtime.engine,
+        performance_metrics=runtime.performance_metrics,
+        close=runtime.engine.close,
+    )
+
+
 def create_serving_app(
     spec: ModelSpec,
     *,
@@ -163,24 +336,18 @@ def create_serving_app(
     self_resubmit_strict_fallback_rolled_back_tokens: int = 4096,
     self_resubmit_initial_extra_blocks: int = 1,
     self_resubmit_kv_admission_watermark: float = 0.9,
+    engine_process: bool = False,
 ) -> FastAPI:
-    """创建单进程 HTTP 服务，并选择 reference 或 Engine Core。
-
-    以后换成独立进程引擎时只改这里，不改 HTTP 路由。
-    """
+    """创建 HTTP 服务，并选择 reference 或批量 Engine Core。"""
 
     # FastAPI 是可选依赖。只有启动 HTTP 服务时才导入，
     # 没有安装它也不影响核心模型功能。
     from light_vllm.serving.http import create_http_app
 
-    runner = create_runner()
-    # reference client 没有常驻 driver；只有批量 Engine 需要在 lifespan
-    # 结束时显式等待当前模型迭代完成。
     close_engine: Callable[[], Awaitable[None]] | None = None
-    initialize_executor: Callable[[], None] | None = None
-    refresh_performance_metrics: Callable[[], None] | None = None
+    start_engine: Callable[[], Awaitable[None]] | None = None
+    start_runtime: Callable[[], None] | None = None
     performance_metrics: PerformanceMetricsReader | None = None
-    sampler = GreedySampler()
     if type(num_speculative_tokens) is not int or num_speculative_tokens < 0:
         raise ValueError("num_speculative_tokens must be a non-negative integer")
     if paged_attention_backend not in ("torch", "triton"):
@@ -188,6 +355,8 @@ def create_serving_app(
     if speculative_proposer not in ("chain", "trie"):
         raise ValueError(f"unsupported speculative proposer: {speculative_proposer}")
     if runtime == "reference":
+        if engine_process:
+            raise ValueError("an engine process requires the engine runtime")
         if enable_self_resubmit:
             raise ValueError("self-resubmit requires the engine runtime")
         if max_tolerable_ttft_seconds is not None:
@@ -199,138 +368,70 @@ def create_serving_app(
         if paged_attention_backend != "torch":
             raise ValueError("paged attention backend selection requires the engine runtime")
         # 保留原始单请求基线，继续通过轻量 sync-to-async bridge 对外服务。
-        executor = LocalTokenExecutor(runner, sampler, device=spec.device)
+        runner = create_runner()
+        executor = LocalTokenExecutor(runner, GreedySampler(), device=spec.device)
         service = ReferenceGenerationService(executor)
         engine: EngineClient = InProcessEngineClient(service)
+        start_runtime = partial(runner.load, spec)
     else:
         if runtime != "engine":
             raise ValueError(f"unsupported runtime mode: {runtime}")
         if enable_self_resubmit and kv_reservation != "blocks":
             raise ValueError("self-resubmit requires paged KV reservation")
-        performance_observer = InMemoryPerformanceObserver(spec.architecture)
-        if kv_reservation == "blocks":
-            cache_planner = _create_paged_cache_planner(
-                spec,
-                num_blocks=num_kv_blocks,
-                block_size=kv_block_size,
-                memory_fraction=kv_cache_memory_fraction,
-            )
-            # 同一容量对象同时交给逻辑分配和物理页池，避免两份配置漂移。
-            logical_cache = PagedKVCacheManager(
-                cache_planner,
-                # 乐观准入会回滚重算；强制缓存 prompt，避免每次都从位置 0 开始。
-                enable_prefix_caching=(enable_prefix_caching or enable_self_resubmit),
-            )
-            step_factory = partial(
-                PagedStepHandler,
-                cache_planner=cache_planner,
-                attention_backend=_create_paged_attention_backend(
-                    paged_attention_backend,
-                    spec,
-                ),
-            )
-        elif kv_reservation == "unbounded":
-            if enable_prefix_caching:
-                raise ValueError("prefix caching requires paged KV reservation")
-            if paged_attention_backend != "torch":
-                raise ValueError("Triton paged attention requires paged KV reservation")
-            # 连续缓存也直接读取模型声明的 KV 形状，这里只指定设备和数据类型。
-            logical_cache = UnboundedKVCacheManager()
-            step_factory = partial(
-                ContiguousStepHandler,
-                cache_config=ContiguousKVCacheConfig(
-                    dtype=spec.dtype,
-                    device=spec.device,
-                ),
-            )
-        else:
-            raise ValueError(f"unsupported KV reservation mode: {kv_reservation}")
-        if num_speculative_tokens:
-            if speculative_proposer == "chain":
-                proposer = NGramChainProposer(
-                    min_match_length=speculative_ngram_min,
-                    max_match_length=speculative_ngram_max,
-                )
-            else:
-                proposer = NGramTrieProposer(
-                    min_match_length=speculative_ngram_min,
-                    max_match_length=speculative_ngram_max,
-                    max_depth=speculative_max_depth,
-                    max_branching=speculative_max_branching,
-                )
-            decode_handler = SpeculativeDecodeHandler(
-                proposer,
-                sampler,
-                GreedyTreeAcceptanceSampler(),
-                performance_observer,
-            )
-            decoding_budget = DecodingBudget(
-                num_lookahead_tokens=num_speculative_tokens,
-                max_output_tokens=num_speculative_tokens + 1,
-            )
-        else:
-            decode_handler = StandardDecodeHandler(sampler)
-            decoding_budget = None
-        worker = LocalModelWorker(
-            runner,
-            step_factory,
-            decode_handler,
-        )
-        model_executor = LocalModelExecutor(
-            worker,
-            timer=_create_execution_timer(spec),
-        )
-        scheduler = TokenBudgetScheduler(
-            logical_cache,
+        config = _EngineRuntimeConfig(
+            kv_reservation=kv_reservation,
+            paged_attention_backend=paged_attention_backend,
             max_num_sequences=max_num_sequences,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
-            decoding_budget=decoding_budget,
+            num_kv_blocks=num_kv_blocks,
+            kv_block_size=kv_block_size,
+            kv_cache_memory_fraction=kv_cache_memory_fraction,
+            enable_prefix_caching=enable_prefix_caching,
+            num_speculative_tokens=num_speculative_tokens,
+            speculative_proposer=speculative_proposer,
+            speculative_ngram_min=speculative_ngram_min,
+            speculative_ngram_max=speculative_ngram_max,
+            speculative_max_depth=speculative_max_depth,
+            speculative_max_branching=speculative_max_branching,
             short_request_policy=short_request_policy,
-            self_resubmit_policy=(
-                SelfResubmitPolicy(
-                    max_resubmits=max_self_resubmits,
-                    strict_fallback_rolled_back_tokens=(
-                        self_resubmit_strict_fallback_rolled_back_tokens
-                    ),
-                    initial_extra_blocks=self_resubmit_initial_extra_blocks,
-                    kv_admission_watermark=self_resubmit_kv_admission_watermark,
-                )
-                if enable_self_resubmit
-                else None
-            ),
-        )
-        # 控制器始终收集 step 样本；没有全局 SLO 时，请求仍可携带自己的 TTFT 上限。
-        ttft_admission = PredictiveTTFTAdmission(
-            SlidingWindowStepLatencyPredictor(
-                window_size=ttft_prediction_window_size,
-                min_observations=ttft_prediction_min_observations,
-                prediction_quantile=ttft_prediction_quantile,
-            ),
             max_tolerable_ttft_seconds=max_tolerable_ttft_seconds,
+            ttft_prediction_window_size=ttft_prediction_window_size,
+            ttft_prediction_min_observations=ttft_prediction_min_observations,
+            ttft_prediction_quantile=ttft_prediction_quantile,
             max_pending_requests=max_pending_requests,
-            kv_cache_watermark=ttft_kv_cache_watermark,
+            ttft_kv_cache_watermark=ttft_kv_cache_watermark,
+            enable_self_resubmit=enable_self_resubmit,
+            max_self_resubmits=max_self_resubmits,
+            self_resubmit_strict_fallback_rolled_back_tokens=(
+                self_resubmit_strict_fallback_rolled_back_tokens
+            ),
+            self_resubmit_initial_extra_blocks=self_resubmit_initial_extra_blocks,
+            self_resubmit_kv_admission_watermark=self_resubmit_kv_admission_watermark,
         )
-        engine_core = EngineCore(
-            model_executor,
-            scheduler,
-            performance_observer=performance_observer,
-            ttft_admission=ttft_admission,
-        )
-        engine = engine_core
-        close_engine = engine_core.close
-        initialize_executor = model_executor.initialize
-        refresh_performance_metrics = engine_core.refresh_performance_metrics
-        performance_metrics = performance_observer
+        if engine_process:
+            # CUDA 初始化全部发生在 fork 之后，父进程从不持有模型或 KV tensor。
+            process_client = ProcessEngineClient(
+                partial(_create_started_engine_process_runtime, spec, config),
+                start_method="fork",
+            )
+            engine = process_client
+            performance_metrics = process_client
+            start_engine = process_client.start
+            close_engine = process_client.close
+        else:
+            engine_runtime = _create_engine_runtime(spec, config)
+            engine = engine_runtime.engine
+            performance_metrics = engine_runtime.performance_metrics
+            start_runtime = engine_runtime.start
+            close_engine = engine_runtime.engine.close
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # 模型加载成功后服务才会就绪；加载失败就停止启动。
-        runner.load(spec)
-        if initialize_executor is not None:
-            initialize_executor()
-        if refresh_performance_metrics is not None:
-            # CUDA KV 容量直到 executor 初始化后才确定，此时发布首个真实快照。
-            refresh_performance_metrics()
+        if start_runtime is not None:
+            start_runtime()
+        if start_engine is not None:
+            await start_engine()
         try:
             yield
         finally:
@@ -424,6 +525,11 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=tuple(_DTYPES), default="float32")
     parser.add_argument("--model-args", type=_json_object, default={})
     parser.add_argument("--runtime", choices=("reference", "engine"), default="reference")
+    parser.add_argument(
+        "--engine-process",
+        action="store_true",
+        help="run the stateful Engine and CUDA worker in a dedicated process",
+    )
     parser.add_argument(
         "--kv-reservation",
         choices=("blocks", "unbounded"),
@@ -564,6 +670,7 @@ def main() -> None:
             ),
             self_resubmit_initial_extra_blocks=(args.self_resubmit_initial_extra_blocks),
             self_resubmit_kv_admission_watermark=(args.self_resubmit_kv_admission_watermark),
+            engine_process=args.engine_process,
         ),
         host=args.host,
         port=args.port,
