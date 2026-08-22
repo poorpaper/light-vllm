@@ -172,7 +172,12 @@ def _create_execution_timer(spec: ModelSpec) -> ExecutionTimer:
     return WallClockExecutionTimer()
 
 
-def _create_engine_runtime(spec: ModelSpec, config: _EngineRuntimeConfig) -> _EngineRuntime:
+def _create_engine_runtime(
+    spec: ModelSpec,
+    config: _EngineRuntimeConfig,
+    *,
+    execute_inline: bool = False,
+) -> _EngineRuntime:
     """装配一个 Engine；模型与 CUDA 资源留到 ``start`` 再初始化。"""
 
     runner = create_runner()
@@ -278,6 +283,7 @@ def _create_engine_runtime(spec: ModelSpec, config: _EngineRuntimeConfig) -> _En
         scheduler,
         performance_observer=performance_observer,
         ttft_admission=ttft_admission,
+        execute_inline=execute_inline,
     )
 
     def start() -> None:
@@ -297,7 +303,7 @@ def _create_started_engine_process_runtime(
     spec: ModelSpec,
     config: _EngineRuntimeConfig,
 ) -> EngineProcessRuntime:
-    runtime = _create_engine_runtime(spec, config)
+    runtime = _create_engine_runtime(spec, config, execute_inline=True)
     runtime.start()
     return EngineProcessRuntime(
         engine=runtime.engine,

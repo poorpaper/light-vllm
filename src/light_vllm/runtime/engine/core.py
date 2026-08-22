@@ -145,9 +145,10 @@ class EngineCore:
         admission: RequestAdmission | None = None,
         performance_observer: PerformanceObserver | None = None,
         ttft_admission: TTFTAdmission | None = None,
+        execute_inline: bool = False,
     ) -> None:
         self._executor = executor
-        self._execution_lane = ExecutionLane(executor)
+        self._execution_lane = None if execute_inline else ExecutionLane(executor)
         self._scheduler = scheduler
         self._admission = admission or CapacityAdmission()
         self._ttft_admission = SafeTTFTAdmission(ttft_admission)
@@ -230,7 +231,8 @@ class EngineCore:
             if task is not None:
                 await _await_safe_boundary(task)
         finally:
-            self._execution_lane.close()
+            if self._execution_lane is not None:
+                self._execution_lane.close()
 
     async def _register(self, request: GenerateRequest) -> _RequestState:
         async with self._lock:
@@ -379,6 +381,11 @@ class EngineCore:
     async def _execute_batch(self, batch: ExecutionBatch) -> ExecutionOutput:
         """把同步 Executor 交给 Engine 私有的常驻执行线程。"""
 
+        if self._execution_lane is None:
+            output = self._executor.execute(batch)
+            # 独立 Engine 进程每步只让出一次，以接收准入、取消和输出 IPC。
+            await asyncio.sleep(0)
+            return output
         return await self._execution_lane.execute(batch)
 
     def _build_execution_batch_locked(self, scheduled: SchedulerOutput) -> ExecutionBatch:
