@@ -176,7 +176,7 @@ def _create_engine_runtime(
     spec: ModelSpec,
     config: _EngineRuntimeConfig,
     *,
-    execute_inline: bool = False,
+    cooperative_inline: bool = False,
 ) -> _EngineRuntime:
     """装配一个 Engine；模型与 CUDA 资源留到 ``start`` 再初始化。"""
 
@@ -283,7 +283,7 @@ def _create_engine_runtime(
         scheduler,
         performance_observer=performance_observer,
         ttft_admission=ttft_admission,
-        execute_inline=execute_inline,
+        cooperative_inline=cooperative_inline,
     )
 
     def start() -> None:
@@ -303,7 +303,7 @@ def _create_started_engine_process_runtime(
     spec: ModelSpec,
     config: _EngineRuntimeConfig,
 ) -> EngineProcessRuntime:
-    runtime = _create_engine_runtime(spec, config, execute_inline=True)
+    runtime = _create_engine_runtime(spec, config, cooperative_inline=True)
     runtime.start()
     return EngineProcessRuntime(
         engine=runtime.engine,

@@ -200,10 +200,12 @@ sequenceDiagram
 ```
 
 Engine 每次只允许一个 `PreparedStep` 在模型侧执行。它在锁内完成 schedule、构造不可变 `ExecutionBatch` 并取得
-lease，再由 Engine 私有的 `ExecutionLane` 交给同一个常驻线程执行；设备越过安全边界并释放 lease 后，再在一个
-锁区内提交上一轮 `CompletedStep`、应用可见 token 并准备下一轮。lane 只传递批次和结果，不拥有请求或 KV 状态。
-这个单在途状态机让取消与 KV 所有权保持明确，同时把相邻轮次的 finish、apply、schedule 和 Scheduler 快照收敛成
-一次原子状态推进，并省去每轮向进程级线程池重新派发同步 Executor 的控制开销。
+lease。默认路径由 Engine 私有的 `ExecutionLane` 交给同一个常驻线程执行；独立 Engine 进程则在自己的事件循环
+内协作式执行同步 Executor，避免每个 token 的跨线程提交开销。协作式路径在提交上一轮结果前推进已经到达的 IPC
+控制任务，并在下一步模型执行前推进已经发布的请求事件；检查点不等待墙钟，只给 ready task 公平执行机会。
+设备越过安全边界并释放 lease 后，Engine 仍在一个锁区内提交上一轮 `CompletedStep`、应用可见 token 并准备
+下一轮。两条执行路径都只传递批次和结果，不拥有请求或 KV 状态。这个单在途状态机让取消与 KV 所有权保持明确，
+并把相邻轮次的 finish、apply、schedule 和 Scheduler 快照收敛成一次原子状态推进。
 
 执行失败时 Engine 移除本轮请求。连续 Step Handler 的请求级 tensor 由 lease 延迟销毁；分页页池是进程级全局
 资源，执行中的请求取消时由 Scheduler 把 block ID 延迟到安全边界后归还，防止物理页被过早复用。

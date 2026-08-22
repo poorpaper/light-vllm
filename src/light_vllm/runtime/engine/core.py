@@ -130,6 +130,20 @@ async def _await_safe_boundary(task: asyncio.Task[None]) -> None:
         raise
 
 
+async def _next_event_loop_turn() -> None:
+    """等当前已就绪任务前进一轮，不引入墙钟等待。"""
+
+    loop = asyncio.get_running_loop()
+    checkpoint: asyncio.Future[None] = loop.create_future()
+
+    def complete() -> None:
+        if not checkpoint.done():
+            checkpoint.set_result(None)
+
+    loop.call_soon(complete)
+    await checkpoint
+
+
 class EngineCore:
     """按 ``schedule → execute → update`` 驱动所有活动请求。
 
@@ -145,10 +159,11 @@ class EngineCore:
         admission: RequestAdmission | None = None,
         performance_observer: PerformanceObserver | None = None,
         ttft_admission: TTFTAdmission | None = None,
-        execute_inline: bool = False,
+        cooperative_inline: bool = False,
     ) -> None:
         self._executor = executor
-        self._execution_lane = None if execute_inline else ExecutionLane(executor)
+        self._cooperative_inline = cooperative_inline
+        self._execution_lane = None if cooperative_inline else ExecutionLane(executor)
         self._scheduler = scheduler
         self._admission = admission or CapacityAdmission()
         self._ttft_admission = SafeTTFTAdmission(ttft_admission)
@@ -296,11 +311,21 @@ class EngineCore:
         try:
             completed: _CompletedStep | None = None
             while True:
+                if self._cooperative_inline:
+                    # IPC reader 先唤醒 command pump，pump 再创建请求 stream。
+                    # 两轮只推进已经 ready 的控制任务，不增加固定延迟。
+                    await _next_event_loop_turn()
+                    await _next_event_loop_turn()
+
                 async with self._lock:
                     prepared = self._advance_locked(completed)
                     completed = None
                     if prepared is None:
                         return
+
+                if self._cooperative_inline:
+                    # apply 已经发布 token；执行下一步前先让现有 stream 消费它。
+                    await _next_event_loop_turn()
 
                 # 锁内只生成计划并保留缓存；耗时的模型计算在线程和锁外执行。
                 try:
@@ -379,13 +404,10 @@ class EngineCore:
             return _CompletedStep(prepared=prepared, error=exc)
 
     async def _execute_batch(self, batch: ExecutionBatch) -> ExecutionOutput:
-        """把同步 Executor 交给 Engine 私有的常驻执行线程。"""
+        """按装配好的 inline 或私有 lane 边界执行一个模型步骤。"""
 
         if self._execution_lane is None:
-            output = self._executor.execute(batch)
-            # 独立 Engine 进程每步只让出一次，以接收准入、取消和输出 IPC。
-            await asyncio.sleep(0)
-            return output
+            return self._executor.execute(batch)
         return await self._execution_lane.execute(batch)
 
     def _build_execution_batch_locked(self, scheduled: SchedulerOutput) -> ExecutionBatch:

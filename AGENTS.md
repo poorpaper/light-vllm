@@ -25,7 +25,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
 - `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流；每次至多保留一个不可变
   `PreparedStep` 在模型侧执行。上一轮结果、执行结束状态和下一轮计划在同一个锁区原子推进，并只发布一次稳定
-  Scheduler 快照。同步 Executor 固定在 Engine 私有的单在途 `ExecutionLane`，不再逐轮提交到进程级线程池。
+  Scheduler 快照。默认同步 Executor 固定在 Engine 私有的单在途 `ExecutionLane`；独立 Engine 进程使用协作式
+  inline 执行，在状态推进前接收已到达控制任务，并在下一步模型执行前交付已发布事件，不引入墙钟 sleep。
 - `TokenBudgetScheduler` 用统一 token budget 调度 prompt、chunked prefill 和 decode；可选短请求策略同时预留
   scheduled token、KV token slot 和 sequence，首 token 后回到通用 round-robin，常规请求用真实 waiting step aging。
 - KV manager 管理逻辑 reservation；`UnboundedKVCacheManager` 不限制容量或产生位置，
@@ -205,7 +206,8 @@ Scheduler 延迟归还其 block IDs，直到该同步执行步骤越过安全边
 `CompletedStep` 事实；lease 释放后，Engine 在一个锁区内完成上一轮提交并准备下一轮，不允许 Executor 或
 Observer 反向修改请求和 Scheduler 状态。`ExecutionLane` 只跨线程传递 `ExecutionBatch` 与
 `ExecutionOutput`，不得提交 Scheduler 状态或提前释放 lease；Engine 关闭时先等待 driver 越过安全边界，再回收
-lane 的常驻线程。
+lane 的常驻线程。独立 Engine 进程可以省略 lane，但必须在同步模型步骤之间通过事件循环检查点给 IPC command
+pump 和请求 stream 公平执行机会；检查点只能推进已经 ready 的任务，不得用固定时长 sleep 调节吞吐或 TTFT。
 
 `TTFTAdmission` 是控制组件：在 Engine 锁内读取一次 Scheduler 快照做准入，在 step 完成后消费真实延迟；
 `PerformanceObserver` 只记录同一事实。投机细节通过独立 `SpeculationObserver` 端口上报，包括候选/命中节点、

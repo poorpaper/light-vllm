@@ -9,6 +9,7 @@ import pytest
 
 from light_vllm import (
     GenerateRequest,
+    GenerateResult,
     GenerationError,
     GenerationOverloadedError,
     TokenGenerated,
@@ -129,6 +130,7 @@ def _engine(
     token_budget: int = 2,
     performance_observer: InMemoryPerformanceObserver | None = None,
     ttft_admission: TTFTAdmission | None = None,
+    cooperative_inline: bool = False,
 ) -> EngineCore:
     scheduler = TokenBudgetScheduler(
         PagedKVCacheManager(FixedKVBlockCapacity(num_blocks=16, block_size=2)),
@@ -145,7 +147,66 @@ def _engine(
         scheduler,
         performance_observer=performance_observer,
         ttft_admission=ttft_admission,
+        cooperative_inline=cooperative_inline,
     )
+
+
+def test_inline_driver_publishes_a_token_before_starting_the_next_step() -> None:
+    async def run() -> None:
+        executor = RecordingExecutor()
+        engine = _engine(executor, cooperative_inline=True)
+        events = engine.stream(GenerateRequest(input_ids=(1,), max_new_tokens=2))
+
+        event = await anext(events)
+
+        assert isinstance(event, TokenGenerated)
+        assert len(executor.history) == 1
+        await events.aclose()
+        await engine.close()
+
+    asyncio.run(run())
+
+
+def test_inline_driver_admits_ready_control_work_before_the_next_schedule() -> None:
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        second_task: asyncio.Task[GenerateResult] | None = None
+
+        def start_second_request() -> None:
+            nonlocal second_task
+            second_task = asyncio.create_task(
+                engine.generate(GenerateRequest(input_ids=(10,), max_new_tokens=1))
+            )
+
+        def relay_second_request() -> None:
+            # 复现进程 reader -> command pump -> stream task 的两级事件循环交接。
+            loop.call_soon(start_second_request)
+
+        class RelayingExecutor(RecordingExecutor):
+            def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+                output = super().execute(batch)
+                if len(self.history) == 1:
+                    loop.call_soon(relay_second_request)
+                return output
+
+        executor = RelayingExecutor()
+        engine = _engine(executor, token_budget=2, cooperative_inline=True)
+
+        first = await engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=3))
+        assert second_task is not None
+        second = await second_task
+        await engine.close()
+
+        assert first.generated_token_ids == (2, 3, 4)
+        assert second.generated_token_ids == (11,)
+        first_batch_with_second_request = next(
+            index
+            for index, request_inputs in enumerate(executor.history)
+            if (10,) in request_inputs
+        )
+        assert first_batch_with_second_request == 1
+
+    asyncio.run(run())
 
 
 def test_engine_reports_ttft_and_tpot_at_visible_token_boundaries() -> None:
