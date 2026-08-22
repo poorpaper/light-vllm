@@ -97,6 +97,16 @@ class PagedAttentionMetadata:
             for layout in self.query_layouts
         )
 
+    @property
+    def request_indices(self) -> tuple[int, ...]:
+        """为每个 packed token 标记其请求下标。"""
+
+        return tuple(
+            request_index
+            for request_index, length in enumerate(self.query_lengths)
+            for _ in range(length)
+        )
+
     def slot_mapping(
         self,
         *,
@@ -178,12 +188,7 @@ class PagedAttentionMetadata:
     def request_indices_tensor(self, *, device: torch.device) -> Tensor:
         """为每个 packed token 标记其请求下标。"""
 
-        request_indices = [
-            request_index
-            for request_index, length in enumerate(self.query_lengths)
-            for _ in range(length)
-        ]
-        return torch.tensor(request_indices, dtype=torch.int32, device=device)
+        return torch.tensor(self.request_indices, dtype=torch.int32, device=device)
 
     def visible_logical_positions(
         self,

@@ -14,6 +14,7 @@ from light_vllm.modeling.models.interfaces import (
     ModelSession,
     ModelSessionProvider,
 )
+from light_vllm.runtime.execution.cuda_staging import SingleStepCudaStagingBuffer
 from light_vllm.runtime.execution.dense_attention import (
     DenseAttentionMetadata,
     TorchDenseAttention,
@@ -69,6 +70,21 @@ def _requested_logit_indices(request: ModelStepRequest) -> tuple[int, ...]:
     return request.logit_query_indices
 
 
+def _validate_positions(
+    positions: list[int] | tuple[int, ...],
+    max_model_tokens: int | None,
+) -> None:
+    """执行端从 CPU 语义布局生成位置后，只在 H2D 前验证一次。"""
+
+    if any(
+        type(position) is not int
+        or position < 0
+        or (max_model_tokens is not None and position >= max_model_tokens)
+        for position in positions
+    ):
+        raise ExecutionError("query position exceeds the model token range")
+
+
 class ContiguousStepHandler:
     """为每个请求维护连续 KV tensor，作为简单的正确性基线。"""
 
@@ -115,11 +131,13 @@ class ContiguousStepHandler:
                     dtype=torch.long,
                     device=self._device,
                 )
+                semantic_position_ids = semantic_positions(
+                    request.query_layout,
+                    prefix_length=request.num_computed_tokens,
+                )
+                _validate_positions(semantic_position_ids, model.max_model_tokens)
                 positions = torch.tensor(
-                    semantic_positions(
-                        request.query_layout,
-                        prefix_length=request.num_computed_tokens,
-                    ),
+                    semantic_position_ids,
                     dtype=torch.long,
                     device=self._device,
                 )
@@ -138,6 +156,7 @@ class ContiguousStepHandler:
                         positions=positions,
                         attention=attention,
                         logit_query_indices=request.logit_query_indices,
+                        positions_are_validated=True,
                     ),
                 )
                 # AttentionContext 先暂存各层 K/V；整个 forward 成功后再统一追加。
@@ -191,6 +210,11 @@ class PagedStepHandler:
         self._cache = PagedKVCache(model_spec, cache_config)
         self._attention_backend = attention_backend
         self._device = cache_config.device
+        self._input_staging = (
+            SingleStepCudaStagingBuffer(self._device, torch.long)
+            if self._device.type == "cuda"
+            else None
+        )
 
     @property
     def max_kv_cache_tokens(self) -> int:
@@ -238,8 +262,15 @@ class PagedStepHandler:
             requested_logits_per_request.append(len(requested))
             global_logit_indices.extend(start + index for index in requested)
             query_start_loc.append(start + len(request.query_token_ids))
-        input_ids = torch.tensor(input_token_ids, dtype=torch.long, device=self._device)
-        positions = torch.tensor(positions_by_token, dtype=torch.long, device=self._device)
+        _validate_positions(positions_by_token, model.max_model_tokens)
+        if self._input_staging is None:
+            input_ids = torch.tensor(input_token_ids, dtype=torch.long, device=self._device)
+            positions = torch.tensor(positions_by_token, dtype=torch.long, device=self._device)
+        else:
+            input_ids, positions = self._input_staging.copy_groups(
+                input_token_ids,
+                positions_by_token,
+            )
 
         metadata = PagedAttentionMetadata(
             block_tables=tuple(request.block_ids or () for request in batch.requests),
@@ -261,6 +292,7 @@ class PagedStepHandler:
                 query_start_loc=tuple(query_start_loc),
                 attention=attention,
                 logit_query_indices=tuple(global_logit_indices),
+                positions_are_validated=True,
             ),
         )
         expected_layers = frozenset(layer.layer_id for layer in self._cache.model_spec.layers)

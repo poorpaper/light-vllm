@@ -725,8 +725,16 @@ def main() -> None:
         raise RuntimeError("LIGHT_VLLM_CPU_PROFILE_DETAIL must be lean or full")
     profiler = _StageProfiler(Path(raw_output), detail=detail)
     _install(profiler, detail=detail)
+    owner_pid = os.getpid()
+    child_only = os.environ.get("LIGHT_VLLM_CPU_PROFILE_CHILD_ONLY") == "1"
+
+    def owns_profile() -> bool:
+        # fork 后子进程保留父进程 PID；只让真正持有 Engine/CUDA 的进程采样和落盘。
+        return not child_only or os.getpid() != owner_pid
 
     def dump_profile_safely() -> None:
+        if not owns_profile():
+            return
         try:
             profiler.dump()
         except Exception:
@@ -736,7 +744,8 @@ def main() -> None:
             )
 
     def reset_profile(_signum: int, _frame: Any) -> None:
-        profiler.reset()
+        if owns_profile():
+            profiler.reset()
 
     def dump_profile(_signum: int, _frame: Any) -> None:
         # JSON aggregation can take seconds for a full trace.  Returning from the

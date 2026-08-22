@@ -25,6 +25,11 @@ run_one() {
   local root=$2
   local round=$3
   local output=${OUTPUT_ROOT}/${label}-r${round}
+  local engine_process=${BASELINE_ENGINE_PROCESS:-0}
+  if [[ "$label" == candidate ]]; then
+    engine_process=${CANDIDATE_ENGINE_PROCESS:-0}
+  fi
+  ENGINE_PROCESS="$engine_process" \
   PROFILE_DETAIL=off \
   RUNS=1 \
   HARNESS_ROOT="$HARNESS_ROOT" \

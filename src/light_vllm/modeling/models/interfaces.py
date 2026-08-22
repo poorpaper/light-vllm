@@ -39,6 +39,8 @@ class ForwardBatch:
     attention: AttentionContext | None = None
     # None 表示消费全部 token；否则只投影一维 token 流中的指定行。
     logit_query_indices: tuple[int, ...] | None = None
+    # Step Handler 已在 CPU 侧验证绝对位置时，模型不再启动重复的 CUDA 检查。
+    positions_are_validated: bool = False
 
     def __post_init__(self) -> None:
         if self.input_ids.ndim != 1 or self.input_ids.numel() == 0:
@@ -74,12 +76,15 @@ class ForwardBatch:
             raise ValueError("positions must have the same shape as input_ids")
         if positions.dtype != torch.long or positions.device != self.input_ids.device:
             raise ValueError("positions must use torch.long on the input_ids device")
-        positions_non_negative = torch.all(positions >= 0)
-        if positions.device.type == "cuda":
-            # 契约校验留在当前 CUDA stream，不在模型提交前强制 CPU 同步。
-            torch._assert_async(positions_non_negative, "positions must not be negative")
-        elif not bool(positions_non_negative):
-            raise ValueError("positions must not be negative")
+        if type(self.positions_are_validated) is not bool:
+            raise TypeError("positions_are_validated must be a boolean")
+        if not self.positions_are_validated:
+            positions_non_negative = torch.all(positions >= 0)
+            if positions.device.type == "cuda":
+                # 契约校验留在当前 CUDA stream，不在模型提交前强制 CPU 同步。
+                torch._assert_async(positions_non_negative, "positions must not be negative")
+            elif not bool(positions_non_negative):
+                raise ValueError("positions must not be negative")
         logit_query_indices = self.logit_query_indices
         if logit_query_indices is not None:
             logit_query_indices = tuple(logit_query_indices)
@@ -120,6 +125,12 @@ def select_query_states(hidden_states: Tensor, batch: ForwardBatch) -> Tensor:
         return hidden_states
     if not indices:
         return hidden_states[:0]
+    if len(indices) == hidden_states.shape[0] and all(
+        index == row for row, index in enumerate(indices)
+    ):
+        # 普通 decode 请求每行都需要 logits；直接复用 hidden states，避免一次
+        # 小 tensor H2D 和无意义的 index_select。
+        return hidden_states
     gather_indices = torch.tensor(indices, dtype=torch.long, device=hidden_states.device)
     return hidden_states.index_select(0, gather_indices)
 

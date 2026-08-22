@@ -30,13 +30,15 @@ def _caches(
     dtype: torch.dtype,
     *,
     block_size: int = 2,
+    num_query_heads: int = 4,
+    num_kv_heads: int = 2,
 ) -> tuple[PagedKVCache, PagedKVCache]:
     model_spec = ModelKVCacheSpec(
         (
             AttentionLayerSpec(
                 layer_id="attention",
-                num_query_heads=4,
-                num_kv_heads=2,
+                num_query_heads=num_query_heads,
+                num_kv_heads=num_kv_heads,
                 head_size=head_size,
             ),
         )
@@ -80,6 +82,20 @@ def _assert_matches_torch(
     torch.cuda.synchronize()
     tolerance = 3e-3 if query.dtype == torch.float16 else 2e-2
     torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    slots = metadata.slot_mapping(
+        block_size=triton_cache.config.block_size,
+        device=_DEVICE,
+    )
+    triton_layer = triton_cache.layer("attention")
+    num_slots = triton_cache.config.num_blocks * triton_cache.config.block_size
+    torch.testing.assert_close(
+        triton_layer.keys.view(num_slots, *key.shape[1:]).index_select(0, slots),
+        key,
+    )
+    torch.testing.assert_close(
+        triton_layer.values.view(num_slots, *value.shape[1:]).index_select(0, slots),
+        value,
+    )
 
 
 @pytest.mark.parametrize("head_size", (32, 80, 128, 256))
@@ -110,6 +126,60 @@ def test_triton_paged_attention_matches_packed_gqa_prefill(
     query = torch.randn(9, 4, head_size, device=_DEVICE, dtype=dtype)
     key = torch.randn(9, 2, head_size, device=_DEVICE, dtype=dtype)
     value = torch.randn(9, 2, head_size, device=_DEVICE, dtype=dtype)
+
+    _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)
+
+
+def test_triton_paged_attention_matches_qwen_gqa_group() -> None:
+    torch.manual_seed(20260822)
+    torch_cache, triton_cache = _caches(
+        128,
+        torch.bfloat16,
+        block_size=4,
+        num_query_heads=28,
+        num_kv_heads=4,
+    )
+    metadata = PagedAttentionMetadata(
+        block_tables=((7, 1), (4,)),
+        num_computed_tokens=(0, 0),
+        query_layouts=_layouts(6, 3),
+    )
+    query = torch.randn(9, 28, 128, device=_DEVICE, dtype=torch.bfloat16)
+    key = torch.randn(9, 4, 128, device=_DEVICE, dtype=torch.bfloat16)
+    value = torch.randn(9, 4, 128, device=_DEVICE, dtype=torch.bfloat16)
+
+    _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)
+
+
+def test_triton_paged_attention_matches_qwen_gqa_across_history_chunks() -> None:
+    torch.manual_seed(20260822)
+    torch_cache, triton_cache = _caches(
+        128,
+        torch.bfloat16,
+        block_size=16,
+        num_query_heads=28,
+        num_kv_heads=4,
+    )
+    prefix_length = 130
+    prefix_key = torch.randn(prefix_length, 4, 128, device=_DEVICE, dtype=torch.bfloat16)
+    prefix_value = torch.randn(
+        prefix_length,
+        4,
+        128,
+        device=_DEVICE,
+        dtype=torch.bfloat16,
+    )
+    prefix_slots = torch.arange(prefix_length, device=_DEVICE)
+    torch_cache.write("attention", prefix_key, prefix_value, prefix_slots)
+    triton_cache.write("attention", prefix_key, prefix_value, prefix_slots)
+    metadata = PagedAttentionMetadata(
+        block_tables=(tuple(range(9)),),
+        num_computed_tokens=(prefix_length,),
+        query_layouts=_layouts(1),
+    )
+    query = torch.randn(1, 28, 128, device=_DEVICE, dtype=torch.bfloat16)
+    key = torch.randn(1, 4, 128, device=_DEVICE, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, 128, device=_DEVICE, dtype=torch.bfloat16)
 
     _assert_matches_torch(torch_cache, triton_cache, metadata, query, key, value)
 

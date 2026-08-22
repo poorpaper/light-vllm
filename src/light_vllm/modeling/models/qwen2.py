@@ -194,15 +194,20 @@ class Qwen2MLP(nn.Module):
             **factory_kwargs,
         )
         self.register_buffer("_merged_gate_up_weight", None, persistent=False)
+        self.register_buffer("_merged_gate_up_weight_t", None, persistent=False)
+        self.register_buffer("_down_proj_weight_t", None, persistent=False)
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         merged_weight = self._merged_gate_up_weight
-        if merged_weight is None:
+        merged_weight_t = self._merged_gate_up_weight_t
+        down_weight_t = self._down_proj_weight_t
+        if merged_weight is None or merged_weight_t is None or down_weight_t is None:
             gate = self.gate_proj(hidden_states)
             up = self.up_proj(hidden_states)
+            return self.down_proj(silu_and_mul(gate, up))
         else:
-            gate, up = F.linear(hidden_states, merged_weight).chunk(2, dim=-1)
-        return self.down_proj(silu_and_mul(gate, up))
+            gate, up = torch.mm(hidden_states, merged_weight_t).chunk(2, dim=-1)
+        return torch.mm(silu_and_mul(gate, up), down_weight_t)
 
     def prepare_for_inference(self) -> None:
         """Pack checkpoint-compatible Gate/Up weights into one inference GEMM."""
@@ -212,6 +217,9 @@ class Qwen2MLP(nn.Module):
                 (self.gate_proj.weight, self.up_proj.weight),
                 dim=0,
             ).contiguous()
+            # 只缓存共享存储的转置 view，避免每个 step 为固定权重重复建 view。
+            self._merged_gate_up_weight_t = self._merged_gate_up_weight.t()
+            self._down_proj_weight_t = self.down_proj.weight.t()
 
 
 class Qwen2Attention(nn.Module):
@@ -257,7 +265,9 @@ class Qwen2Attention(nn.Module):
             **factory_kwargs,
         )
         self.register_buffer("_merged_qkv_weight", None, persistent=False)
+        self.register_buffer("_merged_qkv_weight_t", None, persistent=False)
         self.register_buffer("_merged_qkv_bias", None, persistent=False)
+        self.register_buffer("_o_proj_weight_t", None, persistent=False)
 
     def forward(
         self,
@@ -268,13 +278,20 @@ class Qwen2Attention(nn.Module):
     ) -> Tensor:
         num_tokens = hidden_states.shape[0]
         merged_weight = self._merged_qkv_weight
+        merged_weight_t = self._merged_qkv_weight_t
         merged_bias = self._merged_qkv_bias
-        if merged_weight is None or merged_bias is None:
+        output_weight_t = self._o_proj_weight_t
+        if (
+            merged_weight is None
+            or merged_weight_t is None
+            or merged_bias is None
+            or output_weight_t is None
+        ):
             query_projection = self.q_proj(hidden_states)
             key_projection = self.k_proj(hidden_states)
             value_projection = self.v_proj(hidden_states)
         else:
-            projections = F.linear(hidden_states, merged_weight, merged_bias)
+            projections = torch.addmm(merged_bias, hidden_states, merged_weight_t)
             query_size = self._num_query_heads * self._head_size
             kv_size = self._num_kv_heads * self._head_size
             query_projection, key_projection, value_projection = projections.split(
@@ -305,7 +322,12 @@ class Qwen2Attention(nn.Module):
             values,
             scale=self._scale,
         )
-        output = self.o_proj(attended.reshape(num_tokens, -1))
+        attended = attended.reshape(num_tokens, -1)
+        output = (
+            self.o_proj(attended)
+            if output_weight_t is None
+            else torch.mm(attended, output_weight_t)
+        )
         return output
 
     def prepare_for_inference(self) -> None:
@@ -316,10 +338,12 @@ class Qwen2Attention(nn.Module):
                 (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
                 dim=0,
             ).contiguous()
+            self._merged_qkv_weight_t = self._merged_qkv_weight.t()
             self._merged_qkv_bias = torch.cat(
                 (self.q_proj.bias, self.k_proj.bias, self.v_proj.bias),
                 dim=0,
             ).contiguous()
+            self._o_proj_weight_t = self.o_proj.weight.t()
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -432,6 +456,7 @@ class Qwen2ForCausalLM(nn.Module):
         )
         self.register_buffer("_rope_cosines", None, persistent=False)
         self.register_buffer("_rope_sines", None, persistent=False)
+        self.register_buffer("_lm_head_weight_t", None, persistent=False)
         self.apply(self._initialize_weights)
         if config.tie_word_embeddings:
             # 输入词向量和输出分类层可以共用同一份参数。
@@ -481,14 +506,15 @@ class Qwen2ForCausalLM(nn.Module):
 
         positions = batch.positions
         assert positions is not None
-        positions_in_range = torch.all(positions < self.config.max_position_embeddings)
-        if positions.device.type == "cuda":
-            torch._assert_async(
-                positions_in_range,
-                "Qwen2 position exceeds max_position_embeddings",
-            )
-        elif not bool(positions_in_range):
-            raise ValueError("Qwen2 position exceeds max_position_embeddings")
+        if not batch.positions_are_validated:
+            positions_in_range = torch.all(positions < self.config.max_position_embeddings)
+            if positions.device.type == "cuda":
+                torch._assert_async(
+                    positions_in_range,
+                    "Qwen2 position exceeds max_position_embeddings",
+                )
+            elif not bool(positions_in_range):
+                raise ValueError("Qwen2 position exceeds max_position_embeddings")
         hidden_states = self.model.embed_tokens(batch.input_ids)
         cosines, sines = self._rotary_embeddings(positions, hidden_states.dtype)
         residual = None
@@ -508,7 +534,11 @@ class Qwen2ForCausalLM(nn.Module):
             self.model.norm.eps,
         )
         hidden_states = select_query_states(hidden_states, batch)
-        logits = self.lm_head(hidden_states)
+        logits = (
+            self.lm_head(hidden_states)
+            if self._lm_head_weight_t is None
+            else torch.mm(hidden_states, self._lm_head_weight_t)
+        )
         return ModelOutput(logits=logits)
 
     def prepare_for_inference(self) -> None:
@@ -516,6 +546,8 @@ class Qwen2ForCausalLM(nn.Module):
 
         for layer in self.model.layers:
             layer.prepare_for_inference()
+        # lm_head 与 embedding 可能共享参数；转置 view 不复制这份大权重。
+        self._lm_head_weight_t = self.lm_head.weight.t()
         positions = torch.arange(
             self.config.max_position_embeddings,
             dtype=torch.float32,

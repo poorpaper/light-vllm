@@ -43,7 +43,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - `DraftTree` 只表达候选父子关系；`QueryLayout` 把正式输入与草稿树降为一次 model step 的位置和可见性事实。
   Dense/Paged 后端只允许 query 读取已提交前缀、祖先和自身；验收后 Step Handler 在返回前压实命中路径 KV。
 - Step Handler 把不同请求的 query 拼成一维 token 流；`ForwardBatch.query_start_loc` 保存请求边界，Q/K/V、
-  slot mapping 和模型 hidden states 都不包含 padding 行。`QueryLayout` 仍只表达单请求内部语义。
+  slot mapping 和模型 hidden states 都不包含 padding 行。Step Handler 在 H2D 前验证由语义布局生成的绝对位置，
+  `ForwardBatch` 用显式信任标记避免模型在 CUDA 热路径重复检查。`QueryLayout` 仍只表达单请求内部语义。
 - 固定页数或 CUDA 空闲显存策略在模型加载后解析成同一个分页容量对象，同时供逻辑 manager 与物理页池使用。
 - 可缓存模型只通过 `AttentionContext` 执行 attention，不内置 dense/paged fallback。reference 与连续缓存使用
   `TorchDenseAttention`；分页缓存默认使用逐页读取 K/V 的 `TorchPagedAttention`，也可装配直接读取 block table、
@@ -149,7 +150,9 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 24. 不维护未发布架构的历史兼容别名、空 facade 或旧路径。
 25. `ForwardBatch.positions` 表示请求内绝对位置；连续与分页 Step Handler 都必须显式生成，模型不得从批次形态猜测。
     `input_ids`、`positions` 和 attention Q/K/V 必须使用 token-major 一维布局；`query_start_loc` 必须从 0 开始、
-    严格递增并以总 query token 数结束。不得在模型热路径重新引入 `[batch, max_query_width]` padding。
+    严格递增并以总 query token 数结束。只有 Step Handler 在 CPU 侧按模型上限验证过位置后，才可设置
+    `positions_are_validated=True`；其他调用者仍由 `ForwardBatch` 和模型检查。不得在模型热路径重新引入
+    `[batch, max_query_width]` padding。
     `ModelStepOutput.logits_start_loc` 允许空请求切片，但必须覆盖连续 logits 的全部行。
 26. 使用外部 KV 的模型必须声明 `ModelKVCacheSpec`；连续和分页 Step Handler 都从该规格初始化物理缓存，不再接受
     第二份层数、KV head 数或 head size 配置。

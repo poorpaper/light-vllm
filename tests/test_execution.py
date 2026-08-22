@@ -46,6 +46,7 @@ from light_vllm.runtime.execution.worker import (
     ContiguousStepHandler,
     PagedStepHandler,
     StandardDecodeHandler,
+    _validate_positions,
 )
 from light_vllm.runtime.generation import GenerateRequest
 from light_vllm.runtime.kv_cache import (
@@ -291,6 +292,15 @@ def _dense_tiny_logits(model, token_ids: tuple[int, ...]) -> torch.Tensor:
             attention=attention,
         )
     ).logits
+
+
+def test_step_handler_validates_semantic_positions_before_h2d() -> None:
+    _validate_positions((0, 7), max_model_tokens=8)
+    _validate_positions((0, 8), max_model_tokens=None)
+
+    for positions in ((-1,), (8,), (True,)):
+        with pytest.raises(ExecutionError, match="position"):
+            _validate_positions(positions, max_model_tokens=8)
 
 
 def test_reference_executor_delegates_token_choice_to_sampler() -> None:

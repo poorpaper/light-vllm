@@ -6,7 +6,7 @@ from torch import nn
 
 from light_vllm import ForwardBatch, ModelOutput, ModelSpec, create_catalog, create_runner
 from light_vllm.modeling.attention import AttentionLayerSpec, ModelKVCacheSpec
-from light_vllm.modeling.models.interfaces import ModelFactory
+from light_vllm.modeling.models.interfaces import ModelFactory, select_query_states
 
 
 def tiny_spec(**changes: object) -> ModelSpec:
@@ -48,6 +48,15 @@ def test_forward_batch_validates_explicit_positions() -> None:
     )
 
     torch.testing.assert_close(batch.positions, torch.tensor([4, 5]))
+
+
+def test_forward_batch_requires_a_boolean_position_trust_marker() -> None:
+    with pytest.raises(TypeError, match="positions_are_validated"):
+        ForwardBatch(
+            input_ids=torch.tensor([1]),
+            positions=torch.tensor([0]),
+            positions_are_validated=1,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(
@@ -118,6 +127,16 @@ def test_model_projects_only_requested_query_rows() -> None:
     torch.testing.assert_close(selected[0], full[2])
     torch.testing.assert_close(selected[1], full[4])
     assert skipped.shape == (0, 32)
+
+
+def test_model_reuses_states_when_every_query_row_is_requested() -> None:
+    hidden_states = torch.randn(3, 8)
+    batch = ForwardBatch(
+        input_ids=torch.tensor([1, 2, 3]),
+        logit_query_indices=(0, 1, 2),
+    )
+
+    assert select_query_states(hidden_states, batch) is hidden_states
 
 
 def test_forward_batch_rejects_invalid_logit_query_indices() -> None:

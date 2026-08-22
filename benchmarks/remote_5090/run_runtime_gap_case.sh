@@ -148,6 +148,20 @@ PY
   fi
 }
 
+light_profile_pid() {
+  if [[ "${ENGINE_PROCESS:-0}" != 1 ]]; then
+    printf '%s\n' "$SERVER_PID"
+    return
+  fi
+  local children=()
+  mapfile -t children < <(pgrep -P "$SERVER_PID")
+  if [[ ${#children[@]} -ne 1 ]]; then
+    echo "expected one Engine child of $SERVER_PID, found ${#children[@]}" >&2
+    return 1
+  fi
+  printf '%s\n' "${children[0]}"
+}
+
 MAX_SEQS=16
 KV_BLOCKS=$((KV_TOKENS / 16))
 KV_BYTES=$((KV_TOKENS * 57344))
@@ -242,6 +256,10 @@ case "$MODE" in
     ;;
 esac
 
+if [[ "$BACKEND" == light-vllm && "$PROFILE_DETAIL" != off && "${ENGINE_PROCESS:-0}" == 1 ]]; then
+  SERVER_ENV+=(LIGHT_VLLM_CPU_PROFILE_CHILD_ONLY=1)
+fi
+
 nohup env "${SERVER_ENV[@]}" "${SERVER[@]}" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -301,7 +319,8 @@ done
 
 if [[ "$PROFILE_DETAIL" != off ]]; then
   if [[ "$BACKEND" == light-vllm ]]; then
-    kill -USR1 "$SERVER_PID"
+    LIGHT_PROFILE_PID=$(light_profile_pid)
+    kill -USR1 "$LIGHT_PROFILE_PID"
   else
     for pid_file in "${PROFILE_PREFIX}."*.pid; do
       [[ -f "$pid_file" ]] || continue
@@ -311,7 +330,7 @@ if [[ "$PROFILE_DETAIL" != off ]]; then
   fi
   run_case profile
   if [[ "$BACKEND" == light-vllm ]]; then
-    kill -USR2 "$SERVER_PID"
+    kill -USR2 "$LIGHT_PROFILE_PID"
   else
     for pid_file in "${PROFILE_PREFIX}."*.pid; do
       [[ -f "$pid_file" ]] || continue

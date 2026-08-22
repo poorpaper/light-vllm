@@ -124,11 +124,11 @@ class PagedLayerCache:
 
 @dataclass(frozen=True, slots=True)
 class PagedKVWriteMapping:
-    """A slot mapping normalized once for every layer in one model step."""
+    """一次模型 step 内供所有层复用的物理写入位置。"""
 
-    active: Tensor
-    source_indices: Tensor
     slots: Tensor
+    num_query_tokens: int
+    source_indices: Tensor | None = None
 
 
 class PagedKVCache:
@@ -179,9 +179,18 @@ class PagedKVCache:
             raise KVCacheError("slot mapping must have one entry per packed query token")
         if slot_mapping.device != self._config.device:
             raise KVCacheError("slot mapping device must match the cache")
-        active = slot_mapping >= 0
-        source_indices = torch.nonzero(active.flatten(), as_tuple=False).flatten()
-        slots = slot_mapping.flatten().index_select(0, source_indices).to(torch.long)
+        flat_mapping = slot_mapping.flatten()
+        if not validate:
+            # PagedAttentionMetadata 已证明每个 packed query 都有唯一合法 slot。
+            # 热路径直接复用 dense mapping，避免每步额外的 CUDA nonzero/index_select。
+            return PagedKVWriteMapping(
+                slots=flat_mapping.to(torch.long),
+                num_query_tokens=flat_mapping.numel(),
+            )
+
+        active = flat_mapping >= 0
+        source_indices = torch.nonzero(active, as_tuple=False).flatten()
+        slots = flat_mapping.index_select(0, source_indices).to(torch.long)
         if validate and slots.numel():
             num_slots = self._config.num_blocks * self._config.block_size
             if int(slots.min()) < 0 or int(slots.max()) >= num_slots:
@@ -189,9 +198,11 @@ class PagedKVCache:
             if slots.unique().numel() != slots.numel():
                 raise KVCacheError("slot mapping must not write the same physical slot twice")
         return PagedKVWriteMapping(
-            active=active,
-            source_indices=source_indices,
             slots=slots,
+            num_query_tokens=flat_mapping.numel(),
+            source_indices=(
+                None if source_indices.numel() == flat_mapping.numel() else source_indices
+            ),
         )
 
     @torch.inference_mode()
@@ -211,16 +222,15 @@ class PagedKVCache:
             raise KVCacheError("paged KV update must have shape [tokens, kv_heads, head_size]")
         if value.shape != key.shape:
             raise KVCacheError("paged K/V updates must have the same shape")
-        if mapping.active.shape != key.shape[:1]:
+        if mapping.num_query_tokens != key.shape[0]:
             raise KVCacheError("slot mapping must have one entry per query token")
         if key.dtype != self._config.dtype or key.device != self._config.device:
             raise KVCacheError("paged KV update dtype and device must match the cache")
         if value.dtype != key.dtype or value.device != key.device:
             raise KVCacheError("paged K/V updates must use the same dtype and device")
-        if (
-            mapping.active.device != self._config.device
-            or mapping.source_indices.device != self._config.device
-            or mapping.slots.device != self._config.device
+        if mapping.slots.device != self._config.device or (
+            mapping.source_indices is not None
+            and mapping.source_indices.device != self._config.device
         ):
             raise KVCacheError("prepared slot mapping device must match the cache")
         if mapping.slots.numel() == 0:
@@ -231,7 +241,7 @@ class PagedKVCache:
         flat_values = layer.values.view(num_slots, *expected_tail)
         query_keys = key
         query_values = value
-        if mapping.source_indices.numel() != mapping.active.numel():
+        if mapping.source_indices is not None:
             query_keys = query_keys.index_select(0, mapping.source_indices)
             query_values = query_values.index_select(0, mapping.source_indices)
         flat_keys.index_copy_(0, mapping.slots, query_keys)

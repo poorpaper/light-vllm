@@ -236,7 +236,9 @@ rollback API。
 分页 Step Handler 持有每层 `[block, offset, kv_head, head_size]` 的全局 K/V tensor。它把请求逻辑位置映射为
 `block_id * block_size + offset`，原位写入本轮 K/V，并按 block table 逐页完成 causal attention。不同长度
 请求会组成一维 token-major forward batch；`query_start_loc` 保存各请求的首尾边界，`positions` 始终保存请求内
-绝对位置。Q/K/V、hidden states 与 slot mapping 都只包含真实 token，不为 mixed prefill/decode 补齐宽度。
+绝对位置。Step Handler 在 H2D 前按模型上限验证这些 CPU 语义位置，并用显式标记告诉模型无需在 CUDA 热路径
+重复检查；直接构造 `ForwardBatch` 的其他调用者仍走完整校验。Q/K/V、hidden states 与 slot mapping 都只包含
+真实 token，不为 mixed prefill/decode 补齐宽度。
 连续与分页 Step Handler 都从模型唯一的 `ModelKVCacheSpec` 获取逐层 KV 形状，装配层不再重复配置层数、KV head 或
 head size。`QueryLayout` 将每个 query 的语义位置与物理 slot 分开：兄弟节点可以有相同 RoPE position，但只能读取
 已提交前缀、祖先和自身，并写入不同 slot。验收路径不是展平前缀时，Step Handler 先 gather/clone/scatter 压实 KV，
@@ -245,13 +247,13 @@ query 与显式 lookahead reservation，不携带未预留尾页。可选 prefix
 哈希链保留父摘要和本页精确 token，零引用页进入 LRU。跨请求只允许在相同逻辑位置共享双方都声明为只读的前缀页，
 query 与未填满尾页始终独占。命中时至少留一个 token 重新计算 logits；prompt 恰好整页时会重算最后一整页。
 
-Triton backend 在 context 创建时把 block table、已计算长度、query 边界和 token 到请求的映射一次转成 GPU tensor，
-供所有模型层复用。普通线性 query 的可见性由 `key_query_offset <= query_offset` 直接表达，不构造 visibility；
+Triton backend 在 context 创建时把 block table、已计算长度、query 边界和 token 到请求的映射合并到 pinned staging，
+一次异步传入 GPU 后供所有模型层复用。普通线性 query 的可见性由 `key_query_offset <= query_offset` 直接表达，不构造 visibility；
 非线性草稿树把每个请求的方阵连续拼接成紧凑一维 visibility，不产生跨请求 padding。
-本轮 K/V 先写入物理页，再在同一 CUDA stream 启动 fused attention；两步不放进同一个 grid，避免 prefill 的某个
-query program 读取到另一个 program 尚未写完的 K/V。首版一个 program 负责一个 query token 的一个 query head，
-grid 只覆盖 `(total_query_tokens, query_heads)`，直接按逻辑位置查页表，并用 FP32 累计在线 softmax。这个结构
-便于检查，长上下文的分段并行与归并留给后续优化。
+本轮 K/V 由一个 Triton program 同时写入 K 和 V，再在同一 CUDA stream 启动 fused attention；两步不放进同一个
+grid，避免 prefill 的某个 query program 读取到另一个 program 尚未写完的 K/V。常见 GQA 形状改由一个 program
+为同一 KV head 下的整组 query heads 复用一次 K/V 读取；不支持的形状仍回退到逐 query head kernel。两条路径都
+只覆盖真实 token、直接按逻辑位置查页表，并用 FP32 累计在线 softmax。长上下文的分段并行与归并留给后续优化。
 
 连续 Step Handler 为每个请求创建 `TorchDenseAttention`。它读取请求级连续历史，在模型逐层调用时完成 dense
 attention 并暂存本轮 K/V；只有模型 forward 和输出校验全部成功，Handler 才把所有层一次性追加到

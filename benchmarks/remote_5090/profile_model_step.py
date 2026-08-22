@@ -48,9 +48,9 @@ def _execute_step(
     *,
     sampler: GreedySampler | None,
 ) -> None:
-    logits_by_request = handler.forward(session, batch)
+    output = handler.forward(session, batch)
     if sampler is not None:
-        sampler.sample(torch.stack([logits[-1] for logits in logits_by_request]))
+        sampler.sample(output.logits)
 
 
 def main() -> None:
