@@ -1,76 +1,97 @@
 # light-vllm
 
-一个以可维护性为第一约束的轻量 LLM 推理框架草稿。
+light-vllm 是一个小型、可组合的 LLM 推理运行时。当前工作集中在单机 Qwen2/Qwen2.5 推理：把 Scheduler、KV cache、模型执行和 HTTP 边界拆清楚，再用真实负载检查每次优化有没有收益。
 
-我们的目标不是在第一天复刻 vLLM 的全部能力，而是先建立一组稳定、清晰、可组合的边界：
+它不是 vLLM 的兼容替代品，也还不是生产级 serving。这个仓库更适合阅读推理数据流、验证调度与缓存设计，或在明确边界上继续做实验。
 
-- **轻框架**：核心只保留注册、加载、执行三个必要动作。
-- **热插拔**：模型和加载器通过 `Catalog` 注册；扩展能力不修改核心分发逻辑。
-- **高扩展**：依赖接口和组合，不让功能矩阵演化成跨模块的 `if-else`。
-- **高可读性**：配置、模型、权重加载、运行生命周期各自只有一个职责。
-- **可验证**：每个扩展点都有小而直接的契约测试。
+[架构设计](docs/design.md) · [边界说明](docs/architecture.md) · [5090 优化记录](benchmarks/remote_5090/OPTIMIZATION_JOURNEY.md) · [监控示例](examples/monitoring/README.md)
 
-> 这是一个独立的实验项目，目前不是 vLLM 的兼容替代品。
+## 最终实验结果
 
-## 当前最小闭环
+最终对比使用 Qwen2.5-Coder-7B-Instruct BF16、RTX 5090 和同一组 ShareGPT 首轮回放。Light 采用 strict completion claim，不启用 prefix cache、TTFT admission 或 speculative decoding；对照组是关闭 prefix cache 与 speculation 的 vLLM eager。每个实现运行 3 轮，每轮 64 个请求，表中数值是逐轮指标的中位数。
 
-```text
-ModelSpec
-   │
-   ├── loader name ──────> Loader registry ──> ModelLoader
-   └── architecture ─────> Model registry ──> ModelFactory
-                                               │
-                                               v
-                                        torch.nn.Module
-                                               │
-HTTP / future RPC ──> EngineClient
-                          ├── InProcessEngineClient
-                          │       └── reference GenerationService ──> ModelRunner.forward
-                          ├── EngineCore
-                          │       ├── TokenBudgetScheduler
-                          │       └── LocalModelExecutor ──> ModelWorker
-                          └── future ProcessEngineClient
+| 到达率 | 系统 | 输出吞吐 | TTFT P95 | TPOT P50 |
+| ---: | --- | ---: | ---: | ---: |
+| 2 req/s | light-vllm | 202.41 tok/s | 37.23 ms | 10.658 ms/token |
+| 2 req/s | vLLM eager | 202.44 tok/s | 48.38 ms | 9.911 ms/token |
+| 8 req/s | light-vllm | 624.34 tok/s | 45.00 ms | 11.864 ms/token |
+| 8 req/s | vLLM eager | 653.74 tok/s | 54.69 ms | 10.768 ms/token |
 
-EngineClient.stream ──> GenerationEvent
-EngineClient.generate ──> collect the same stream ──> GenerateResult
+8 req/s 下，light-vllm 的吞吐是 vLLM eager 的 95.5%，TPOT 生成速度是 90.8%；这组负载里的 TTFT P95 更低。2 req/s 的吞吐受请求到达率限制，只适合看低负载延迟。这里没有“普遍快于 vLLM”的结论：剩余差距与模型 kernel、CUDA Graph 和控制路径都有关，结果也只适用于记录的硬件、模型和 workload。
+
+![最终吞吐对比](benchmarks/remote_5090/results/2026-08-22-complete-report/analysis/01_final_throughput.png)
+
+![最终延迟分位数对比](benchmarks/remote_5090/results/2026-08-22-complete-report/analysis/02_final_latency_percentiles.png)
+
+最终报告还保留了一个容易被平均数掩盖的结果：投机策略依赖 workload。重复代码负载里 Chain 更快；专门构造的分支救援负载里 Trie 更快，因此默认策略不能只看一组接受率。
+
+![投机解码的 workload 依赖](benchmarks/remote_5090/results/2026-08-22-complete-report/analysis/03_speculation_workload_dependence.png)
+
+精确 CSV、逐轮数据摘要和图表哈希位于 [complete-report/analysis](benchmarks/remote_5090/results/2026-08-22-complete-report/analysis/)。完整实验条件、失败过的优化方向和原始数据入口见 [OPTIMIZATION_JOURNEY.md](benchmarks/remote_5090/OPTIMIZATION_JOURNEY.md)。
+
+## 当前架构
+
+```mermaid
+flowchart LR
+    HTTP["FastAPI<br/>JSON · SSE"] --> Port["EngineClient"]
+    Port --> Process["ProcessEngineClient"]
+    Port -. correctness baseline .-> Reference["ReferenceGenerationService"]
+
+    Process -->|IPC| Core
+
+    subgraph EngineProcess["Engine process"]
+        Core["EngineCore<br/>schedule → execute → update"]
+        Core --> Scheduler["TokenBudgetScheduler"]
+        Scheduler --> LogicalKV["Logical KV manager<br/>reservation · block table"]
+        Core --> Executor["LocalModelExecutor"]
+        Executor --> Worker["LocalModelWorker<br/>fixed model generation"]
+        Worker --> Decode["DecodeHandler<br/>standard / speculative"]
+        Decode --> Sampler["Sampler"]
+        Decode --> Step["ModelStepHandler<br/>contiguous / paged"]
+        Step --> PhysicalKV["Physical KV<br/>request tensors / global pages"]
+        Step --> Session["Pinned ModelSession"]
+        Session --> Model["Qwen2ForCausalLM"]
+        Model --> Attention["AttentionContext<br/>Torch / Triton"]
+        Attention --> PhysicalKV
+        Core --> Observer["PerformanceObserver"]
+    end
+
+    Snapshot["HF / ModelScope<br/>local snapshot"] --> Loader["Catalog + SafetensorsLoader"]
+    Loader --> Runner["ModelRunner<br/>atomic install"]
+    Runner --> Session
+    Reference --> Runner
+    Observer --> Metrics["Prometheus /metrics"]
 ```
 
-首版包含：
+HTTP 只依赖 `EngineClient`。GPU 服务可以把 Engine、Scheduler、Worker 和 CUDA context 放进独立进程；reference 路径保留全序列重算，作为同步正确性基线。
 
-- `TinyCausalLM`：`Embedding -> Linear` 的最简单 causal-LM forward。
-- `Qwen2ForCausalLM`：原生 Qwen2/Qwen2.5 full-attention 推理，连续与分页 KV 共用同一个模型实现。
-- `InitModelLoader`：只初始化模型，适合测试和结构验证。
-- `StateDictModelLoader`：从本地 PyTorch state dict 加载权重。
-- `SafetensorsModelLoader`：读取 HF/ModelScope 兼容的本地配置、单文件或分片权重。
-- `ModelRunner`：统一执行入口；新模型加载成功后原子替换旧模型。
-- `Catalog` / `Registry`：显式扩展点，避免在核心路径增加类型判断。
-- `ReferenceGenerationService`：以 token event stream 为唯一路径的最小生成参考实现。
-- `InProcessEngineClient`：把同步 reference 实现适配为稳定的异步 serving 端口。
-- `EngineCore`：按 `schedule -> execute -> update` 驱动异步请求与事件流。
-- `TokenBudgetScheduler`：统一规划 prompt、chunked prefill 与 decode，并可组合短请求资源池和 self-resubmit。
-- `PagedKVCacheManager`：管理逻辑 block 的预留、提交、回滚和释放。
-- `LocalModelExecutor` / `LocalModelWorker`：把本地执行拓扑、模型版本和具体计算能力分开。
-- `LocalModelWorker`：固定当前模型版本和请求生命周期，并组合 Step / Decode Handler。
-- `PagedStepHandler`：消费 block table，使用全局物理页与可替换的 PyTorch/Triton Paged Attention。
-- `ContiguousStepHandler`：保留请求级连续 K/V 的无分页正确性基线。
-- `StandardDecodeHandler`：处理普通 prefill 和单 token decode。
-- `SpeculativeDecodeHandler`：把 chain/trie 草稿树交给同一个目标模型并行验证，验收后压实命中路径 KV，不新增 Worker。
-- `PerformanceObserver`：在统一 Engine 边界记录 TTFT、可见 token 间隔、step 延迟、队列与 KV 使用率。
-- `PredictiveTTFTAdmission`：依次用队列、KV 水位和真实 step 延迟预测做动态早拒，支持请求级 TTFT SLO。
-- `GreedySampler`：独立于 Executor 的贪心采样策略。
-- FastAPI adapter：生成路由只依赖 `EngineClient`，`/metrics` 只依赖独立的性能快照读取端口。
+Scheduler 管逻辑 KV reservation 和 block ID，Step Handler 管物理 tensor 与 attention metadata。一次只允许一个不可变 step 在模型侧执行；请求开始后固定 `ModelSession`，模型 reload 不会让活动请求跨 generation。
+
+模型只生成 Q/K/V、RoPE、norm 和 MLP，并通过 `AttentionContext` 使用连续或分页 KV。Torch backend 是可读的正确性基线，Triton backend 直接按 block table 读取物理页。[完整总览](docs/diagrams/light-vllm-current-overview.html)、[KV 所有权](docs/diagrams/light-vllm-kv-ownership.html)、[Paged Attention 地址映射](docs/diagrams/light-vllm-paged-attention-token-path.html)、[迭代事务](docs/diagrams/light-vllm-iteration-transaction.html) 和 [Worker 生命周期](docs/diagrams/light-vllm-worker-lifecycle.html) 都有单文件图。
+
+## 已经实现
+
+| 范围 | 当前实现 |
+| --- | --- |
+| 模型与权重 | 原生 Qwen2/Qwen2.5 full attention、default RoPE、GQA、tied embedding；HF/ModelScope 兼容的本地 safetensors 快照 |
+| 执行 | token-major packed query、chunked prefill、连续与分页 KV、PyTorch correctness attention、可选 Triton fused paged attention |
+| 调度 | 统一 token budget、严格非抢占 completion claim、prefix cache、短请求资源池、TTFT 早拒、可选 self-resubmit |
+| 解码 | Greedy sampler；N-Gram Chain/Trie proposer 共用树形验证和 KV compact |
+| 服务 | JSON/SSE token-ID API、独立 Engine 进程、取消与异常清理、Prometheus 指标 |
+
+当前没有 tokenizer 和文本 prompt，也没有随机 sampling、sliding-window/RoPE scaling、量化权重、第三方 victim preemption、分布式执行或 OpenAI-compatible API。Triton 路径完成了 RTX 5090 上的既有数值与性能验收，但长上下文、跨显卡和更多模型仍未验证。
 
 ## 快速开始
 
-```bash
+Python 3.10 或更高版本。Windows PowerShell：
+
+```powershell
 python -m venv .venv
-.venv/Scripts/activate
-python -m pip install -e ".[dev]"
-python examples/minimal_forward.py
-python -m pytest
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest
 ```
 
-最小调用：
+最小模型调用使用一维 token 流：
 
 ```python
 import torch
@@ -86,146 +107,30 @@ runner.load(
     )
 )
 
-output = runner.open_session().forward(ForwardBatch(input_ids=torch.tensor([[1, 2, 3]])))
-print(output.logits.shape)  # torch.Size([1, 3, 128])
+batch = ForwardBatch(input_ids=torch.tensor([1, 2, 3], dtype=torch.long))
+output = runner.open_session().forward(batch)
+print(output.logits.shape)  # torch.Size([3, 128])
 ```
 
-## Qwen2 / Qwen2.5 快照
-
-先用 Hugging Face 或 ModelScope 的官方工具把快照下载到本地，再把同一个目录交给 loader：
-
-```python
-from pathlib import Path
-
-import torch
-
-from light_vllm import ModelSpec, create_runner
-
-runner = create_runner()
-runner.load(
-    ModelSpec(
-        architecture="qwen2.5",
-        loader="safetensors",
-        weights=Path("D:/models/Qwen2.5-3B-Instruct"),
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-)
-```
-
-`qwen2.5` 是显式注册名；它与 `qwen2` 复用同一个 factory，因为官方 Qwen2.5 checkpoint 仍声明
-`model_type: qwen2`，模型尺寸由快照的 `config.json` 决定。当前已用官方 Qwen2.5-3B-Instruct 配置验证
-36 层、16 个 query head、2 个 KV head 和 BF16 目标构造。
-
-当前支持 Qwen2/Qwen2.5 的 full attention、default RoPE、GQA、tied embedding 和 safetensors 分片。
-sliding-window、RoPE scaling、量化权重和 tokenizer 尚未实现；因此这是明确的 Qwen 子集支持，不是“大多数 HF
-模型都可直接运行”。安装 `.[validation]` 后，测试会用 Transformers 官方 Qwen2 实现对照同权重 logits；
-Transformers 不参与实际推理。
-
-## HTTP 服务
-
-HTTP 是可选 adapter，不会成为核心运行时依赖：
+在 Linux/WSL 上启动 Qwen GPU 服务：
 
 ```bash
-python -m pip install -e ".[serve]"
-light-vllm-serve \
-  --architecture tiny-attention-causal-lm \
-  --runtime engine \
-  --kv-reservation blocks \
-  --max-num-sequences 8 \
-  --max-num-scheduled-tokens 2048 \
-  --model-args '{"vocab_size": 128, "hidden_size": 32, "num_heads": 4}'
-```
+python -m venv .venv
+.venv/bin/python -m pip install -e ".[serve,triton]"
 
-`--runtime` 支持两条清晰路径：
-
-- `reference`：一次执行一个完整请求，作为最清楚的语义基线。
-- `engine`：token-budget Scheduler、统一 Worker、连续或分页 Step Handler 和增量模型执行。
-
-Engine 路径不区分 prefill/decode 模式：Scheduler 只返回每请求本轮 token 数，长 prompt 自然拆成
-chunk；追上全部已知 token 后才采样输出。
-
-`--kv-reservation blocks` 装配逻辑 block manager 与物理 `PagedStepHandler`。模型声明自己的 K/V layer/head
-规格，Handler 以 `[block, offset, kv_head, head_size]` 布局创建页池。默认 PyTorch backend 直接逐页完成
-attention，适合 CPU correctness；可选 Triton backend 直接按 block table 读取分页 K/V，在一个 kernel 内完成
-QK、在线 softmax 和 PV。
-
-CUDA Linux/WSL 环境可安装可选依赖并显式启用 Triton；该 extra 使用 Torch 2.6 或更高版本：
-
-```bash
-python -m pip install -e ".[serve,triton]"
-light-vllm-serve \
-  --architecture tiny-attention-causal-lm \
-  --runtime engine \
+.venv/bin/light-vllm-serve \
+  --architecture qwen2.5 \
+  --loader safetensors \
+  --weights /models/Qwen2.5-Coder-7B-Instruct \
   --device cuda \
-  --dtype float16 \
-  --paged-attention-backend triton \
-  --model-args '{"vocab_size": 128, "hidden_size": 32, "num_heads": 4}'
-```
-
-首版 Triton kernel 支持 FP16/BF16、MHA/GQA、padded batch、树形 ancestor visibility 和不超过 256 的 head size。
-K/V 写入与 attention 读取分成同一 CUDA stream 上的两个顺序步骤，避免 query 读取尚未写完的 KV。线性
-prefill、decode、共享 prefix 和投机多 query 已在 RTX 5090 完成数值对照；树形 padded parity 测试已加入，
-仍需在 CUDA 环境完成验收。长上下文性能和跨显卡调优也仍待完成，默认 backend 因此保持为 `torch`。
-
-增加 `--enable-prefix-caching` 后，Engine 会按 token 内容复用已经算完的完整 prompt 页。共享页只读，
-每个请求继续使用自己的可写尾页；模型重新加载后 cache epoch 改变，旧页索引会自动清空。
-
-增加 `--num-speculative-tokens 3` 后，Engine 会把这 3 个位置作为单轮草稿节点预算，并用目标模型一次验证。
-默认 `--speculative-proposer chain` 保持线性 N-Gram 行为；选择 `trie` 后，会把最长重复后缀的多个历史续写
-按频次、最近位置和 token ID 确定性裁剪为草稿树。`--speculative-ngram-min/max` 控制匹配长度，
-`--speculative-max-depth` 和 `--speculative-max-branching` 控制树形上限。找不到重复片段时自动退化为普通
-单 token 解码。两种 proposer 共用连续/分页 KV、树形 attention 和验收压实流程。
-
-`--kv-reservation unbounded` 装配无 block manager 与 `ContiguousStepHandler`，不限制逻辑 KV 容量。它保留
-无 Paged Attention 的请求级连续 tensor 路径，主要用于测试和结果对照，不是生产容量保护机制。两种 Handler
-都只读取模型的 `ModelKVCacheSpec`，装配层不重复填写 K/V 形状。
-
-### 非抢占调度与 TTFT 保护
-
-分页 KV 默认使用严格非抢占准入：请求进入 running 前领取覆盖其最大可提交长度的 completion claim，之后不会
-因为其他请求占满 KV 而被挑作 victim。可以同时启用短请求资源池与 TTFT 早拒：
-
-```bash
-light-vllm-serve \
-  --architecture tiny-attention-causal-lm \
+  --dtype bfloat16 \
   --runtime engine \
+  --engine-process \
   --kv-reservation blocks \
-  --num-kv-blocks 128 \
-  --kv-block-size 16 \
-  --max-num-sequences 8 \
-  --max-num-scheduled-tokens 256 \
-  --short-request-max-effective-prompt-tokens 32 \
-  --short-request-max-total-tokens 64 \
-  --short-request-reserved-scheduled-tokens 32 \
-  --short-request-reserved-kv-token-slots 63 \
-  --short-request-reserved-sequences 1 \
-  --regular-request-aging-steps 8 \
-  --max-tolerable-ttft-seconds 1.5 \
-  --max-pending-requests 128 \
-  --ttft-kv-cache-watermark 0.9
+  --paged-attention-backend triton
 ```
 
-短请求按 prefix 命中后的有效 prompt 和最大总长度分类；scheduled token、KV slot 和 sequence 都有独立预留。
-首次 token 可见后，请求回到通用 round-robin。常规请求等待达到 aging 阈值后可以借用 KV 水位，避免饥饿。
-TTFT 预测使用 `新 prompt + waiting pending + running pending` 的全局当前工作量：prefill 贡献尚未计算的 prompt，
-普通 decode 通常贡献当前待算的 1 个 token，所有请求再统一求和；未来 `max_new_tokens` 不会提前展开。延迟表按
-每个 step 实际进入模型 forward 的 token 数更新，默认取 p90 并构造单调包络，可用
-`--ttft-prediction-quantile` 调整；默认积累 100 个 step 后才启用预测。队列上限和 KV 水位不依赖预测器冷启动，
-会始终生效。请求也可以用 JSON 字段 `max_tolerable_ttft_seconds` 覆盖全局 SLO。确定性容量不足返回 422，
-当前负载不满足准入条件返回可重试的 429。
-压测 Scheduler 本身时可把 `--max-pending-requests` 或 `--ttft-kv-cache-watermark` 设为 `off`，避免把早拒收益
-误算成调度收益；生产默认仍分别是 128 和 0.9。
-
-实验性 `--enable-self-resubmit` 改用乐观准入：每个常规请求先领取覆盖 `prompt + 1 block` 的小额 claim，
-新请求合计最多使用全局 90% KV，余下 10% 留给已经运行的 decode 增长。decode 需要新页但空间不足时，
-撞墙者只释放自己的 KV 并重新排队，不回滚第三方，也不重复输出已经可见的 token。该模式会强制开启 prefix cache，
-因此重算可以找回已提交的完整 prompt 页；生成阶段的 KV 仍需重算。它默认关闭且仅支持 `blocks`。可用
-`--max-self-resubmits` 和 `--self-resubmit-strict-fallback-rolled-back-tokens` 控制何时恢复严格 completion claim，
-从而给活锁一个有界退出路径。`--self-resubmit-initial-extra-blocks` 和
-`--self-resubmit-kv-admission-watermark` 可以调整上述两个乐观准入参数。
-
-当前没有 tokenizer，因此接口直接接收 token IDs。普通生成返回一个 JSON：
+当前接口直接接收 token IDs：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/generate \
@@ -233,60 +138,22 @@ curl -X POST http://127.0.0.1:8000/generate \
   -d '{"input_ids":[1,2,3],"max_new_tokens":4}'
 ```
 
-流式生成把同一生成事件编码为 SSE：
+`POST /generate/stream` 返回 SSE；`GET /capabilities` 给出模型、KV 与 Scheduler 容量，`GET /metrics` 返回性能快照。完整参数以 `light-vllm-serve --help` 为准。
+
+## 运行与开发边界
+
+- `reference` 是无调度、全序列重算的语义基线；`engine` 才使用 token budget、KV cache 和增量执行。
+- `blocks` 装配 `PagedKVCacheManager + PagedStepHandler`；`unbounded` 是连续 KV 的实验对照，不提供容量保护。
+- prefix cache 只复用已经提交的完整 prompt 页。self-resubmit 默认关闭，启用后也只回滚撞墙请求自己。
+- 普通生成只投影需要采样的 logits 行；投机验证可以一次确认多个 token，但 Scheduler 只提交真实接受的连续前缀。
+
+提交前运行：
 
 ```bash
-curl -N -X POST http://127.0.0.1:8000/generate/stream \
-  -H "Content-Type: application/json" \
-  -d '{"input_ids":[1,2,3],"max_new_tokens":4}'
+python -m pytest
+ruff check .
+ruff format --check .
+git diff --check
 ```
 
-另有 `GET /healthz` 与 `GET /readyz`。模型在应用 lifespan 中加载完成后，readiness 才返回成功。
-
-## 性能指标
-
-`engine` runtime 额外提供 Prometheus `GET /metrics`：
-
-```bash
-curl http://127.0.0.1:8000/metrics
-```
-
-它包含 TTFT、可见 token 间隔、真实完成的 step 延迟、waiting/running 请求、短请求首 token lane、两种 token
-backlog、KV cache 使用率/claim、self-resubmit 回滚进度、准入拒绝和 token 吞吐，也包含投机尝试、命中节点、
-验证产出 token、草稿根/分支、最大深度和 KV 搬运计数。平均验证产出长度可用
-`rate(light_vllm_speculative_verified_tokens_total[5m]) / rate(light_vllm_speculation_attempts_total[5m])`
-计算。`pending_tokens` 只统计当前
-已知输入；`max_remaining_tokens` 还包含最大输出预算，适合保守扩缩容，二者不会混用。
-指标来自同一套 Engine/Scheduler/KV 事实，与 `qwen2`、`qwen2.5` 或具体模型尺寸无关；`reference`
-runtime 没有 Scheduler 和固定 KV 容量，因此不伪造这些指标。
-
-可直接导入的 Grafana dashboard、Prometheus 抓取配置和 Kubernetes HPA 示例见
-[`examples/monitoring`](examples/monitoring/README.md)。HPA 推荐消费
-`light_vllm_waiting_max_remaining_tokens`；TTFT 预测应使用 pending 输入和 step 延迟，不得拿最大输出预算冒充
-首 token 前工作量。
-
-HTTP adapter 当前最多接受 4096 个输入 token，`max_new_tokens` 也最多为 4096。进程内
-reference engine 仍然一次只执行一个完整请求；并发请求在 event loop 中等待准入，不占用推理线程。
-每个被接纳的请求使用一个专属单线程执行器，保证同步 stream 的创建、推进和关闭都发生在同一线程。
-流式客户端断开时会关闭 engine stream，并在当前同步 token step 安全结束后释放执行槽位。
-
-## 扩展方式
-
-第三方能力只需实现契约并注册：
-
-```python
-catalog.models.register("my-model", my_model_factory)
-catalog.loaders.register("my-format", my_loader)
-```
-
-已有名称默认不可覆盖；需要有意识地替换时才传 `replace=True`。架构图与运行时序见
-[`docs/design.md`](docs/design.md)，更细的边界规则见
-[`docs/architecture.md`](docs/architecture.md)。
-
-## 当前非目标
-
-当前 Engine Core 已有 token budget、chunked prefill、逻辑 block reserve/commit/rollback、独立 Greedy
-Sampler、原生 Qwen2 子集、整页 prefix cache、chain/trie 树形投机解码、PyTorch Paged Attention correctness backend
-和可选的首版 Triton fused attention。Tokenizer、文本 prompt、随机 sampling、经过长上下文调优和跨显卡验收的
-生产级 attention kernel、第三方 victim preemption、分布式执行和 OpenAI-compatible API 仍是后续能力。多进程实现将新增
-`EngineClient` / Worker 拓扑，而不改 HTTP。
+核心 CPU 测试不依赖 CUDA；Triton 测试在没有 GPU 或 Triton 时自动跳过。
