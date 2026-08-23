@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/light-vllm-icon.png" alt="light-vllm icon" width="180">
+</p>
+
 <h1 align="center">light-vllm</h1>
 
 <p align="center">
