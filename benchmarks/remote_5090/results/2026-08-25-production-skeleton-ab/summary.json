@@ -1,0 +1,91 @@
+{
+  "baseline_commit": "6fb26c3a198a3345e22f63bf5881f6021aeeabf7",
+  "candidate_commit": "79322eb9f32dcce628187a0400bc7efed566bddc",
+  "runtime_source_identical": true,
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 5090, 32607 MiB",
+    "driver": "595.71.05",
+    "python": "3.12.13",
+    "torch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "model": "Qwen2.5-Coder-7B-Instruct",
+    "dtype": "bfloat16",
+    "engine_process": true,
+    "max_num_sequences": 16,
+    "max_num_scheduled_tokens": 512,
+    "kv_tokens": 32768,
+    "block_size": 16
+  },
+  "production_like_three_run_median": {
+    "requests_per_run": 64,
+    "request_rate": 8,
+    "output_tokens_per_run": 7514,
+    "successful_requests_per_run": 64,
+    "throughput_tokens_per_second": {
+      "baseline": 625.2458493929786,
+      "candidate": 622.6787438335363,
+      "relative_change_percent": -0.41057538597570886
+    },
+    "ttft_p50_milliseconds": {
+      "baseline": 27.51888707280159,
+      "candidate": 28.65660097450018,
+      "absolute_change_milliseconds": 1.1377139016985893
+    },
+    "ttft_p95_milliseconds": {
+      "baseline": 44.112927699461575,
+      "candidate": 46.78813947830349,
+      "absolute_change_milliseconds": 2.675211778841918
+    },
+    "tpot_p50_milliseconds": {
+      "baseline": 11.814018868519901,
+      "candidate": 11.905106870319017,
+      "relative_change_percent": 0.7710162207530624
+    },
+    "tpot_p95_milliseconds": {
+      "baseline": 12.225164133688493,
+      "candidate": 12.370127601295664,
+      "relative_change_percent": 1.185779315696056
+    },
+    "e2e_p95_seconds": {
+      "baseline": 6.100541964289732,
+      "candidate": 6.161262500844895,
+      "relative_change_percent": 0.9953302003428144
+    }
+  },
+  "fixed_decode_one_run": {
+    "requests": 16,
+    "output_tokens": 8192,
+    "successful_requests": 16,
+    "throughput_tokens_per_second": {
+      "baseline": 1333.7765764785217,
+      "candidate": 1333.3592617440227,
+      "relative_change_percent": -0.031288203876012055
+    },
+    "ttft_p95_milliseconds": {
+      "baseline": 59.411474387161434,
+      "candidate": 60.048800078220665,
+      "absolute_change_milliseconds": 0.6373256910592312
+    },
+    "tpot_p50_milliseconds": {
+      "baseline": 11.892919268262248,
+      "candidate": 11.896071997024629,
+      "absolute_change_milliseconds": 0.0031527287623809724
+    }
+  },
+  "correctness": {
+    "isolated_generation_tokens": 128,
+    "isolated_generation_token_exact": true,
+    "production_like_candidate_vs_baseline_mismatches": [26, 24, 22],
+    "production_like_baseline_self_mismatches": 28,
+    "production_like_candidate_self_mismatches": 23,
+    "fixed_candidate_vs_baseline_mismatches": 9,
+    "fixed_baseline_self_mismatches": 9
+  },
+  "gates": {
+    "throughput_or_tpot_regression_limit_percent": 3.0,
+    "ttft_p95_absolute_increase_limit_milliseconds": 5.0,
+    "native_mode_passed": true,
+    "docker_mode_tested": false,
+    "docker_mode_reason": "The supplied GPU host has no Docker-compatible container runtime."
+  }
+}

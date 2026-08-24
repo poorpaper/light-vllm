@@ -1,0 +1,85 @@
+INFO:     Started server process [4981]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8032 (Press CTRL+C to quit)
+INFO:     127.0.0.1:51964 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51974 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51974 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51988 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52002 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52008 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52020 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52034 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52048 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52052 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51834 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51840 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51840 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51856 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51870 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51874 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51876 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51884 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51896 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51910 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51916 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51924 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51932 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51934 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51946 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51954 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51964 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51980 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51986 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51988 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51994 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52010 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52012 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52016 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52026 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52028 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52044 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52060 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52068 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52082 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52096 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52102 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52108 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52122 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52132 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52136 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52140 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52154 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52160 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52176 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34016 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34018 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34034 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34050 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34060 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34074 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34080 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34090 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34106 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34108 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34116 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34124 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34136 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34144 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34148 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34154 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34156 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34170 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34184 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34188 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34196 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34210 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34220 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34234 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34238 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34246 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34262 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [4981]
