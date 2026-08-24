@@ -72,7 +72,7 @@ flowchart TB
     Core --> Observer["PerformanceObserver<br/>TTFT / ITL / step / outcomes"]
     Scheduler --> Observer
     Observer --> Metrics["Prometheus /metrics"]
-    Metrics --> Grafana["Grafana / HPA"]
+    Metrics --> Grafana["Grafana / HPA / KEDA"]
     Scheduler --> LogicalKV["KVCacheManager<br/>reservation / logical blocks"]
     Core --> Executor["LocalModelExecutor"]
     Executor --> Worker["LocalModelWorker<br/>fixed model version"]
@@ -350,9 +350,10 @@ token 时记录 TTFT/可见 token 间隔；请求完成、失败或取消时记�
 `InMemoryPerformanceObserver` 是专门的性能观察角色，只做短临界区计数。它不能调整 Scheduler 参数，也不执行
 网络或文件 I/O；`SafeCompositePerformanceObserver` 会停用首次失败的旁路实现，指标故障不能泄漏请求、同步刷屏
 或改变生成结果。
-`serving/prometheus.py` 把快照转换成标准文本；Grafana 直接消费 Prometheus，HPA 通过
-Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`。未来性能 Guardian 必须通过单独的有界控制
-端口工作，不能把策略塞进 observer 或 token 热路径。
+`serving/prometheus.py` 把快照转换成标准文本；Grafana 直接消费 Prometheus，HPA 可以通过
+Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也可以直接查询同一指标并管理 HPA。
+这些路径互相替换，不能同时控制同一个 Deployment。未来性能 Guardian 必须通过单独的有界控制端口工作，
+不能把策略塞进 observer 或 token 热路径。
 
 ## 11. 代码映射
 

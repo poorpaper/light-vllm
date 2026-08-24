@@ -78,6 +78,17 @@ kubectl apply -k deploy/kubernetes/base
 再给进程 180 秒完成已有请求和释放 CUDA。
 已有的 Prometheus、Grafana 和 HPA 示例继续位于 `examples/monitoring/`。
 
+单机两张 GPU 时，可以用可选的 KEDA overlay 验证 1→2→1 横向扩缩容：
+
+```bash
+kubectl apply -k deploy/kubernetes/overlays/keda-dual-gpu
+```
+
+它按所有 Pod 的 waiting token backlog 扩容，每个 Pod 申请一张 GPU，并把编译缓存改为 Pod 独占。
+详细前置条件、阈值语义、验证步骤和能力边界见
+[`deploy/kubernetes/overlays/keda-dual-gpu/README.md`](../deploy/kubernetes/overlays/keda-dual-gpu/README.md)。
+不要把 `examples/monitoring/hpa.yaml` 与这个 overlay 同时应用到同一个 Deployment；KEDA 会自己创建 HPA。
+
 ## 4. 烟测与性能门槛
 
 三种方式都使用相同检查：

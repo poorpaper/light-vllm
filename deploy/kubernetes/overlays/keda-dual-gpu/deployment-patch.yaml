@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: light-vllm
+spec:
+  template:
+    spec:
+      containers:
+        - name: inference
+          # 每个 Pod 申请一张完整 GPU；Device Plugin 负责分配不同设备。
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          lifecycle:
+            preStop:
+              exec:
+                # 给 EndpointSlice 和 kube-proxy 留出摘流时间。
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep 10
+      volumes:
+        - name: cache
+          # Triton/Torch 编译缓存按 Pod 隔离，避免两个副本并发写同一目录。
+          persistentVolumeClaim: null
+          emptyDir:
+            sizeLimit: 20Gi

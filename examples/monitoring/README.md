@@ -47,3 +47,19 @@ Engine runtime 启动后直接暴露 `GET /metrics`，不需要在 token 热路�
 - [Kubernetes HPA](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)
 - [Prometheus Adapter](https://github.com/kubernetes-sigs/prometheus-adapter)
 - [Grafana provisioning](https://grafana.com/tutorials/provision-dashboards-and-data-sources/)
+
+## Kubernetes KEDA
+
+KEDA 可以直接查询 Prometheus，并为目标 Deployment 创建 HPA，因此不再需要 Prometheus Adapter。单机双 GPU
+示例位于 `deploy/kubernetes/overlays/keda-dual-gpu/`，默认保留一个热副本、最多扩到两个副本，并在 Prometheus
+故障时保持当前容量。
+
+HPA 与 KEDA 是两条可替换的控制面路径，不能同时控制同一个 Deployment：
+
+```text
+Prometheus → Prometheus Adapter → 手写 HPA
+Prometheus → KEDA Prometheus scaler → KEDA 管理的 HPA
+```
+
+配置字段参考 [KEDA ScaledObject](https://keda.sh/docs/2.20/reference/scaledobject-spec/) 和
+[Prometheus scaler](https://keda.sh/docs/2.20/scalers/prometheus/)。
