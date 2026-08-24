@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: light-vllm
+  labels:
+    app.kubernetes.io/name: light-vllm
+spec:
+  selector:
+    app.kubernetes.io/name: light-vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

@@ -150,6 +150,9 @@ curl -X POST http://127.0.0.1:8000/generate \
 
 `POST /generate/stream` 返回 SSE；`GET /capabilities` 给出模型、KV 与 Scheduler 容量；`GET /metrics` 返回性能快照。完整参数以 `light-vllm-serve --help` 为准。
 
+原生 systemd、Docker Compose 和 Kubernetes 的最小生产骨架见
+[生产部署骨架](docs/deployment.md)。三种方式复用同一个服务入口，部署配置不进入推理热路径。
+
 ## RTX 5090 上的一组实测
 
 最终对比使用 Qwen2.5-Coder-7B-Instruct BF16、RTX 5090 和同一组 ShareGPT 首轮回放。light-vllm 使用 strict completion claim，不启用 prefix cache、TTFT admission 或 speculative decoding；对照组是关闭 prefix cache 与 speculation 的 vLLM eager。每个实现运行 3 轮，每轮 64 个请求，表中是逐轮指标的中位数。
