@@ -1,0 +1,54 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: light-vllm
+  labels:
+    app.kubernetes.io/name: light-vllm
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: light-vllm
+  pollingInterval: 15
+  minReplicaCount: 1
+  maxReplicaCount: 2
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+    # 监控故障时冻结当前容量，避免在未知负载下错误缩容。
+    behavior: currentReplicas
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      name: light-vllm-keda
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 30
+        scaleDown:
+          # 模型副本启动昂贵，低负载需持续一段时间才释放 GPU。
+          stabilizationWindowSeconds: 600
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+  triggers:
+    - type: prometheus
+      name: waiting-token-backlog
+      # 全局 backlog 除以阈值，得到期望副本数。
+      metricType: AverageValue
+      useCachedMetrics: true
+      metadata:
+        serverAddress: http://prometheus-operated.monitoring.svc.cluster.local:9090
+        query: >-
+          sum(max by (pod) (
+            light_vllm_waiting_max_remaining_tokens{
+              namespace="default",pod=~"light-vllm-.*"
+            }
+          ))
+        threshold: "4096"
+        ignoreNullValues: "false"
+        timeout: 3s

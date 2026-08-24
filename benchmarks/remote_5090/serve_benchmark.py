@@ -349,10 +349,11 @@ async def _main_async(args: argparse.Namespace) -> None:
 
     limits = httpx.Limits(
         max_connections=args.max_connections,
-        max_keepalive_connections=args.max_connections,
+        max_keepalive_connections=(0 if args.disable_keepalive else args.max_connections),
     )
     timeout = httpx.Timeout(args.timeout)
-    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+    headers = {"Connection": "close"} if args.disable_keepalive else None
+    async with httpx.AsyncClient(timeout=timeout, limits=limits, headers=headers) as client:
         metrics_url = f"{args.base_url.rstrip('/')}/metrics"
         metrics_before = await _fetch_text(client, metrics_url)
         start = time.perf_counter()
@@ -424,6 +425,11 @@ def main() -> None:
     parser.add_argument("--request-rate", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=20260819)
     parser.add_argument("--max-connections", type=int, default=128)
+    parser.add_argument(
+        "--disable-keepalive",
+        action="store_true",
+        help="open fresh TCP connections so a Kubernetes Service can reach new replicas",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument(

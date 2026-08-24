@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: light-vllm
+  labels:
+    app.kubernetes.io/name: light-vllm
+spec:
+  replicas: 1
+  # 单 GPU 骨架使用 Recreate，避免滚动更新同时申请两张 GPU。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: light-vllm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: light-vllm
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8000"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 180
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: inference
+          image: light-vllm:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --architecture
+            - $(LIGHT_VLLM_ARCHITECTURE)
+            - --loader
+            - safetensors
+            - --weights
+            - /models/$(LIGHT_VLLM_MODEL_NAME)
+            - --device
+            - cuda:0
+            - --dtype
+            - bfloat16
+            - --runtime
+            - engine
+            - --engine-process
+            - --kv-reservation
+            - blocks
+            - --paged-attention-backend
+            - triton
+            - --max-num-sequences
+            - "16"
+            - --max-num-scheduled-tokens
+            - "512"
+            - --kv-block-size
+            - "16"
+            - --kv-cache-memory-fraction
+            - "0.8"
+          env:
+            - name: LIGHT_VLLM_ARCHITECTURE
+              value: qwen2.5
+            - name: LIGHT_VLLM_MODEL_NAME
+              value: Qwen2.5-Coder-7B-Instruct
+            - name: XDG_CACHE_HOME
+              value: /var/cache/light-vllm
+            - name: TRITON_CACHE_DIR
+              value: /var/cache/light-vllm/triton
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /var/cache/light-vllm/torchinductor
+          ports:
+            - name: http
+              containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              # startupProbe 成功后检查 Engine 子进程，死亡时让 K8s 重建 Pod。
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/light-vllm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: light-vllm-models
+        - name: cache
+          persistentVolumeClaim:
+            claimName: light-vllm-cache
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

@@ -1,0 +1,45 @@
+INFO:     Started server process [5225]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8033 (Press CTRL+C to quit)
+INFO:     127.0.0.1:36520 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36524 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36524 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36532 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36542 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36550 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36556 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36560 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36570 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36578 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36592 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36600 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36608 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36620 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36628 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36636 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36652 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36664 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36524 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50868 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50868 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50876 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50880 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50882 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50886 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50896 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50912 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50926 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50934 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50948 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50952 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50960 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50968 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50974 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50982 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50992 - "POST /generate/stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50868 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [5225]

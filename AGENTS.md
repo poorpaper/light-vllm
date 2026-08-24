@@ -68,7 +68,7 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   容量拒绝和当前负载过载表达为 422/429。
 - `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
 - `PerformanceObserver` 在 Engine 已生效的生命周期边界记录 TTFT、可见 token 间隔、step 延迟与请求结果，只读取
-  Scheduler/KV 不可变快照；Prometheus、Grafana 和 HPA 不进入推理热路径。
+  Scheduler/KV 不可变快照；Prometheus、Grafana、HPA 和 KEDA 不进入推理热路径。
 - FastAPI 生成路由只依赖 `EngineClient`；`/metrics` 只依赖独立的 `PerformanceMetricsReader`，两者都不知道
   scheduler、runner、torch 或具体模型。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
@@ -190,7 +190,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 41. `PerformanceObserver` 只能接收请求生命周期、完成的 step 和 Scheduler/KV 不可变事实；它不得执行 I/O、修改
     运行时状态或按 architecture/模型尺寸分支。安全组合器必须在 observer 首次失败后停用它，且不得在 Engine
     热路径同步写日志或让指标故障改变推理结果。
-    Prometheus/Grafana/HPA 表达必须留在控制面 adapter。
+    Prometheus/Grafana/HPA/KEDA 表达必须留在控制面 adapter。
 
 ## 锁与资源的准确含义
 

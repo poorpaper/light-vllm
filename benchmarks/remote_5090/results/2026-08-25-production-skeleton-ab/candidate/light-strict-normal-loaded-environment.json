@@ -1,0 +1,15 @@
+{
+  "git_sha": "79322eb9f32dcce628187a0400bc7efed566bddc",
+  "git_status": "",
+  "python": "3.12.13",
+  "torch": "2.11.0+cu130",
+  "torch_cuda": "13.0",
+  "gpu": "NVIDIA GeForce RTX 5090, 595.71.05, 32607 MiB",
+  "mode": "light-strict",
+  "case": "normal-loaded",
+  "kv_tokens": 32768,
+  "max_num_sequences": 16,
+  "short_request_reserved_sequences": null,
+  "model": "/root/autodl-tmp/models/Qwen2.5-Coder-7B-Instruct",
+  "model_config_sha256": "c0242402ad6a13b331ea320feea8c7e3776ffb7a4eff0757b9cd667e116d9a28"
+}

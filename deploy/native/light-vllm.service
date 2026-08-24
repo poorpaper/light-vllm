@@ -1,0 +1,62 @@
+[Unit]
+Description=light-vllm inference service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=light-vllm
+Group=light-vllm
+WorkingDirectory=/opt/light-vllm
+
+# 默认值便于阅读；站点配置放在独立 EnvironmentFile 中覆盖。
+Environment=LIGHT_VLLM_MODEL_PATH=/data/models/Qwen2.5-Coder-7B-Instruct
+Environment=LIGHT_VLLM_ARCHITECTURE=qwen2.5
+Environment=LIGHT_VLLM_DEVICE=cuda:0
+Environment=LIGHT_VLLM_DTYPE=bfloat16
+Environment=LIGHT_VLLM_PORT=8000
+Environment=LIGHT_VLLM_MAX_NUM_SEQUENCES=16
+Environment=LIGHT_VLLM_MAX_NUM_SCHEDULED_TOKENS=512
+Environment=LIGHT_VLLM_KV_BLOCK_SIZE=16
+Environment=LIGHT_VLLM_KV_CACHE_MEMORY_FRACTION=0.8
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_CACHE_HOME=/var/cache/light-vllm
+Environment=TRITON_CACHE_DIR=/var/cache/light-vllm/triton
+Environment=TORCHINDUCTOR_CACHE_DIR=/var/cache/light-vllm/torchinductor
+EnvironmentFile=-/etc/light-vllm/light-vllm.env
+
+ExecStart=/opt/light-vllm/.venv/bin/light-vllm-serve \
+    --host 0.0.0.0 \
+    --port ${LIGHT_VLLM_PORT} \
+    --architecture ${LIGHT_VLLM_ARCHITECTURE} \
+    --loader safetensors \
+    --weights ${LIGHT_VLLM_MODEL_PATH} \
+    --device ${LIGHT_VLLM_DEVICE} \
+    --dtype ${LIGHT_VLLM_DTYPE} \
+    --runtime engine \
+    --engine-process \
+    --kv-reservation blocks \
+    --paged-attention-backend triton \
+    --max-num-sequences ${LIGHT_VLLM_MAX_NUM_SEQUENCES} \
+    --max-num-scheduled-tokens ${LIGHT_VLLM_MAX_NUM_SCHEDULED_TOKENS} \
+    --kv-block-size ${LIGHT_VLLM_KV_BLOCK_SIZE} \
+    --kv-cache-memory-fraction ${LIGHT_VLLM_KV_CACHE_MEMORY_FRACTION}
+
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=infinity
+TimeoutStopSec=3min
+KillSignal=SIGTERM
+LimitMEMLOCK=infinity
+CacheDirectory=light-vllm
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
