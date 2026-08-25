@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import torch
 
 from light_vllm.bootstrap import create_runner
 from light_vllm.modeling.models.interfaces import ModelSpec
+from light_vllm.modeling.tensor_parallel import TensorParallelContext
+from light_vllm.runtime.execution.distributed import TorchDistributedGroup
 from light_vllm.runtime.execution.interfaces import ModelStepBatch, ModelStepRequest
 from light_vllm.runtime.execution.layout import linear_query_layout
 from light_vllm.runtime.execution.paged_cache import PagedKVCacheConfig
@@ -65,15 +68,26 @@ def main() -> None:
     parser.add_argument("--timed-steps", type=int, default=10)
     parser.add_argument("--profile-steps", type=int, default=1)
     parser.add_argument("--include-greedy-sampling", action="store_true")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     args = parser.parse_args()
 
-    device = torch.device("cuda:0")
+    if args.tensor_parallel_size <= 0:
+        raise ValueError("tensor parallel size must be positive")
+    launched_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if launched_world_size != args.tensor_parallel_size:
+        raise ValueError("launch world size must match --tensor-parallel-size")
+
+    group = TorchDistributedGroup.initialize() if args.tensor_parallel_size > 1 else None
+    rank = 0 if group is None else group.rank
+    device = torch.device("cuda:0") if group is None else group.device
+    parallel = None if group is None else TensorParallelContext(group.rank, group.world_size, group)
     spec = ModelSpec(
         architecture="qwen2",
         loader="safetensors",
         weights=args.weights,
         device=device,
         dtype=torch.bfloat16,
+        tensor_parallel=parallel,
     )
     runner = create_runner()
     runner.load(spec)
@@ -121,7 +135,12 @@ def main() -> None:
         torch.cuda.synchronize(device)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    trace_path = args.output.with_suffix(".trace.json")
+    rank_output = (
+        args.output
+        if group is None
+        else args.output.with_name(f"{args.output.stem}.rank{rank}{args.output.suffix}")
+    )
+    trace_path = rank_output.with_suffix(".trace.json")
     profile.export_chrome_trace(str(trace_path))
     payload = {
         "batch_size": args.batch_size,
@@ -130,6 +149,8 @@ def main() -> None:
         "timed_steps": args.timed_steps,
         "profile_steps": args.profile_steps,
         "include_greedy_sampling": args.include_greedy_sampling,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "rank": rank,
         "elapsed_s": elapsed,
         "mean_step_ms": elapsed * 1000 / args.timed_steps,
         "profiler_cuda": profile.key_averages().table(
@@ -142,8 +163,33 @@ def main() -> None:
         ),
         "trace": str(trace_path),
     }
-    args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(json.dumps({key: value for key, value in payload.items() if key != "trace"}, indent=2))
+    rank_output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    summary = {
+        "rank": rank,
+        "mean_step_ms": payload["mean_step_ms"],
+        "profile": str(rank_output),
+        "trace": str(trace_path),
+    }
+    if group is None:
+        print(
+            json.dumps(
+                {key: value for key, value in payload.items() if key != "trace"},
+                indent=2,
+            )
+        )
+    else:
+        rank_summaries = group.all_gather_object(summary)
+        if rank == 0:
+            combined = {
+                "tensor_parallel_size": args.tensor_parallel_size,
+                "batch_size": args.batch_size,
+                "computed_tokens": args.computed_tokens,
+                "query_tokens": args.query_tokens,
+                "ranks": rank_summaries,
+            }
+            args.output.write_text(json.dumps(combined, indent=2), encoding="utf-8")
+            print(json.dumps(combined, indent=2))
+        group.close()
 
 
 if __name__ == "__main__":

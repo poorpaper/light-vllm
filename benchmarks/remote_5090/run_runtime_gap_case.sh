@@ -17,18 +17,34 @@ HARNESS_ROOT=${HARNESS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PYTHON=${PYTHON:-/root/autodl-tmp/conda-envs/vllm/bin/python}
 MODEL=${MODEL:-/root/autodl-tmp/models/Qwen2.5-Coder-7B-Instruct}
 WORKLOAD_DIR=${WORKLOAD_DIR:-/root/autodl-tmp/light-vllm-results/workloads}
+FIXED_WORKLOAD=${FIXED_WORKLOAD:-${WORKLOAD_DIR}/decode-steady.json}
 REPLAY_REFERENCE=${REPLAY_REFERENCE:-/root/autodl-tmp/light-vllm-results/preemption-latest-20260820/replay-reference.json}
 PROFILE_DETAIL=${PROFILE_DETAIL:-full}
 RUNS=${RUNS:-3}
+TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+PAGED_ATTENTION_BACKEND=${PAGED_ATTENTION_BACKEND:-triton}
 SHORT_REQUEST_RESERVED_SEQUENCES=${SHORT_REQUEST_RESERVED_SEQUENCES:-}
 SERVER_PREFIX=${MODE}-${CASE}
 LOG=${OUTPUT_DIR}/${SERVER_PREFIX}-server.log
+
+if [[ ! "$TENSOR_PARALLEL_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TENSOR_PARALLEL_SIZE must be a positive integer" >&2
+  exit 2
+fi
+if (( TENSOR_PARALLEL_SIZE > 1 )) && [[ "$PROFILE_DETAIL" != off ]]; then
+  echo "tensor-parallel benchmark currently requires PROFILE_DETAIL=off" >&2
+  exit 2
+fi
+if (( TENSOR_PARALLEL_SIZE > 1 )) && [[ "${ENGINE_PROCESS:-0}" == 1 ]]; then
+  echo "tensor-parallel ranks already provide the engine process boundary" >&2
+  exit 2
+fi
 
 configure_case() {
   local benchmark_case=$1
   case "$benchmark_case" in
   fixed)
-    WORKLOAD=${WORKLOAD_DIR}/decode-steady.json
+    WORKLOAD=$FIXED_WORKLOAD
     ARRIVAL_MODE=burst
     RATE=1
     KV_TOKENS=32768
@@ -104,10 +120,15 @@ mkdir -p "$OUTPUT_DIR"
 cd "$ROOT"
 
 SERVER_PID=""
+GPU_MONITOR_PID=""
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill -TERM "$SERVER_PID"
     wait "$SERVER_PID" || true
+  fi
+  if [[ -n "$GPU_MONITOR_PID" ]] && kill -0 "$GPU_MONITOR_PID" 2>/dev/null; then
+    kill -TERM "$GPU_MONITOR_PID"
+    wait "$GPU_MONITOR_PID" || true
   fi
 }
 trap cleanup EXIT
@@ -162,17 +183,37 @@ light_profile_pid() {
   printf '%s\n' "${children[0]}"
 }
 
-MAX_SEQS=16
+MAX_SEQS=${MAX_NUM_SEQUENCES:-16}
+if [[ ! "$MAX_SEQS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_NUM_SEQUENCES must be a positive integer" >&2
+  exit 2
+fi
 KV_BLOCKS=$((KV_TOKENS / 16))
-KV_BYTES=$((KV_TOKENS * 57344))
+# Qwen2.5-Coder-7B BF16 的完整 KV 是 57344 bytes/token。TP 按 KV head
+# 切分，因此 vLLM 的每 Rank 显存预算也按 TP 大小缩小；逻辑 token 容量不变。
+KV_BYTES=$((KV_TOKENS * 57344 / TENSOR_PARALLEL_SIZE))
 BACKEND=light-vllm
 MODEL_ARGS=()
 PROFILE_PREFIX=${OUTPUT_DIR}/${MODE}-${PROFILE_CASE}-profile
 SERVER_ENV=(PYTHONPATH=${ROOT}/src)
-if [[ "$PROFILE_DETAIL" == off ]]; then
+if (( TENSOR_PARALLEL_SIZE > 1 )); then
+  LIGHT_ENTRY=(
+    "$PYTHON" -m torch.distributed.run
+    --standalone
+    --nproc-per-node "$TENSOR_PARALLEL_SIZE"
+    --module light_vllm.entrypoints.http
+  )
+  SERVER_ENV+=(
+    NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+    TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+  )
+  LIGHT_DEVICE=cuda
+elif [[ "$PROFILE_DETAIL" == off ]]; then
   LIGHT_ENTRY=("$PYTHON" -m light_vllm.entrypoints.http)
+  LIGHT_DEVICE=cuda:0
 else
   LIGHT_ENTRY=("$PYTHON" "$HARNESS_ROOT/benchmarks/remote_5090/profile_light_cpu_stages.py")
+  LIGHT_DEVICE=cuda:0
 fi
 LIGHT_COMMON=(
   "${LIGHT_ENTRY[@]}"
@@ -181,11 +222,11 @@ LIGHT_COMMON=(
   --architecture qwen2
   --loader safetensors
   --weights "$MODEL"
-  --device cuda:0
+  --device "$LIGHT_DEVICE"
   --dtype bfloat16
   --runtime engine
   --kv-reservation blocks
-  --paged-attention-backend triton
+  --paged-attention-backend "$PAGED_ATTENTION_BACKEND"
   --max-num-sequences "$MAX_SEQS"
   --max-num-scheduled-tokens 512
   --num-kv-blocks "$KV_BLOCKS"
@@ -193,6 +234,9 @@ LIGHT_COMMON=(
   --max-pending-requests off
   --ttft-kv-cache-watermark off
 )
+if (( TENSOR_PARALLEL_SIZE > 1 )); then
+  LIGHT_COMMON+=(--tensor-parallel-size "$TENSOR_PARALLEL_SIZE")
+fi
 if [[ "${ENGINE_PROCESS:-0}" == 1 ]]; then
   LIGHT_COMMON+=(--engine-process)
 fi
@@ -240,12 +284,15 @@ case "$MODE" in
     fi
     SERVER=(
       bash "$HARNESS_ROOT/benchmarks/remote_5090/launch_vllm.sh"
-      "$MODEL" "$KV_BYTES" none "$MAX_SEQS" 512 "$PORT"
+      "$MODEL" "$KV_BYTES" none "$MAX_SEQS" 512 "$PORT" "$TENSOR_PARALLEL_SIZE"
     )
-    SERVER_ENV=(
-      PYTHONPATH=${HARNESS_ROOT}/benchmarks/remote_5090/vllm_profile_hook:${ROOT}/src
-      VLLM_CPU_PROFILE_OUTPUT=${PROFILE_PREFIX}.{pid}.json
-    )
+    SERVER_ENV=(PYTHONPATH=${ROOT}/src)
+    if [[ "$PROFILE_DETAIL" != off ]]; then
+      SERVER_ENV=(
+        PYTHONPATH=${HARNESS_ROOT}/benchmarks/remote_5090/vllm_profile_hook:${ROOT}/src
+        VLLM_CPU_PROFILE_OUTPUT=${PROFILE_PREFIX}.{pid}.json
+      )
+    fi
     if [[ "$MODE" == vllm-eager ]]; then
       SERVER_ENV+=(VLLM_ENFORCE_EAGER=1)
     fi
@@ -279,6 +326,19 @@ if [[ "$ready" != true ]]; then
   exit 1
 fi
 
+GPU_LOG=${OUTPUT_DIR}/${SERVER_PREFIX}-gpu.csv
+printf '%s\n' 'timestamp,index,memory_used_mib,gpu_util_percent,power_watts,sm_clock_mhz' \
+  >"$GPU_LOG"
+(
+  while kill -0 "$SERVER_PID" 2>/dev/null; do
+    nvidia-smi \
+      --query-gpu=timestamp,index,memory.used,utilization.gpu,power.draw,clocks.sm \
+      --format=csv,noheader,nounits
+    sleep 1
+  done
+) >>"$GPU_LOG" 2>/dev/null &
+GPU_MONITOR_PID=$!
+
 run_case() {
   local suffix=$1
   local limit=${2:-}
@@ -306,6 +366,18 @@ run_case() {
     arguments+=(--limit "$limit")
   fi
   PYTHONPATH="$ROOT/src" "${arguments[@]}"
+  "$PYTHON" - "$output" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+summary = json.loads(path.read_text(encoding="utf-8"))["summary"]
+if int(summary["failed_requests"]) != 0:
+    raise SystemExit(f"benchmark contains failed requests: {path}")
+if int(summary["successful_requests"]) != int(summary["requests"]):
+    raise SystemExit(f"benchmark request count is inconsistent: {path}")
+PY
 }
 
 for benchmark_case in "${BENCHMARK_CASES[@]}"; do
@@ -344,11 +416,18 @@ fi
 BENCHMARK_MODE="$MODE" \
 BENCHMARK_CASE="$CASE" \
 BENCHMARK_MODEL="$MODEL" \
+BENCHMARK_FIXED_WORKLOAD="$FIXED_WORKLOAD" \
+BENCHMARK_PRODUCTION_WORKLOAD="${WORKLOAD_DIR}/production-sharegpt-eos.json" \
+BENCHMARK_REPLAY_REFERENCE="$REPLAY_REFERENCE" \
 BENCHMARK_KV_TOKENS="$KV_TOKENS" \
 BENCHMARK_MAX_SEQS="$MAX_SEQS" \
+BENCHMARK_TENSOR_PARALLEL_SIZE="$TENSOR_PARALLEL_SIZE" \
+BENCHMARK_PAGED_ATTENTION_BACKEND="$PAGED_ATTENTION_BACKEND" \
+BENCHMARK_ENGINE_PROCESS="${ENGINE_PROCESS:-0}" \
 BENCHMARK_SHORT_REQUEST_RESERVED_SEQUENCES="$SHORT_REQUEST_RESERVED_SEQUENCES" \
 "$PYTHON" - <<'PY' >"${OUTPUT_DIR}/${SERVER_PREFIX}-environment.json"
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -360,12 +439,33 @@ import torch
 def command(*args):
     return subprocess.check_output(args, text=True).strip()
 
+def package_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+def sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+diff = subprocess.check_output(["git", "diff", "--binary", "HEAD"])
+inputs = {
+    "fixed_workload": os.environ["BENCHMARK_FIXED_WORKLOAD"],
+    "production_workload": os.environ["BENCHMARK_PRODUCTION_WORKLOAD"],
+    "replay_reference": os.environ["BENCHMARK_REPLAY_REFERENCE"],
+}
+
 print(json.dumps({
     "git_sha": command("git", "rev-parse", "HEAD"),
     "git_status": command("git", "status", "--short"),
     "python": platform.python_version(),
     "torch": torch.__version__,
     "torch_cuda": torch.version.cuda,
+    "torch_nccl": torch.cuda.nccl.version() if torch.cuda.is_available() else None,
+    "packages": {
+        name: package_version(name)
+        for name in ("vllm", "triton", "transformers", "tokenizers", "safetensors")
+    },
     "gpu": command(
         "nvidia-smi",
         "--query-gpu=name,driver_version,memory.total",
@@ -375,6 +475,15 @@ print(json.dumps({
     "case": os.environ.get("BENCHMARK_CASE"),
     "kv_tokens": int(os.environ["BENCHMARK_KV_TOKENS"]),
     "max_num_sequences": int(os.environ["BENCHMARK_MAX_SEQS"]),
+    "tensor_parallel_size": int(os.environ["BENCHMARK_TENSOR_PARALLEL_SIZE"]),
+    "paged_attention_backend": os.environ["BENCHMARK_PAGED_ATTENTION_BACKEND"],
+    "engine_process": bool(int(os.environ["BENCHMARK_ENGINE_PROCESS"])),
+    "cuda_peer_access": (
+        torch.cuda.can_device_access_peer(0, 1)
+        if torch.cuda.device_count() >= 2
+        else None
+    ),
+    "gpu_topology": command("nvidia-smi", "topo", "-m"),
     "short_request_reserved_sequences": (
         int(os.environ["BENCHMARK_SHORT_REQUEST_RESERVED_SEQUENCES"])
         if os.environ["BENCHMARK_SHORT_REQUEST_RESERVED_SEQUENCES"]
@@ -384,5 +493,7 @@ print(json.dumps({
     "model_config_sha256": hashlib.sha256(
         (Path(os.environ["BENCHMARK_MODEL"]) / "config.json").read_bytes()
     ).hexdigest(),
+    "input_sha256": {name: sha256_file(path) for name, path in inputs.items()},
+    "git_diff_sha256": hashlib.sha256(diff).hexdigest(),
 }, indent=2))
 PY
