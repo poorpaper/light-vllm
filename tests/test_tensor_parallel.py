@@ -373,7 +373,7 @@ def test_tensor_parallel_executor_defers_free_until_a_prepared_batch_finishes() 
     executor.shutdown()
 
 
-def test_tensor_parallel_executor_does_not_free_during_a_model_step() -> None:
+def test_tensor_parallel_lifecycle_updates_do_not_wait_for_a_model_step() -> None:
     local = _FakeExecutor()
     group = _FakeLeaderGroup()
     executor = TensorParallelModelExecutor(local, group)  # type: ignore[arg-type]
@@ -407,17 +407,25 @@ def test_tensor_parallel_executor_does_not_free_during_a_model_step() -> None:
     local.execute = blocking_execute  # type: ignore[method-assign]
     executor.initialize()
     executor.add_request("request-1", capacity=8)
+    lease = executor.acquire(("request-1",))
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         execute_future = pool.submit(executor.execute, batch)
         assert entered_step.wait(timeout=1)
         free_future = pool.submit(free_request)
         assert free_started.wait(timeout=1)
-        assert not free_future.done()
-        release_step.set()
+        try:
+            assert free_future.result(timeout=1)
+            add_future = pool.submit(executor.add_request, "request-2", capacity=8)
+            add_future.result(timeout=1)
+            assert local.requests == {"request-1", "request-2"}
+        finally:
+            release_step.set()
         assert execute_future.result(timeout=1).requests[0].output_token_ids == (9,)
-        assert free_future.result(timeout=1)
 
+    lease.release()
+    assert local.requests == {"request-2"}
+    assert executor.free_request("request-2")
     executor.shutdown()
 
 

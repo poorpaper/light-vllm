@@ -388,19 +388,24 @@ class TensorParallelModelExecutor:
         self._active_requests: set[str] = set()
         self._lease_counts: dict[str, int] = {}
         self._deferred_frees: set[str] = set()
+        # 生命周期只用短锁更新；长时间的 collective 由另一把锁串行化。
+        self._state_lock = Lock()
         self._command_lock = Lock()
         self._capabilities: ExecutionCapabilities | None = None
         self._closed = False
 
     @property
     def ready(self) -> bool:
-        return not self._closed and self._capabilities is not None and self._local.ready
+        with self._state_lock:
+            return not self._closed and self._capabilities is not None and self._local.ready
 
     @property
     def capabilities(self) -> ExecutionCapabilities:
-        if self._capabilities is None:
+        with self._state_lock:
+            capabilities = self._capabilities
+        if capabilities is None:
             raise ExecutionError("initialize the tensor parallel executor first")
-        return self._capabilities
+        return capabilities
 
     def initialize(self) -> None:
         def initialize_local() -> ExecutionCapabilities:
@@ -408,32 +413,33 @@ class TensorParallelModelExecutor:
             return self._local.capabilities
 
         with self._command_lock:
-            self._ensure_open()
+            with self._state_lock:
+                self._ensure_open_locked()
             value = self._run_command(
                 _Initialize(),
                 initialize_local,
                 require_consensus=True,
             )
-        if not isinstance(value, ExecutionCapabilities):
-            raise ExecutionError("tensor parallel initialization returned invalid capabilities")
-        if value.tensor_parallel_size != self._group.world_size:
-            raise ExecutionError(
-                "model tensor parallel size does not match the distributed world size"
-            )
-        self._capabilities = value
+            if not isinstance(value, ExecutionCapabilities):
+                raise ExecutionError("tensor parallel initialization returned invalid capabilities")
+            if value.tensor_parallel_size != self._group.world_size:
+                raise ExecutionError(
+                    "model tensor parallel size does not match the distributed world size"
+                )
+            with self._state_lock:
+                self._capabilities = value
 
     def add_request(self, request_id: str, *, capacity: int) -> None:
-        # 本地生命周期变更和命令广播必须落在同一个 step 边界。否则取消
-        # 可能先释放 Rank 0，而其他 Rank 已开始下一轮 collective。
-        with self._command_lock:
-            self._ensure_open()
+        # Rank 0 立即登记请求；远端更新在下一条有序命令前一起送达。
+        with self._state_lock:
+            self._ensure_open_locked()
             self._local.add_request(request_id, capacity=capacity)
             self._active_requests.add(request_id)
             self._pending.append(_AddRequest(request_id, capacity))
 
     def free_request(self, request_id: str) -> bool:
-        with self._command_lock:
-            self._ensure_open()
+        with self._state_lock:
+            self._ensure_open_locked()
             if request_id not in self._active_requests:
                 return False
             self._active_requests.remove(request_id)
@@ -444,8 +450,8 @@ class TensorParallelModelExecutor:
             return True
 
     def acquire(self, request_ids: tuple[str, ...]) -> ExecutionLease:
-        with self._command_lock:
-            self._ensure_open()
+        with self._state_lock:
+            self._ensure_open_locked()
             local = self._local.acquire(request_ids)
             for request_id in request_ids:
                 self._lease_counts[request_id] = self._lease_counts.get(request_id, 0) + 1
@@ -466,16 +472,19 @@ class TensorParallelModelExecutor:
 
     def shutdown(self) -> None:
         with self._command_lock:
-            if self._closed:
-                return
+            with self._state_lock:
+                if self._closed:
+                    return
+                # 先关闭新生命周期更新，再把已有更新按序送达所有 Rank。
+                self._closed = True
             self._flush_pending()
             self._run_command(_Shutdown(), lambda: None, require_consensus=True)
-            self._closed = True
 
     def _execute(self, batch: ExecutionBatch) -> ExecutionOutput:
         with self._command_lock:
-            self._ensure_open()
-            updates = self._take_pending()
+            with self._state_lock:
+                self._ensure_open_locked()
+                updates = self._take_pending_locked()
             value = self._run_command(
                 _Execute(batch, updates),
                 lambda: self._local.execute(batch),
@@ -486,7 +495,8 @@ class TensorParallelModelExecutor:
         return value
 
     def _flush_pending(self) -> None:
-        updates = self._take_pending()
+        with self._state_lock:
+            updates = self._take_pending_locked()
         if not updates:
             return
         self._run_command(
@@ -495,13 +505,13 @@ class TensorParallelModelExecutor:
             require_consensus=True,
         )
 
-    def _take_pending(self) -> tuple[_AddRequest | _FreeRequest, ...]:
+    def _take_pending_locked(self) -> tuple[_AddRequest | _FreeRequest, ...]:
         updates = tuple(self._pending)
         self._pending.clear()
         return updates
 
     def _release_lease(self, local: ExecutionLease, request_ids: tuple[str, ...]) -> None:
-        with self._command_lock:
+        with self._state_lock:
             local.release()
             for request_id in request_ids:
                 count = self._lease_counts[request_id] - 1
@@ -518,7 +528,7 @@ class TensorParallelModelExecutor:
             raise ExecutionError(f"tensor parallel leader does not own request {request_id!r}")
         self._pending.append(_FreeRequest(request_id))
 
-    def _ensure_open(self) -> None:
+    def _ensure_open_locked(self) -> None:
         if self._closed:
             raise ExecutionError("tensor parallel executor is closed")
 
