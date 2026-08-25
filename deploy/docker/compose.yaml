@@ -58,18 +58,6 @@ services:
       - ${LIGHT_VLLM_KV_BLOCK_SIZE:-16}
       - --kv-cache-memory-fraction
       - ${LIGHT_VLLM_KV_CACHE_MEMORY_FRACTION:-0.8}
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - >-
-          import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).read()
-      interval: 10s
-      timeout: 3s
-      start_period: 10m
-      retries: 3
     stop_grace_period: 3m
     security_opt:
       - no-new-privileges:true

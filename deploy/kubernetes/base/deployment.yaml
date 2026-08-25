@@ -49,8 +49,6 @@ spec:
             - /models/$(LIGHT_VLLM_MODEL_NAME)
             - --served-model-name
             - $(LIGHT_VLLM_SERVED_MODEL_NAME)
-            - --request-timeout-seconds
-            - "300"
             - --device
             - cuda:0
             - --dtype

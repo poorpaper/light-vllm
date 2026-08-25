@@ -34,17 +34,19 @@ python -m venv /opt/light-vllm/.venv
   --paged-attention-backend triton
 ```
 
-systemd 示例位于 `deploy/native/`。安装前创建专用用户，并确保它有权限读取模型、写入
-`/var/cache/light-vllm` 和访问 NVIDIA 设备：
+systemd 示例位于 `deploy/native/`。安装前创建专用用户，并确保它有权限读取模型和访问 NVIDIA 设备；
+`CacheDirectory=light-vllm` 会创建并授权 `/var/cache/light-vllm`：
 
 ```bash
 sudo useradd --system --home /opt/light-vllm --shell /usr/sbin/nologin light-vllm
-sudo install -d -o light-vllm -g light-vllm /etc/light-vllm /var/cache/light-vllm
+sudo install -d -o light-vllm -g light-vllm /etc/light-vllm
 sudo install -m 0644 deploy/native/light-vllm.service /etc/systemd/system/
 sudo install -m 0644 deploy/native/light-vllm.env.example /etc/light-vllm/light-vllm.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now light-vllm
 ```
+
+unit 要求 `/etc/light-vllm/light-vllm.env` 存在；站点参数只在该文件维护，缺失时服务会明确启动失败。
 
 ## 2. Docker Compose
 
@@ -58,7 +60,8 @@ docker compose \
   up --build -d
 ```
 
-镜像默认基于已验证版本组合 `PyTorch 2.11.0 + CUDA 13.0`，也可在构建时通过 `BASE_IMAGE` 替换。
+镜像默认基于已验证版本组合 `PyTorch 2.11.0 + CUDA 13.0`，也可在构建时通过 `BASE_IMAGE` 替换。Compose 继承
+镜像内相同的 healthcheck，不重复声明第二份。
 模型只读挂载，Triton/Torch 编译缓存写入独立 volume，容器根文件系统保持只读。当前进程间通信使用 Pipe，
 不依赖 `--ipc=host` 或额外共享内存权限。
 
