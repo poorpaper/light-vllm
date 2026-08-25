@@ -291,9 +291,10 @@ class Sampler(Protocol):
 ```
 
 `LocalTokenExecutor` 和 `LocalModelExecutor` 都通过组合使用同一个 Sampler。`ConfigurableSampler` 根据不可变
-`SamplingParams` 执行 greedy、temperature、top-k 和 top-p；固定 seed 与输出位置共同确定每一步随机数，因此同一
-请求不受动态 batching 的行顺序和其他请求生命周期影响。`temperature=0` 始终使用 argmax。Sampler 不拥有请求级
-可变状态；Engine 只传采样事实，不包含采样算法分支。
+`SamplingParams` 执行 greedy、temperature、top-k 和 top-p；未指定 seed 的随机请求只在注册时解析一次私有 seed，
+之后由固定 seed 与输出位置共同确定每一步随机数，因此同一请求不受动态 batching 的行顺序和其他请求生命周期
+影响。`temperature=0` 始终使用 argmax，不创建随机 seed。Sampler 不拥有请求级可变状态；Engine 只传采样事实，
+不包含采样算法分支。
 
 投机解码的 acceptance sampling 与普通 Sampler 是不同职责。`NGramChainProposer` 保留最近命中的线性续写，
 `NGramTrieProposer` 将最长重复后缀的所有历史续写按频次、最近位置和 token ID 确定性裁剪为有界 BFS 树。二者只

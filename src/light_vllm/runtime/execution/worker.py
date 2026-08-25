@@ -370,17 +370,12 @@ class StandardDecodeHandler:
             # 模型已经按请求顺序只投影需要采样的行，直接消费连续结果。
             sampling_metadata = tuple(
                 SamplingMetadata(
-                    request_id=batch.requests[row].request_id,
                     params=batch.requests[row].sampling,
                     output_position=batch.requests[row].output_position,
                 )
                 for row in sampling_rows
             )
-            sampled_ids = (
-                self._sampler.sample(model_output.logits)
-                if all(item.params.is_greedy for item in sampling_metadata)
-                else self._sampler.sample(model_output.logits, sampling_metadata)
-            )
+            sampled_ids = self._sampler.sample(model_output.logits, sampling_metadata)
             sampled = dict(zip(sampling_rows, sampled_ids, strict=True))
 
         # 把“算了多少输入”和“确认了哪些输出”作为事实返回给 Engine。

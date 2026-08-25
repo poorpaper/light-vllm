@@ -23,7 +23,6 @@ from light_vllm.runtime.generation.interfaces import (
     GenerationNotReadyError,
     TokenGenerated,
 )
-from light_vllm.runtime.sampling import SamplingParams
 
 
 class ReferenceGenerationService:
@@ -49,11 +48,7 @@ class ReferenceGenerationService:
         with self._execution_lock:
             try:
                 # 一个请求只打开一次 session，生成途中 reload 不会切换模型。
-                execution = (
-                    self._executor.open_session()
-                    if request.sampling == SamplingParams()
-                    else self._executor.open_session(request.sampling)
-                )
+                execution = self._executor.open_session(request.sampling)
                 for position in range(request.max_new_tokens):
                     token_id = execution.next_token(tuple(token_ids))
                     token_ids.append(token_id)

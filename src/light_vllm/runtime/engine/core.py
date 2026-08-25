@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from itertools import count
-from secrets import randbits
 
 from light_vllm.runtime.engine.admission import CapacityAdmission, SafeTTFTAdmission
 from light_vllm.runtime.engine.execution_lane import ExecutionLane
@@ -43,6 +42,7 @@ from light_vllm.runtime.observability.interfaces import (
     PerformanceObserver,
     StepObservation,
 )
+from light_vllm.runtime.sampling import SamplingParams, resolve_sampling_seed
 from light_vllm.runtime.scheduler.interfaces import Scheduler, SchedulerError, SchedulerOutput
 
 
@@ -59,7 +59,7 @@ class _RequestState:
     request_id: str
     request: GenerateRequest
     token_ids: list[int]
-    sampling_seed: int
+    sampling: SamplingParams
     generated_count: int = 0
     events: asyncio.Queue[_QueueItem] = field(default_factory=asyncio.Queue)
 
@@ -274,7 +274,7 @@ class EngineCore:
                 request_id,
                 request,
                 list(request.input_ids),
-                request.sampling.seed if request.sampling.seed is not None else randbits(63),
+                resolve_sampling_seed(request.sampling),
             )
             self._states[request_id] = state
             capacity = len(request.input_ids) + request.max_new_tokens
@@ -439,7 +439,7 @@ class EngineCore:
                     max_output_tokens=item.max_output_tokens,
                     block_ids=item.block_ids,
                     num_readonly_prefix_blocks=item.num_readonly_prefix_blocks,
-                    sampling=replace(state.request.sampling, seed=state.sampling_seed),
+                    sampling=state.sampling,
                     output_position=state.generated_count,
                 )
             )

@@ -126,7 +126,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ModelWorker` | 一个设备 rank 内固定模型版本并编排请求生命周期 |
 | `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回连续有效 logits 与请求边界 |
 | `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
-| `SamplingParams` / `SamplingMetadata` | 不可变逐请求采样参数，以及与动态 batching 顺序无关的请求/输出位置事实 |
+| `SamplingParams` / `SamplingMetadata` | 不可变逐请求采样参数，以及与动态 batching 顺序无关的输出位置事实 |
 | `Sampler` | 从二维 `[batch, vocabulary]` logits 按逐请求元数据选择 token |
 | `ForwardBatch` / `ModelOutput` | 一维 token 流、请求边界、绝对 position、attention 上下文与对应 logits 的统一模型边界 |
 | `ModelKVCacheSpec` | 模型声明的逐 attention 层 K/V 形状 |
@@ -326,10 +326,10 @@ worker = LocalModelWorker(runner, step_factory, StandardDecodeHandler(sampler))
 model_executor = LocalModelExecutor(worker)
 ```
 
-`SamplingParams` 表达 temperature、top-k、top-p 和可选 seed；`temperature=0` 始终走 greedy。Engine 为未指定 seed
-的请求生成一次私有 seed，并把 request ID、固定 seed 和当前输出位置作为 `SamplingMetadata` 传给 Sampler。
-因此同一请求的随机序列不受并发请求进入、退出或批次行顺序影响，取消、异常和结束也无需在 Sampler 内维护可泄漏
-的可变状态。v0.2 明确拒绝“随机 sampling + speculative decoding”的组合。
+`SamplingParams` 表达 temperature、top-k、top-p 和可选 seed；`temperature=0` 始终走 greedy。Engine 只为未指定
+seed 的随机请求生成一次私有 seed，之后每轮把同一组参数和当前输出位置作为 `SamplingMetadata` 传给 Sampler；
+greedy 请求保持原参数，不生成 seed。因此同一随机请求的序列不受并发请求进入、退出或批次行顺序影响，取消、异常
+和结束也无需在 Sampler 内维护可泄漏的可变状态。v0.2 明确拒绝“随机 sampling + speculative decoding”的组合。
 
 投机解码的 acceptance sampler 不等同于普通 Sampler：
 `NGramChainProposer` 和 `NGramTrieProposer` 都返回 `DraftTree`，通用 `SpeculativeDecodeHandler` 将正式输入和草稿
@@ -408,6 +408,7 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也�
 | HTTP adapter | `src/light_vllm/serving/http.py` |
 | 文本处理契约 | `src/light_vllm/serving/interfaces.py` |
 | 本地 tokenizer | `src/light_vllm/serving/text.py` |
+| stream 生命周期 | `src/light_vllm/serving/streams.py` |
 | OpenAI adapter | `src/light_vllm/serving/openai.py` |
 | Prometheus adapter | `src/light_vllm/serving/prometheus.py` |
 | 装配入口 | `src/light_vllm/entrypoints/http.py` |

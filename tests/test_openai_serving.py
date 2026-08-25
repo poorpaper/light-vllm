@@ -51,9 +51,6 @@ class FakeTextProcessor:
         self.chat_messages = messages
         return (3, 4, 5)
 
-    def decode(self, token_ids: tuple[int, ...]) -> str:
-        return "".join({10: "hello", 11: "<END>", 12: "tail"}[item] for item in token_ids)
-
     def new_decoder(self):
         return PieceDecoder({10: "hello<", 11: "END>", 12: "tail"})
 

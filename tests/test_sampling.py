@@ -5,11 +5,10 @@ from light_vllm import ConfigurableSampler, SamplingMetadata, SamplingParams
 from light_vllm.runtime.sampling import SamplingError
 
 
-def _metadata(request_id: str, *, seed: int, position: int = 0, **changes):
+def _metadata(*, seed: int, position: int = 0, **changes):
     params = {"temperature": 1.0, "seed": seed}
     params.update(changes)
     return SamplingMetadata(
-        request_id=request_id,
         params=SamplingParams(**params),
         output_position=position,
     )
@@ -20,7 +19,7 @@ def test_temperature_zero_is_greedy() -> None:
 
     assert ConfigurableSampler().sample(
         logits,
-        (SamplingMetadata("request", SamplingParams(seed=7), 0),),
+        (SamplingMetadata(SamplingParams(seed=7), 0),),
     ) == (1,)
 
 
@@ -30,8 +29,8 @@ def test_top_k_one_and_small_top_p_keep_the_best_token() -> None:
     assert ConfigurableSampler().sample(
         logits,
         (
-            _metadata("top-k", seed=3, top_k=1),
-            _metadata("top-p", seed=5, top_p=0.01),
+            _metadata(seed=3, top_k=1),
+            _metadata(seed=5, top_p=0.01),
         ),
     ) == (1, 1)
 
@@ -41,14 +40,14 @@ def test_very_small_temperature_remains_numerically_stable() -> None:
 
     assert ConfigurableSampler().sample(
         logits,
-        (_metadata("request", seed=3, temperature=1e-300),),
+        (_metadata(seed=3, temperature=1e-300),),
     ) == (1,)
 
 
 def test_fixed_seed_is_independent_of_batch_row_order() -> None:
     logits = torch.tensor([[0.1, 0.2, 0.3], [0.1, 0.2, 0.3]])
-    first = _metadata("first", seed=11, position=4)
-    second = _metadata("second", seed=29, position=4)
+    first = _metadata(seed=11, position=4)
+    second = _metadata(seed=29, position=4)
     sampler = ConfigurableSampler()
 
     forward = sampler.sample(logits, (first, second))
@@ -63,7 +62,7 @@ def test_fixed_seed_sequence_is_stable_when_a_peer_enters_and_leaves_the_batch()
     sampler = ConfigurableSampler()
 
     alone = tuple(
-        sampler.sample(request_logits, (_metadata("request", seed=11, position=position),))[0]
+        sampler.sample(request_logits, (_metadata(seed=11, position=position),))[0]
         for position in range(4)
     )
     interleaved: list[int] = []
@@ -72,8 +71,8 @@ def test_fixed_seed_sequence_is_stable_when_a_peer_enters_and_leaves_the_batch()
             sampled = sampler.sample(
                 torch.cat((peer_logits, request_logits)),
                 (
-                    _metadata("peer", seed=29, position=position),
-                    _metadata("request", seed=11, position=position),
+                    _metadata(seed=29, position=position),
+                    _metadata(seed=11, position=position),
                 ),
             )
             interleaved.append(sampled[1])
@@ -81,7 +80,7 @@ def test_fixed_seed_sequence_is_stable_when_a_peer_enters_and_leaves_the_batch()
             interleaved.append(
                 sampler.sample(
                     request_logits,
-                    (_metadata("request", seed=11, position=position),),
+                    (_metadata(seed=11, position=position),),
                 )[0]
             )
 
@@ -108,5 +107,9 @@ def test_sampler_rejects_top_k_larger_than_vocabulary() -> None:
     with pytest.raises(SamplingError, match="vocabulary"):
         ConfigurableSampler().sample(
             torch.ones(1, 2),
-            (_metadata("request", seed=1, top_k=3),),
+            (_metadata(seed=1, top_k=3),),
         )
+
+
+def test_runtime_sampling_allows_temperature_above_openai_limit() -> None:
+    assert SamplingParams(temperature=3.0).temperature == 3.0

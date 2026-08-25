@@ -67,7 +67,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   门控仍生效；请求可以覆盖全局 TTFT SLO。它是独立控制组件，不属于只读 `PerformanceObserver`。HTTP 分别把
   容量拒绝和当前负载过载表达为 422/429。
 - `Sampler` 独立于 Executor；`ConfigurableSampler` 消费不可变 `SamplingParams` 和逐请求 `SamplingMetadata`，支持
-  greedy、temperature、top-k、top-p 与 seed。Engine 固定请求私有 seed，随机序列不受动态 batching 行顺序影响。
+  greedy、temperature、top-k、top-p 与 seed。Engine 只为未指定 seed 的随机请求解析一次私有 seed；greedy 不生成
+  随机 seed，随机序列不受动态 batching 行顺序影响。
 - `PerformanceObserver` 在 Engine 已生效的生命周期边界记录 TTFT、可见 token 间隔、step 延迟与请求结果，只读取
   Scheduler/KV 不可变快照；Prometheus、Grafana、HPA 和 KEDA 不进入推理热路径。
 - FastAPI token 路由只依赖 `EngineClient`；OpenAI 文本路由额外依赖 serving 自己的 `TextProcessor`，把本地
@@ -116,6 +117,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/serving/http.py` | FastAPI JSON/SSE adapter |
 | `src/light_vllm/serving/interfaces.py` | 文本编码与增量解码契约 |
 | `src/light_vllm/serving/text.py` | 本地 Hugging Face tokenizer adapter |
+| `src/light_vllm/serving/streams.py` | serving adapter 共用的 Engine stream 关闭边界 |
 | `src/light_vllm/serving/openai.py` | OpenAI Completion/Chat、stop、usage 与错误映射 |
 | `src/light_vllm/serving/prometheus.py` | 性能快照到 Prometheus 文本格式的转换 |
 | `src/light_vllm/entrypoints/http.py` | 具体组件的装配入口 |
@@ -148,8 +150,9 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 18. 取消请求必须立即退出后续调度；已开始执行的同步步骤到达安全边界后，其结果必须丢弃。
 19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID、prefix cache、self-resubmit 和未来 victim preemption；
     Worker/Step Handler 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
-20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。固定 seed 的逐请求随机序列不得受
-    动态 batching 的行顺序、其他请求进入或取消影响；Sampler 不得持有需要按请求清理的可变 RNG 状态。
+20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。普通 Decode Handler 始终传递同一个
+    逐请求采样契约，由 Sampler 决定 greedy 或随机路径；固定 seed 的随机序列不得受动态 batching 的行顺序、其他
+    请求进入或取消影响，Sampler 不得持有需要按请求清理的可变 RNG 状态。
 21. 投机解码由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor 或 Worker。
     proposer 只返回 `DraftTree`；Decode Handler 将其降为 `QueryLayout`，并在返回前调用 `compact()` 压实命中路径。
     Engine、Scheduler、Executor、Worker 和模型不得理解具体树策略。

@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from functools import partial
 from math import isfinite
 from typing import Annotated, Literal
 from uuid import uuid4
@@ -28,6 +28,7 @@ from light_vllm.runtime.generation.interfaces import (
 )
 from light_vllm.runtime.sampling import SamplingParams
 from light_vllm.serving.interfaces import ChatMessage, TextProcessingError, TextProcessor
+from light_vllm.serving.streams import close_stream
 
 StrictPositiveInt = Annotated[int, Field(strict=True, ge=1)]
 StrictSeed = Annotated[int, Field(strict=True, ge=0, lt=2**63)]
@@ -41,11 +42,10 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
-class CompletionRequest(BaseModel):
+class _GenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str = Field(min_length=1)
-    prompt: str
     max_tokens: StrictPositiveInt = 16
     temperature: Temperature = 1.0
     top_p: TopP = 1.0
@@ -55,6 +55,10 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     n: Literal[1] = 1
+
+
+class CompletionRequest(_GenerationRequest):
+    prompt: str
 
 
 class ChatMessageRequest(BaseModel):
@@ -64,20 +68,8 @@ class ChatMessageRequest(BaseModel):
     content: str
 
 
-class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model: str = Field(min_length=1)
+class ChatCompletionRequest(_GenerationRequest):
     messages: list[ChatMessageRequest] = Field(min_length=1)
-    max_tokens: StrictPositiveInt = 16
-    temperature: Temperature = 1.0
-    top_p: TopP = 1.0
-    top_k: StrictPositiveInt | None = None
-    seed: StrictSeed | None = None
-    stop: str | list[str] | None = None
-    stream: bool = False
-    stream_options: StreamOptions | None = None
-    n: Literal[1] = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,19 +210,6 @@ class _StopBuffer:
         return visible, False
 
 
-async def _close_events(events: AsyncIterator[object]) -> None:
-    close = getattr(events, "aclose", None)
-    if close is None:
-        return
-    pending = asyncio.create_task(close())
-    try:
-        await asyncio.shield(pending)
-    except asyncio.CancelledError:
-        with suppress(Exception):
-            await pending
-        raise
-
-
 async def _consume_text(
     engine_events: AsyncIterator[object],
     *,
@@ -290,7 +269,7 @@ async def _text_stream(
                 ):
                     yield item
     finally:
-        await _close_events(events)
+        await close_stream(events)
 
 
 def _sampling_request(
@@ -298,7 +277,6 @@ def _sampling_request(
     input_ids: tuple[int, ...],
     config: OpenAIServingConfig,
 ) -> GenerateRequest:
-    _validate_model(payload.model, config)
     if not input_ids:
         raise _OpenAIRequestError("prompt must produce at least one token", param="prompt")
     if payload.top_k is not None and payload.top_k > config.text_processor.vocab_size:
@@ -343,109 +321,90 @@ def _chunk_base(response_id: str, created: int, model: str, object_name: str) ->
     return {"id": response_id, "object": object_name, "created": created, "model": model}
 
 
-async def _completion_sse(
-    first: _TextEvent,
-    events: AsyncIterator[_TextEvent],
+def _completion_chunks(
+    item: _TextEvent,
     *,
-    response_id: str,
-    created: int,
-    model: str,
+    base: dict[str, object],
     include_usage: bool,
-) -> AsyncIterator[bytes]:
-    base = _chunk_base(response_id, created, model, "text_completion")
-    try:
-
-        async def emit(item: _TextEvent) -> AsyncIterator[bytes]:
-            if isinstance(item, _TextDelta):
-                yield _sse_data(
-                    base
-                    | {
-                        "choices": [
-                            {"index": 0, "text": item.text, "logprobs": None, "finish_reason": None}
-                        ]
-                    }
-                )
-                return
-            yield _sse_data(
+) -> tuple[bytes, ...]:
+    if isinstance(item, _TextDelta):
+        return (
+            _sse_data(
                 base
                 | {
                     "choices": [
-                        {
-                            "index": 0,
-                            "text": "",
-                            "logprobs": None,
-                            "finish_reason": item.finish_reason,
-                        }
+                        {"index": 0, "text": item.text, "logprobs": None, "finish_reason": None}
                     ]
                 }
-            )
-            if include_usage:
-                yield _sse_data(base | {"choices": [], "usage": item.usage.as_dict()})
-
-        async for chunk in emit(first):
-            yield chunk
-        async for item in events:
-            async for chunk in emit(item):
-                yield chunk
-    except Exception as exc:
-        _, body = _error_body(exc)
-        yield _sse_data(body)
-    finally:
-        await _close_events(events)
-    yield b"data: [DONE]\n\n"
-
-
-async def _chat_sse(
-    first: _TextEvent,
-    events: AsyncIterator[_TextEvent],
-    *,
-    response_id: str,
-    created: int,
-    model: str,
-    include_usage: bool,
-) -> AsyncIterator[bytes]:
-    base = _chunk_base(response_id, created, model, "chat.completion.chunk")
-    try:
-        yield _sse_data(
+            ),
+        )
+    chunks = [
+        _sse_data(
             base
             | {
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
-                        "finish_reason": None,
+                        "text": "",
+                        "logprobs": None,
+                        "finish_reason": item.finish_reason,
                     }
                 ]
             }
         )
+    ]
+    if include_usage:
+        chunks.append(_sse_data(base | {"choices": [], "usage": item.usage.as_dict()}))
+    return tuple(chunks)
 
-        async def emit(item: _TextEvent) -> AsyncIterator[bytes]:
-            if isinstance(item, _TextDelta):
-                yield _sse_data(
-                    base
-                    | {
-                        "choices": [
-                            {"index": 0, "delta": {"content": item.text}, "finish_reason": None}
-                        ]
-                    }
-                )
-                return
-            yield _sse_data(
-                base | {"choices": [{"index": 0, "delta": {}, "finish_reason": item.finish_reason}]}
-            )
-            if include_usage:
-                yield _sse_data(base | {"choices": [], "usage": item.usage.as_dict()})
 
-        async for chunk in emit(first):
+def _chat_chunks(
+    item: _TextEvent,
+    *,
+    base: dict[str, object],
+    include_usage: bool,
+) -> tuple[bytes, ...]:
+    if isinstance(item, _TextDelta):
+        return (
+            _sse_data(
+                base
+                | {
+                    "choices": [
+                        {"index": 0, "delta": {"content": item.text}, "finish_reason": None}
+                    ]
+                }
+            ),
+        )
+    chunks = [
+        _sse_data(
+            base | {"choices": [{"index": 0, "delta": {}, "finish_reason": item.finish_reason}]}
+        )
+    ]
+    if include_usage:
+        chunks.append(_sse_data(base | {"choices": [], "usage": item.usage.as_dict()}))
+    return tuple(chunks)
+
+
+async def _sse_stream(
+    first: _TextEvent,
+    events: AsyncIterator[_TextEvent],
+    *,
+    encode: Callable[[_TextEvent], tuple[bytes, ...]],
+    initial: tuple[bytes, ...] = (),
+) -> AsyncIterator[bytes]:
+    try:
+        for chunk in initial:
+            yield chunk
+        for chunk in encode(first):
             yield chunk
         async for item in events:
-            async for chunk in emit(item):
+            for chunk in encode(item):
                 yield chunk
     except Exception as exc:
         _, body = _error_body(exc)
         yield _sse_data(body)
     finally:
-        await _close_events(events)
+        await close_stream(events)
     yield b"data: [DONE]\n\n"
 
 
@@ -459,7 +418,7 @@ async def _collect_text(events: AsyncIterator[_TextEvent]) -> tuple[str, _TextFi
             else:
                 finished = item
     finally:
-        await _close_events(events)
+        await close_stream(events)
     if finished is None:
         raise GenerationError("text stream ended without a terminal event")
     return "".join(text), finished
@@ -480,15 +439,22 @@ def create_openai_router(engine: EngineClient, config: OpenAIServingConfig) -> A
                 first = await anext(events)
                 response_id = f"cmpl-{uuid4().hex}"
                 created = int(time.time())
+                base = _chunk_base(
+                    response_id,
+                    created,
+                    config.served_model_name,
+                    "text_completion",
+                )
                 return StreamingResponse(
-                    _completion_sse(
+                    _sse_stream(
                         first,
                         events,
-                        response_id=response_id,
-                        created=created,
-                        model=config.served_model_name,
-                        include_usage=bool(
-                            payload.stream_options and payload.stream_options.include_usage
+                        encode=partial(
+                            _completion_chunks,
+                            base=base,
+                            include_usage=bool(
+                                payload.stream_options and payload.stream_options.include_usage
+                            ),
                         ),
                     ),
                     media_type="text/event-stream",
@@ -529,16 +495,36 @@ def create_openai_router(engine: EngineClient, config: OpenAIServingConfig) -> A
                 first = await anext(events)
                 response_id = f"chatcmpl-{uuid4().hex}"
                 created = int(time.time())
+                base = _chunk_base(
+                    response_id,
+                    created,
+                    config.served_model_name,
+                    "chat.completion.chunk",
+                )
+                role_chunk = _sse_data(
+                    base
+                    | {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": ""},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                )
                 return StreamingResponse(
-                    _chat_sse(
+                    _sse_stream(
                         first,
                         events,
-                        response_id=response_id,
-                        created=created,
-                        model=config.served_model_name,
-                        include_usage=bool(
-                            payload.stream_options and payload.stream_options.include_usage
+                        encode=partial(
+                            _chat_chunks,
+                            base=base,
+                            include_usage=bool(
+                                payload.stream_options and payload.stream_options.include_usage
+                            ),
                         ),
+                        initial=(role_chunk,),
                     ),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

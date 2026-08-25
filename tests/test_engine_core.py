@@ -12,6 +12,7 @@ from light_vllm import (
     GenerateResult,
     GenerationError,
     GenerationOverloadedError,
+    SamplingParams,
     TokenGenerated,
 )
 from light_vllm.runtime.engine import (
@@ -63,6 +64,7 @@ class RecordingExecutor:
     ) -> None:
         self.history: list[tuple[tuple[int, ...], ...]] = []
         self.context_history: list[tuple[tuple[int, ...] | None, ...]] = []
+        self.sampling_history: list[tuple[SamplingParams, ...]] = []
         self.execution_thread_ids: list[int] = []
         self.active: set[str] = set()
         self.multiple_tokens = multiple_tokens
@@ -90,6 +92,7 @@ class RecordingExecutor:
         step = len(self.history)
         self.history.append(tuple(request.input_token_ids for request in batch.requests))
         self.context_history.append(tuple(request.context_token_ids for request in batch.requests))
+        self.sampling_history.append(tuple(request.sampling for request in batch.requests))
         if step == 0:
             self.first_step_started.set()
             if self.block_first_step:
@@ -163,6 +166,34 @@ def test_inline_driver_publishes_a_token_before_starting_the_next_step() -> None
         assert len(executor.history) == 1
         await events.aclose()
         await engine.close()
+
+    asyncio.run(run())
+
+
+def test_engine_resolves_only_unseeded_random_sampling_once_per_request() -> None:
+    async def run() -> None:
+        random_executor = RecordingExecutor()
+        random_engine = _engine(random_executor)
+        await random_engine.generate(
+            GenerateRequest(
+                input_ids=(1,),
+                max_new_tokens=2,
+                sampling=SamplingParams(temperature=1.0),
+            )
+        )
+        await random_engine.close()
+
+        resolved = [batch[0] for batch in random_executor.sampling_history]
+        assert len(resolved) == 2
+        assert resolved[0] is resolved[1]
+        assert resolved[0].seed is not None
+
+        greedy_executor = RecordingExecutor()
+        greedy_engine = _engine(greedy_executor)
+        await greedy_engine.generate(GenerateRequest(input_ids=(1,), max_new_tokens=1))
+        await greedy_engine.close()
+
+        assert greedy_executor.sampling_history[0][0].seed is None
 
     asyncio.run(run())
 

@@ -63,7 +63,7 @@ from light_vllm.runtime.kv_cache import (
 )
 from light_vllm.runtime.observability.interfaces import PerformanceMetricsReader
 from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
-from light_vllm.runtime.sampling import ConfigurableSampler
+from light_vllm.runtime.sampling import ConfigurableSampler, GreedySampler
 from light_vllm.runtime.scheduler.interfaces import (
     DecodingBudget,
     SelfResubmitPolicy,
@@ -235,7 +235,7 @@ def _create_engine_runtime(
             )
         decode_handler = SpeculativeDecodeHandler(
             proposer,
-            ConfigurableSampler(),
+            GreedySampler(),
             GreedyTreeAcceptanceSampler(),
             performance_observer,
         )

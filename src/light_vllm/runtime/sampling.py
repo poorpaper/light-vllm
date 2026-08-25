@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
+from secrets import randbits
 from typing import Protocol
 
 import torch
@@ -32,9 +33,9 @@ class SamplingParams:
             isinstance(self.temperature, bool)
             or not isinstance(self.temperature, (int, float))
             or not isfinite(self.temperature)
-            or not 0.0 <= self.temperature <= 2.0
+            or self.temperature < 0.0
         ):
-            raise ValueError("temperature must be finite and within [0, 2]")
+            raise ValueError("temperature must be finite and non-negative")
         if self.top_k is not None and (type(self.top_k) is not int or self.top_k <= 0):
             raise ValueError("top_k must be a positive integer")
         if (
@@ -58,15 +59,20 @@ class SamplingParams:
 class SamplingMetadata:
     """一行 logits 对应的请求及输出位置。"""
 
-    request_id: str
     params: SamplingParams
     output_position: int
 
     def __post_init__(self) -> None:
-        if not self.request_id:
-            raise ValueError("sampling request_id must not be empty")
         if type(self.output_position) is not int or self.output_position < 0:
             raise ValueError("sampling output_position must be a non-negative integer")
+
+
+def resolve_sampling_seed(params: SamplingParams) -> SamplingParams:
+    """只为未指定 seed 的随机请求生成一次私有 seed。"""
+
+    if params.is_greedy or params.seed is not None:
+        return params
+    return replace(params, seed=randbits(63))
 
 
 class Sampler(Protocol):

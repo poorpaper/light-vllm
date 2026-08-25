@@ -44,10 +44,10 @@ class _HuggingFaceIncrementalDecoder:
         if type(token_id) is not int or token_id < 0:
             raise TextProcessingError("token_id must be a non-negative integer")
         self._token_ids.append(token_id)
-        prefix = self._processor.decode(
+        prefix = self._processor._decode(
             tuple(self._token_ids[self._prefix_offset : self._read_offset])
         )
-        text = self._processor.decode(tuple(self._token_ids[self._prefix_offset :]))
+        text = self._processor._decode(tuple(self._token_ids[self._prefix_offset :]))
         if len(text) <= len(prefix) or text.endswith("\ufffd"):
             return ""
         delta = text[len(prefix) :]
@@ -59,10 +59,10 @@ class _HuggingFaceIncrementalDecoder:
         if self._finished:
             return ""
         self._finished = True
-        prefix = self._processor.decode(
+        prefix = self._processor._decode(
             tuple(self._token_ids[self._prefix_offset : self._read_offset])
         )
-        text = self._processor.decode(tuple(self._token_ids[self._prefix_offset :]))
+        text = self._processor._decode(tuple(self._token_ids[self._prefix_offset :]))
         return text[len(prefix) :] if text.startswith(prefix) else text
 
 
@@ -139,7 +139,7 @@ class HuggingFaceTextProcessor:
             raise TextProcessingError("cannot apply the tokenizer chat template") from exc
         return _token_ids(value, operation="chat template")
 
-    def decode(self, token_ids: tuple[int, ...]) -> str:
+    def _decode(self, token_ids: tuple[int, ...]) -> str:
         try:
             value = self._tokenizer.decode(
                 list(token_ids),

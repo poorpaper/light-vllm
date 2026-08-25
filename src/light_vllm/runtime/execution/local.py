@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from secrets import randbits
-
 import torch
 
 from light_vllm.modeling.models.interfaces import (
@@ -29,7 +27,12 @@ from light_vllm.runtime.execution.interfaces import (
 )
 from light_vllm.runtime.execution.layout import linear_query_layout
 from light_vllm.runtime.execution.worker import _forward
-from light_vllm.runtime.sampling import Sampler, SamplingMetadata, SamplingParams
+from light_vllm.runtime.sampling import (
+    Sampler,
+    SamplingMetadata,
+    SamplingParams,
+    resolve_sampling_seed,
+)
 
 
 class _LocalTokenExecutionSession:
@@ -45,14 +48,7 @@ class _LocalTokenExecutionSession:
     ) -> None:
         self._model = model
         self._sampler = sampler
-        sampling = sampling or SamplingParams()
-        seed = sampling.seed if sampling.seed is not None else randbits(63)
-        self._sampling = SamplingParams(
-            temperature=sampling.temperature,
-            top_k=sampling.top_k,
-            top_p=sampling.top_p,
-            seed=seed,
-        )
+        self._sampling = resolve_sampling_seed(sampling or SamplingParams())
         self._output_position = 0
         self._device = torch.device(device)
 
@@ -86,19 +82,10 @@ class _LocalTokenExecutionSession:
             expected_layers = frozenset(layer.layer_id for layer in model_spec.layers)
             if attention.layer_ids != expected_layers:
                 raise ExecutionError("model did not execute every configured dense attention layer")
-        if self._sampling.is_greedy:
-            token_id = self._sampler.sample(output.logits[-1:])[0]
-        else:
-            token_id = self._sampler.sample(
-                output.logits[-1:],
-                (
-                    SamplingMetadata(
-                        request_id="reference-request",
-                        params=self._sampling,
-                        output_position=self._output_position,
-                    ),
-                ),
-            )[0]
+        token_id = self._sampler.sample(
+            output.logits[-1:],
+            (SamplingMetadata(self._sampling, self._output_position),),
+        )[0]
         self._output_position += 1
         return token_id
 

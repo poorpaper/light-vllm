@@ -37,6 +37,7 @@ from light_vllm.serving.openai import (
     openai_error_response,
 )
 from light_vllm.serving.prometheus import PROMETHEUS_CONTENT_TYPE, render_prometheus
+from light_vllm.serving.streams import close_stream
 
 TokenId = Annotated[int, Field(strict=True, ge=0)]
 Lifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
@@ -172,25 +173,6 @@ def _stream_error_event(exc: Exception) -> bytes:
     return format_sse_event(event="error", data_str=data.model_dump_json())
 
 
-async def _close_engine_stream(events: AsyncIterator[GenerationEvent]) -> None:
-    """安全关闭生成流，避免取消和清理同时发生。"""
-
-    aclose = getattr(events, "aclose", None)
-    if aclose is not None:
-        pending = asyncio.create_task(aclose())
-        try:
-            await asyncio.shield(pending)
-        except asyncio.CancelledError:
-            with suppress(Exception):
-                await pending
-            raise
-        return
-
-    close = getattr(events, "close", None)
-    if close is not None:
-        close()
-
-
 async def _encoded_stream(
     first_event: GenerationEvent, events: AsyncIterator[GenerationEvent]
 ) -> AsyncIterator[bytes]:
@@ -216,7 +198,7 @@ async def _encoded_stream(
     except Exception as exc:
         yield _stream_error_event(exc)
     finally:
-        await _close_engine_stream(events)
+        await close_stream(events)
 
 
 def create_http_app(
@@ -304,17 +286,17 @@ def create_http_app(
             first_event = await anext(events)
         except StopAsyncIteration as exc:
             with suppress(Exception):
-                await _close_engine_stream(events)
+                await close_stream(events)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="generation stream ended without an event",
             ) from exc
         except asyncio.CancelledError:
-            await _close_engine_stream(events)
+            await close_stream(events)
             raise
         except Exception as exc:
             with suppress(Exception):
-                await _close_engine_stream(events)
+                await close_stream(events)
             raise _http_error(exc) from exc
 
         return EventSourceResponse(
