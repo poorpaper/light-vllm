@@ -205,6 +205,7 @@ class Qwen2MLP(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        self._needs_output_reduction = parallel.world_size > 1
         self.register_buffer("_merged_gate_up_weight", None, persistent=False)
         self.register_buffer("_merged_gate_up_weight_t", None, persistent=False)
         self.register_buffer("_down_proj_weight_t", None, persistent=False)
@@ -220,6 +221,9 @@ class Qwen2MLP(nn.Module):
         else:
             gate, up = torch.mm(hidden_states, merged_weight_t).chunk(2, dim=-1)
         local_output = torch.mm(silu_and_mul(gate, up), down_weight_t)
+        if not self._needs_output_reduction:
+            # TP=1 保留原来的直通热路径，不为无通信场景调用 collective 适配层。
+            return local_output
         return self.down_proj.reduce_output(local_output)
 
     def prepare_for_inference(self) -> None:
@@ -307,6 +311,7 @@ class Qwen2Attention(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        self._needs_output_reduction = parallel.world_size > 1
         self.register_buffer("_merged_qkv_weight", None, persistent=False)
         self.register_buffer("_merged_qkv_weight_t", None, persistent=False)
         self.register_buffer("_merged_qkv_bias", None, persistent=False)
@@ -369,6 +374,8 @@ class Qwen2Attention(nn.Module):
         if output_weight_t is None:
             return self.o_proj(attended)
         local_output = torch.mm(attended, output_weight_t)
+        if not self._needs_output_reduction:
+            return local_output
         return self.o_proj.reduce_output(local_output)
 
     def prepare_for_inference(self) -> None:
@@ -496,6 +503,7 @@ class Qwen2ForCausalLM(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.config = config
         self._parallel = parallel
+        self._needs_logits_gather = parallel.world_size > 1
         self.model = Qwen2Model(config, parallel, **factory_kwargs)
         self.lm_head = VocabParallelLinear(
             config.hidden_size,
@@ -593,7 +601,11 @@ class Qwen2ForCausalLM(nn.Module):
             logits = self.lm_head(hidden_states)
         else:
             local_logits = torch.mm(hidden_states, self._lm_head_weight_t)
-            logits = self.lm_head.gather_output(local_logits)
+            logits = (
+                self.lm_head.gather_output(local_logits)
+                if self._needs_logits_gather
+                else local_logits
+            )
         return ModelOutput(logits=logits)
 
     def prepare_for_inference(self) -> None:

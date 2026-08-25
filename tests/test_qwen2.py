@@ -9,6 +9,7 @@ from safetensors.torch import save_file
 
 from light_vllm import ForwardBatch, ModelSpec, create_catalog, create_runner
 from light_vllm.modeling.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+from light_vllm.modeling.tensor_parallel import TensorParallelContext
 from light_vllm.runtime.execution.dense_attention import (
     DenseAttentionMetadata,
     TorchDenseAttention,
@@ -288,6 +289,29 @@ def test_qwen2_logits_match_transformers_reference() -> None:
         actual = _dense_forward(model, input_ids)[0].logits
 
     torch.testing.assert_close(actual, expected[0], atol=1e-6, rtol=1e-5)
+
+
+def test_qwen2_packed_tp1_forward_does_not_enter_collective_adapter() -> None:
+    class ForbiddenCollectives:
+        def all_reduce_sum(self, tensor: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("TP=1 must not all-reduce model output")
+
+        def all_gather_last_dim(
+            self,
+            tensor: torch.Tensor,
+            partition_sizes: tuple[int, ...],
+        ) -> torch.Tensor:
+            raise AssertionError("TP=1 must not all-gather model output")
+
+    model = Qwen2ForCausalLM(
+        Qwen2Config.from_mapping(qwen2_args()),
+        parallel=TensorParallelContext(0, 1, ForbiddenCollectives()),
+    ).eval()
+    model.prepare_for_inference()
+
+    output, _ = _dense_forward(model, torch.tensor([[1, 2, 3]]))
+
+    assert output.logits.shape == (3, 64)
 
 
 def test_qwen2_greedy_tokens_match_transformers_reference() -> None:
