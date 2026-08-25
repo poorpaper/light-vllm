@@ -165,11 +165,13 @@ port_released=false
 if ! curl -fsS --max-time 1 "http://127.0.0.1:${PORT}/metrics" >/dev/null 2>&1; then
   port_released=true
 fi
+gpu_memory_released=false
 for _ in $(seq 1 100); do
   mapfile -t gpu_memory < <(
     nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
   )
   if (( ${gpu_memory[0]} < 64 && ${gpu_memory[1]} < 64 )); then
+    gpu_memory_released=true
     break
   fi
   sleep 0.1
@@ -182,13 +184,24 @@ done
   "$elapsed_ms" \
   "$timed_out" \
   "$port_released" \
+  "$gpu_memory_released" \
   "${remaining[*]}" \
   "${gpu_memory[*]}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-path, victim, exit_code, elapsed_ms, timed_out, port_released, remaining, gpu_memory = sys.argv[1:]
+(
+    path,
+    victim,
+    exit_code,
+    elapsed_ms,
+    timed_out,
+    port_released,
+    gpu_memory_released,
+    remaining,
+    gpu_memory,
+) = sys.argv[1:]
 payload = {
     "killed_local_rank": 1,
     "victim_pid": int(victim),
@@ -196,6 +209,7 @@ payload = {
     "exit_elapsed_ms": int(elapsed_ms),
     "exit_timed_out": timed_out == "true",
     "port_released": port_released == "true",
+    "gpu_memory_released": gpu_memory_released == "true",
     "remaining_server_pids": remaining.split(),
     "gpu_memory_used_mib": [int(value) for value in gpu_memory.split()],
 }
@@ -203,6 +217,12 @@ Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 print(json.dumps(payload, indent=2))
 PY
 
-if [[ "$exit_code" -eq 0 || "$timed_out" == true || "$port_released" != true || ${#remaining[@]} -ne 0 ]]; then
+if [[
+  "$exit_code" -eq 0
+  || "$timed_out" == true
+  || "$port_released" != true
+  || "$gpu_memory_released" != true
+  || ${#remaining[@]} -ne 0
+]]; then
   exit 1
 fi
