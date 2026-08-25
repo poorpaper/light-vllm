@@ -110,7 +110,7 @@ class InvalidOutputForwarder:
 
 
 class FixedSampler:
-    def sample(self, logits: torch.Tensor) -> tuple[int, ...]:
+    def sample(self, logits: torch.Tensor, metadata=None) -> tuple[int, ...]:
         return (7,) * logits.shape[0]
 
 
@@ -689,7 +689,7 @@ def test_standard_decode_samples_the_packed_logits_without_restacking() -> None:
     class RecordingSampler:
         seen = None
 
-        def sample(self, value):
+        def sample(self, value, metadata=None):
             self.seen = value
             return (1, 0)
 

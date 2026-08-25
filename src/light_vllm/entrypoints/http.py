@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
+from math import isfinite
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -62,7 +63,7 @@ from light_vllm.runtime.kv_cache import (
 )
 from light_vllm.runtime.observability.interfaces import PerformanceMetricsReader
 from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
-from light_vllm.runtime.sampling import GreedySampler
+from light_vllm.runtime.sampling import ConfigurableSampler, GreedySampler
 from light_vllm.runtime.scheduler.interfaces import (
     DecodingBudget,
     SelfResubmitPolicy,
@@ -72,6 +73,8 @@ from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
+
+    from light_vllm.serving.interfaces import TextProcessor
 
 
 _DTYPES = {
@@ -241,7 +244,7 @@ def _create_engine_runtime(
             max_output_tokens=config.num_speculative_tokens + 1,
         )
     else:
-        decode_handler = StandardDecodeHandler(GreedySampler())
+        decode_handler = StandardDecodeHandler(ConfigurableSampler())
         decoding_budget = None
 
     worker = LocalModelWorker(runner, step_factory, decode_handler)
@@ -343,12 +346,16 @@ def create_serving_app(
     self_resubmit_initial_extra_blocks: int = 1,
     self_resubmit_kv_admission_watermark: float = 0.9,
     engine_process: bool = False,
+    text_processor: TextProcessor | None = None,
+    served_model_name: str | None = None,
+    request_timeout_seconds: float | None = 300.0,
 ) -> FastAPI:
     """创建 HTTP 服务，并选择 reference 或批量 Engine Core。"""
 
     # FastAPI 是可选依赖。只有启动 HTTP 服务时才导入，
     # 没有安装它也不影响核心模型功能。
     from light_vllm.serving.http import create_http_app
+    from light_vllm.serving.openai import OpenAIServingConfig
 
     close_engine: Callable[[], Awaitable[None]] | None = None
     start_engine: Callable[[], Awaitable[None]] | None = None
@@ -360,6 +367,8 @@ def create_serving_app(
         raise ValueError(f"unsupported paged attention backend: {paged_attention_backend}")
     if speculative_proposer not in ("chain", "trie"):
         raise ValueError(f"unsupported speculative proposer: {speculative_proposer}")
+    if (text_processor is None) != (served_model_name is None):
+        raise ValueError("text_processor and served_model_name must be configured together")
     if runtime == "reference":
         if engine_process:
             raise ValueError("an engine process requires the engine runtime")
@@ -375,7 +384,7 @@ def create_serving_app(
             raise ValueError("paged attention backend selection requires the engine runtime")
         # 保留原始单请求基线，继续通过轻量 sync-to-async bridge 对外服务。
         runner = create_runner()
-        executor = LocalTokenExecutor(runner, GreedySampler(), device=spec.device)
+        executor = LocalTokenExecutor(runner, ConfigurableSampler(), device=spec.device)
         service = ReferenceGenerationService(executor)
         engine: EngineClient = InProcessEngineClient(service)
         start_runtime = partial(runner.load, spec)
@@ -445,10 +454,21 @@ def create_serving_app(
             if close_engine is not None:
                 await close_engine()
 
+    openai_config = (
+        OpenAIServingConfig(
+            text_processor=text_processor,
+            served_model_name=served_model_name,
+            request_timeout_seconds=request_timeout_seconds,
+            speculative_decoding=bool(num_speculative_tokens),
+        )
+        if text_processor is not None and served_model_name is not None
+        else None
+    )
     return create_http_app(
         engine,
         lifespan=lifespan,
         performance_metrics=performance_metrics,
+        openai_config=openai_config,
     )
 
 
@@ -483,6 +503,18 @@ def _optional_ratio(value: str) -> float | None:
         raise argparse.ArgumentTypeError("value must be within (0, 1] or 'off'") from exc
     if not 0.0 < parsed <= 1.0:
         raise argparse.ArgumentTypeError("value must be within (0, 1] or 'off'")
+    return parsed
+
+
+def _optional_positive_float(value: str) -> float | None:
+    if value.lower() in {"none", "off"}:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be positive or 'off'") from exc
+    if not isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive or 'off'")
     return parsed
 
 
@@ -530,6 +562,22 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=tuple(_DTYPES), default="float32")
     parser.add_argument("--model-args", type=_json_object, default={})
+    openai = parser.add_argument_group("local OpenAI-compatible text API")
+    openai.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="local tokenizer directory; enables /v1/completions and /v1/chat/completions",
+    )
+    openai.add_argument(
+        "--served-model-name",
+        help="model identifier accepted and returned by the OpenAI-compatible endpoints",
+    )
+    openai.add_argument(
+        "--request-timeout-seconds",
+        type=_optional_positive_float,
+        default=300.0,
+        help="whole-request generation timeout, or 'off'",
+    )
     parser.add_argument("--runtime", choices=("reference", "engine"), default="reference")
     parser.add_argument(
         "--engine-process",
@@ -629,6 +677,17 @@ def main() -> None:
     import uvicorn
 
     args = _create_parser().parse_args()
+    text_processor = None
+    served_model_name = None
+    if args.tokenizer is not None:
+        from light_vllm.serving.text import HuggingFaceTextProcessor
+
+        text_processor = HuggingFaceTextProcessor.from_pretrained(args.tokenizer)
+        served_model_name = args.served_model_name or (
+            args.weights.name if args.weights is not None else args.architecture
+        )
+    elif args.served_model_name is not None:
+        raise ValueError("--served-model-name requires --tokenizer")
     spec = ModelSpec(
         architecture=args.architecture,
         loader=args.loader,
@@ -677,6 +736,9 @@ def main() -> None:
             self_resubmit_initial_extra_blocks=(args.self_resubmit_initial_extra_blocks),
             self_resubmit_kv_admission_watermark=(args.self_resubmit_kv_admission_watermark),
             engine_process=args.engine_process,
+            text_processor=text_processor,
+            served_model_name=served_model_name,
+            request_timeout_seconds=args.request_timeout_seconds,
         ),
         host=args.host,
         port=args.port,

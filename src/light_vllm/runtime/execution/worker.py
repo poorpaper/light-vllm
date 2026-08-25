@@ -47,7 +47,7 @@ from light_vllm.runtime.kv_cache import (
     ContiguousKVCacheConfig,
     KVCacheError,
 )
-from light_vllm.runtime.sampling import Sampler
+from light_vllm.runtime.sampling import Sampler, SamplingMetadata
 
 
 def _forward(model: ModelSession, batch: ForwardBatch) -> ModelOutput:
@@ -368,7 +368,14 @@ class StandardDecodeHandler:
         sampled: dict[int, int] = {}
         if sampling_rows:
             # 模型已经按请求顺序只投影需要采样的行，直接消费连续结果。
-            sampled_ids = self._sampler.sample(model_output.logits)
+            sampling_metadata = tuple(
+                SamplingMetadata(
+                    params=batch.requests[row].sampling,
+                    output_position=batch.requests[row].output_position,
+                )
+                for row in sampling_rows
+            )
+            sampled_ids = self._sampler.sample(model_output.logits, sampling_metadata)
             sampled = dict(zip(sampling_rows, sampled_ids, strict=True))
 
         # 把“算了多少输入”和“确认了哪些输出”作为事实返回给 Engine。

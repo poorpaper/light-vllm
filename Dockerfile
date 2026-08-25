@@ -46,4 +46,4 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10m --retries=3 \
   CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).read()"]
 
 ENTRYPOINT ["light-vllm-serve"]
-CMD ["--host", "0.0.0.0", "--port", "8000", "--architecture", "qwen2.5", "--loader", "safetensors", "--weights", "/models/model", "--device", "cuda:0", "--dtype", "bfloat16", "--runtime", "engine", "--engine-process", "--kv-reservation", "blocks", "--paged-attention-backend", "triton"]
+CMD ["--host", "0.0.0.0", "--port", "8000", "--architecture", "qwen2.5", "--loader", "safetensors", "--weights", "/models/model", "--tokenizer", "/models/model", "--device", "cuda:0", "--dtype", "bfloat16", "--runtime", "engine", "--engine-process", "--kv-reservation", "blocks", "--paged-attention-backend", "triton"]

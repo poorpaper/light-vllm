@@ -12,7 +12,7 @@ from light_vllm.runtime.execution import ExecutionError, ExecutionNotReadyError
 
 
 class _SelfSessionExecutor:
-    def open_session(self):
+    def open_session(self, sampling):
         return self
 
 

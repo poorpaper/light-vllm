@@ -1,0 +1,313 @@
+# HELP light_vllm_requests_waiting Requests waiting for a scheduler slot.
+# TYPE light_vllm_requests_waiting gauge
+light_vllm_requests_waiting{model="qwen2.5"} 0
+# HELP light_vllm_requests_running Requests admitted to the scheduler running set.
+# TYPE light_vllm_requests_running gauge
+light_vllm_requests_running{model="qwen2.5"} 0
+# HELP light_vllm_short_launch_requests Admitted short requests still waiting for their first visible token.
+# TYPE light_vllm_short_launch_requests gauge
+light_vllm_short_launch_requests{model="qwen2.5"} 0
+# HELP light_vllm_waiting_pending_tokens Known input tokens not yet computed for waiting requests.
+# TYPE light_vllm_waiting_pending_tokens gauge
+light_vllm_waiting_pending_tokens{model="qwen2.5"} 0
+# HELP light_vllm_running_pending_tokens Known input tokens not yet computed for running requests.
+# TYPE light_vllm_running_pending_tokens gauge
+light_vllm_running_pending_tokens{model="qwen2.5"} 0
+# HELP light_vllm_waiting_max_remaining_tokens Conservative remaining token upper bound of waiting requests.
+# TYPE light_vllm_waiting_max_remaining_tokens gauge
+light_vllm_waiting_max_remaining_tokens{model="qwen2.5"} 0
+# HELP light_vllm_running_max_remaining_tokens Conservative remaining token upper bound of running requests.
+# TYPE light_vllm_running_max_remaining_tokens gauge
+light_vllm_running_max_remaining_tokens{model="qwen2.5"} 0
+# HELP light_vllm_kv_cache_usage_ratio Non-reclaimable KV token slots divided by total token slots.
+# TYPE light_vllm_kv_cache_usage_ratio gauge
+light_vllm_kv_cache_usage_ratio{model="qwen2.5"} 0.0
+# HELP light_vllm_kv_cache_used_token_slots KV token slots that cannot be reclaimed immediately.
+# TYPE light_vllm_kv_cache_used_token_slots gauge
+light_vllm_kv_cache_used_token_slots{model="qwen2.5"} 0
+# HELP light_vllm_kv_cache_claimed_token_slots KV token slots promised to admitted requests but not allocated yet.
+# TYPE light_vllm_kv_cache_claimed_token_slots gauge
+light_vllm_kv_cache_claimed_token_slots{model="qwen2.5"} 0
+# HELP light_vllm_kv_cache_capacity_token_slots Total KV cache capacity in token slots.
+# TYPE light_vllm_kv_cache_capacity_token_slots gauge
+light_vllm_kv_cache_capacity_token_slots{model="qwen2.5"} 32768
+# HELP light_vllm_self_resubmits_total Requests that released their own KV and re-entered scheduling.
+# TYPE light_vllm_self_resubmits_total counter
+light_vllm_self_resubmits_total{model="qwen2.5"} 0
+# HELP light_vllm_self_resubmit_rolled_back_tokens_total Computed-token progress rolled back by self-resubmit.
+# TYPE light_vllm_self_resubmit_rolled_back_tokens_total counter
+light_vllm_self_resubmit_rolled_back_tokens_total{model="qwen2.5"} 0
+# HELP light_vllm_speculation_attempts_total Completed speculative verification attempts.
+# TYPE light_vllm_speculation_attempts_total counter
+light_vllm_speculation_attempts_total{model="qwen2.5"} 0
+# HELP light_vllm_speculation_hits_total Speculative attempts that accepted at least one draft node.
+# TYPE light_vllm_speculation_hits_total counter
+light_vllm_speculation_hits_total{model="qwen2.5"} 0
+# HELP light_vllm_speculative_proposed_nodes_total Draft tree nodes sent to the target model.
+# TYPE light_vllm_speculative_proposed_nodes_total counter
+light_vllm_speculative_proposed_nodes_total{model="qwen2.5"} 0
+# HELP light_vllm_speculative_accepted_nodes_total Draft tree nodes accepted by the target model.
+# TYPE light_vllm_speculative_accepted_nodes_total counter
+light_vllm_speculative_accepted_nodes_total{model="qwen2.5"} 0
+# HELP light_vllm_speculative_verified_tokens_total Tokens produced by speculative target verification, including the final target token.
+# TYPE light_vllm_speculative_verified_tokens_total counter
+light_vllm_speculative_verified_tokens_total{model="qwen2.5"} 0
+# HELP light_vllm_speculative_draft_roots_total Root nodes across proposed draft trees.
+# TYPE light_vllm_speculative_draft_roots_total counter
+light_vllm_speculative_draft_roots_total{model="qwen2.5"} 0
+# HELP light_vllm_speculative_branching_parents_total Draft nodes that had more than one proposed child.
+# TYPE light_vllm_speculative_branching_parents_total counter
+light_vllm_speculative_branching_parents_total{model="qwen2.5"} 0
+# HELP light_vllm_speculative_compacted_tokens_total Accepted draft tokens moved while compacting physical KV.
+# TYPE light_vllm_speculative_compacted_tokens_total counter
+light_vllm_speculative_compacted_tokens_total{model="qwen2.5"} 0
+# HELP light_vllm_speculative_max_draft_depth Maximum observed draft tree depth.
+# TYPE light_vllm_speculative_max_draft_depth gauge
+light_vllm_speculative_max_draft_depth{model="qwen2.5"} 0
+# HELP light_vllm_time_to_first_token_seconds Time from request admission to the first visible token.
+# TYPE light_vllm_time_to_first_token_seconds histogram
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="0.001"} 0
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="0.005"} 0
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="0.01"} 0
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="0.025"} 297
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="0.05"} 355
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="0.1"} 364
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="0.25"} 375
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="0.5"} 385
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="1.0"} 399
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="2.5"} 401
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="5.0"} 472
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="10.0"} 472
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="30.0"} 472
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="60.0"} 472
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="120.0"} 472
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="300.0"} 472
+light_vllm_time_to_first_token_seconds_bucket{model="qwen2.5",le="+Inf"} 472
+light_vllm_time_to_first_token_seconds_count{model="qwen2.5"} 472
+light_vllm_time_to_first_token_seconds_sum{model="qwen2.5"} 273.7428591363132
+# HELP light_vllm_inter_token_latency_seconds Visible interval between output tokens after the first token.
+# TYPE light_vllm_inter_token_latency_seconds histogram
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="0.001"} 0
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="0.005"} 0
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="0.01"} 0
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="0.025"} 60671
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="0.05"} 61074
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="0.1"} 61089
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="0.25"} 61089
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="0.5"} 61100
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="1.0"} 61204
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="2.5"} 61204
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="5.0"} 61204
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="10.0"} 61204
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="30.0"} 61204
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="60.0"} 61204
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="120.0"} 61204
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="300.0"} 61204
+light_vllm_inter_token_latency_seconds_bucket{model="qwen2.5",le="+Inf"} 61204
+light_vllm_inter_token_latency_seconds_count{model="qwen2.5"} 61204
+light_vllm_inter_token_latency_seconds_sum{model="qwen2.5"} 845.0912953671068
+# HELP light_vllm_engine_step_seconds Completed device-step latency grouped by actual model-token upper bound.
+# TYPE light_vllm_engine_step_seconds histogram
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="0.025"} 1208
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="0.05"} 1209
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="0.1"} 1209
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="0.25"} 1209
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="0.5"} 1209
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="1.0"} 1214
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="2.5"} 1214
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="5.0"} 1214
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="10.0"} 1214
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="30.0"} 1214
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="60.0"} 1214
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="120.0"} 1214
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="300.0"} 1214
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="1",le="+Inf"} 1214
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="1"} 1214
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="1"} 15.60799648952484
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="0.025"} 217
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="0.05"} 217
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="0.1"} 217
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="0.25"} 217
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="0.5"} 217
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="1.0"} 218
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="2.5"} 218
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="5.0"} 218
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="10.0"} 218
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="30.0"} 218
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="60.0"} 218
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="120.0"} 218
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="300.0"} 218
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="2",le="+Inf"} 218
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="2"} 218
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="2"} 2.918117834091184
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="0.025"} 876
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="0.05"} 876
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="0.1"} 876
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="0.25"} 876
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="0.5"} 876
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="1.0"} 878
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="2.5"} 878
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="5.0"} 878
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="10.0"} 878
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="30.0"} 878
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="60.0"} 878
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="120.0"} 878
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="300.0"} 878
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="4",le="+Inf"} 878
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="4"} 878
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="4"} 10.852595285415646
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="0.025"} 1016
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="0.05"} 1016
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="0.1"} 1016
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="0.25"} 1016
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="0.5"} 1016
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="1.0"} 1019
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="2.5"} 1019
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="5.0"} 1019
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="10.0"} 1019
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="30.0"} 1019
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="60.0"} 1019
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="120.0"} 1019
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="300.0"} 1019
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="8",le="+Inf"} 1019
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="8"} 1019
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="8"} 12.785579865455622
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="0.025"} 3427
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="0.05"} 3428
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="0.1"} 3428
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="0.25"} 3428
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="0.5"} 3429
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="1.0"} 3433
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="2.5"} 3433
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="5.0"} 3433
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="10.0"} 3433
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="30.0"} 3433
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="60.0"} 3433
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="120.0"} 3433
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="300.0"} 3433
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="16",le="+Inf"} 3433
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="16"} 3433
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="16"} 43.372164422035226
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="0.025"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="0.05"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="0.1"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="0.25"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="0.5"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="1.0"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="2.5"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="5.0"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="10.0"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="30.0"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="60.0"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="120.0"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="300.0"} 10
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="32",le="+Inf"} 10
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="32"} 10
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="32"} 0.11402460861206053
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="0.025"} 184
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="0.05"} 184
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="0.1"} 184
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="0.25"} 184
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="0.5"} 184
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="1.0"} 186
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="2.5"} 186
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="5.0"} 186
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="10.0"} 186
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="30.0"} 186
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="60.0"} 186
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="120.0"} 186
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="300.0"} 186
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="64",le="+Inf"} 186
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="64"} 186
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="64"} 4.396178903579713
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="0.025"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="0.05"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="0.1"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="0.25"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="0.5"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="1.0"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="2.5"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="5.0"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="10.0"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="30.0"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="60.0"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="120.0"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="300.0"} 96
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="128",le="+Inf"} 96
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="128"} 96
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="128"} 1.6855782718658454
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="0.025"} 77
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="0.05"} 78
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="0.1"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="0.25"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="0.5"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="1.0"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="2.5"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="5.0"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="10.0"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="30.0"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="60.0"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="120.0"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="300.0"} 79
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="256",le="+Inf"} 79
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="256"} 79
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="256"} 1.5196513271331789
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="0.001"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="0.005"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="0.01"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="0.025"} 0
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="0.05"} 38
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="0.1"} 38
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="0.25"} 38
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="0.5"} 38
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="1.0"} 40
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="2.5"} 40
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="5.0"} 40
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="10.0"} 40
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="30.0"} 40
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="60.0"} 40
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="120.0"} 40
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="300.0"} 40
+light_vllm_engine_step_seconds_bucket{model="qwen2.5",model_tokens_computed_le="512",le="+Inf"} 40
+light_vllm_engine_step_seconds_count{model="qwen2.5",model_tokens_computed_le="512"} 40
+light_vllm_engine_step_seconds_sum{model="qwen2.5",model_tokens_computed_le="512"} 2.5433671016693116
+# HELP light_vllm_prompt_tokens_total Prompt tokens admitted to the engine.
+# TYPE light_vllm_prompt_tokens_total counter
+light_vllm_prompt_tokens_total{model="qwen2.5"} 41261
+# HELP light_vllm_generation_tokens_total Visible output tokens emitted by the engine.
+# TYPE light_vllm_generation_tokens_total counter
+light_vllm_generation_tokens_total{model="qwen2.5"} 61676
+# HELP light_vllm_requests_total Requests by terminal outcome.
+# TYPE light_vllm_requests_total counter
+light_vllm_requests_total{model="qwen2.5",outcome="finished"} 87
+light_vllm_requests_total{model="qwen2.5",outcome="failed"} 0
+light_vllm_requests_total{model="qwen2.5",outcome="cancelled"} 385
+light_vllm_requests_total{model="qwen2.5",outcome="rejected"} 0
+light_vllm_requests_total{model="qwen2.5",outcome="overloaded"} 0

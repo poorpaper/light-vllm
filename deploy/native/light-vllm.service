@@ -9,21 +9,12 @@ User=light-vllm
 Group=light-vllm
 WorkingDirectory=/opt/light-vllm
 
-# 默认值便于阅读；站点配置放在独立 EnvironmentFile 中覆盖。
-Environment=LIGHT_VLLM_MODEL_PATH=/data/models/Qwen2.5-Coder-7B-Instruct
-Environment=LIGHT_VLLM_ARCHITECTURE=qwen2.5
-Environment=LIGHT_VLLM_DEVICE=cuda:0
-Environment=LIGHT_VLLM_DTYPE=bfloat16
-Environment=LIGHT_VLLM_PORT=8000
-Environment=LIGHT_VLLM_MAX_NUM_SEQUENCES=16
-Environment=LIGHT_VLLM_MAX_NUM_SCHEDULED_TOKENS=512
-Environment=LIGHT_VLLM_KV_BLOCK_SIZE=16
-Environment=LIGHT_VLLM_KV_CACHE_MEMORY_FRACTION=0.8
+# 站点参数只保存在这一份文件中，避免 unit 与 env 各自维护默认值。
+EnvironmentFile=/etc/light-vllm/light-vllm.env
 Environment=PYTHONUNBUFFERED=1
 Environment=XDG_CACHE_HOME=/var/cache/light-vllm
 Environment=TRITON_CACHE_DIR=/var/cache/light-vllm/triton
 Environment=TORCHINDUCTOR_CACHE_DIR=/var/cache/light-vllm/torchinductor
-EnvironmentFile=-/etc/light-vllm/light-vllm.env
 
 ExecStart=/opt/light-vllm/.venv/bin/light-vllm-serve \
     --host 0.0.0.0 \
@@ -31,6 +22,9 @@ ExecStart=/opt/light-vllm/.venv/bin/light-vllm-serve \
     --architecture ${LIGHT_VLLM_ARCHITECTURE} \
     --loader safetensors \
     --weights ${LIGHT_VLLM_MODEL_PATH} \
+    --tokenizer ${LIGHT_VLLM_MODEL_PATH} \
+    --served-model-name ${LIGHT_VLLM_SERVED_MODEL_NAME} \
+    --request-timeout-seconds ${LIGHT_VLLM_REQUEST_TIMEOUT_SECONDS} \
     --device ${LIGHT_VLLM_DEVICE} \
     --dtype ${LIGHT_VLLM_DTYPE} \
     --runtime engine \
@@ -44,9 +38,7 @@ ExecStart=/opt/light-vllm/.venv/bin/light-vllm-serve \
 
 Restart=on-failure
 RestartSec=3s
-TimeoutStartSec=infinity
 TimeoutStopSec=3min
-KillSignal=SIGTERM
 LimitMEMLOCK=infinity
 CacheDirectory=light-vllm
 

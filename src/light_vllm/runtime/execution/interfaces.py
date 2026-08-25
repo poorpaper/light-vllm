@@ -10,6 +10,8 @@ if TYPE_CHECKING:
 
     from light_vllm.modeling.models.interfaces import ModelSession
 
+from light_vllm.runtime.sampling import SamplingParams
+
 
 class ExecutionError(RuntimeError):
     """执行一次模型计算失败时抛出。"""
@@ -188,6 +190,8 @@ class ExecutionRequest:
     # 分页 KV cache 需要 block table；连续 KV cache 不需要，使用 None。
     block_ids: tuple[int, ...] | None
     num_readonly_prefix_blocks: int = 0
+    sampling: SamplingParams = SamplingParams()
+    output_position: int = 0
 
     def __post_init__(self) -> None:
         input_token_ids = tuple(self.input_token_ids)
@@ -205,6 +209,10 @@ class ExecutionRequest:
             raise ValueError("max_output_tokens must be a non-negative integer")
         if type(self.num_readonly_prefix_blocks) is not int or self.num_readonly_prefix_blocks < 0:
             raise ValueError("num_readonly_prefix_blocks must be a non-negative integer")
+        if not isinstance(self.sampling, SamplingParams):
+            raise TypeError("sampling must be SamplingParams")
+        if type(self.output_position) is not int or self.output_position < 0:
+            raise ValueError("output_position must be a non-negative integer")
         object.__setattr__(self, "input_token_ids", input_token_ids)
         if self.context_token_ids is not None:
             context_token_ids = tuple(self.context_token_ids)
@@ -434,7 +442,10 @@ class TokenExecutor(Protocol):
     @property
     def ready(self) -> bool: ...
 
-    def open_session(self) -> TokenExecutionSession: ...
+    def open_session(
+        self,
+        sampling: SamplingParams | None = None,
+    ) -> TokenExecutionSession: ...
 
 
 class ModelExecutor(Protocol):

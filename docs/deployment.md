@@ -1,6 +1,6 @@
 # 生产部署骨架
 
-这一版只建立单节点生产运行骨架，不引入网关、分布式执行、Helm、tokenizer 或 OpenAI 协议。
+这一版提供单节点生产运行骨架和访问本地 GPU 的 OpenAI-compatible 文本协议，不引入网关、分布式执行或 Helm。
 原生、Docker 和 Kubernetes 都启动同一个 `light-vllm-serve` 入口：
 
 ```text
@@ -23,6 +23,9 @@ python -m venv /opt/light-vllm/.venv
   --architecture qwen2.5 \
   --loader safetensors \
   --weights /data/models/Qwen2.5-Coder-7B-Instruct \
+  --tokenizer /data/models/Qwen2.5-Coder-7B-Instruct \
+  --served-model-name Qwen2.5-Coder-7B-Instruct \
+  --request-timeout-seconds 300 \
   --device cuda:0 \
   --dtype bfloat16 \
   --runtime engine \
@@ -31,17 +34,19 @@ python -m venv /opt/light-vllm/.venv
   --paged-attention-backend triton
 ```
 
-systemd 示例位于 `deploy/native/`。安装前创建专用用户，并确保它有权限读取模型、写入
-`/var/cache/light-vllm` 和访问 NVIDIA 设备：
+systemd 示例位于 `deploy/native/`。安装前创建专用用户，并确保它有权限读取模型和访问 NVIDIA 设备；
+`CacheDirectory=light-vllm` 会创建并授权 `/var/cache/light-vllm`：
 
 ```bash
 sudo useradd --system --home /opt/light-vllm --shell /usr/sbin/nologin light-vllm
-sudo install -d -o light-vllm -g light-vllm /etc/light-vllm /var/cache/light-vllm
+sudo install -d -o light-vllm -g light-vllm /etc/light-vllm
 sudo install -m 0644 deploy/native/light-vllm.service /etc/systemd/system/
 sudo install -m 0644 deploy/native/light-vllm.env.example /etc/light-vllm/light-vllm.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now light-vllm
 ```
+
+unit 要求 `/etc/light-vllm/light-vllm.env` 存在；站点参数只在该文件维护，缺失时服务会明确启动失败。
 
 ## 2. Docker Compose
 
@@ -55,7 +60,8 @@ docker compose \
   up --build -d
 ```
 
-镜像默认基于已验证版本组合 `PyTorch 2.11.0 + CUDA 13.0`，也可在构建时通过 `BASE_IMAGE` 替换。
+镜像默认基于已验证版本组合 `PyTorch 2.11.0 + CUDA 13.0`，也可在构建时通过 `BASE_IMAGE` 替换。Compose 继承
+镜像内相同的 healthcheck，不重复声明第二份。
 模型只读挂载，Triton/Torch 编译缓存写入独立 volume，容器根文件系统保持只读。当前进程间通信使用 Pipe，
 不依赖 `--ipc=host` 或额外共享内存权限。
 
@@ -84,7 +90,8 @@ kubectl apply -k deploy/kubernetes/base
 kubectl apply -k deploy/kubernetes/overlays/keda-dual-gpu
 ```
 
-它按所有 Pod 的 waiting token backlog 扩容，每个 Pod 申请一张 GPU，并把编译缓存改为 Pod 独占。
+它按所有 Pod 的 waiting token backlog 扩容，每个 Pod 申请一张 GPU，并把编译缓存改为 Pod 独占。这是两个各自
+加载完整模型的独立副本，不是 Tensor Parallel。
 详细前置条件、阈值语义、验证步骤和能力边界见
 [`deploy/kubernetes/overlays/keda-dual-gpu/README.md`](../deploy/kubernetes/overlays/keda-dual-gpu/README.md)。
 不要把 `examples/monitoring/hpa.yaml` 与这个 overlay 同时应用到同一个 Deployment；KEDA 会自己创建 HPA。
@@ -97,10 +104,13 @@ kubectl apply -k deploy/kubernetes/overlays/keda-dual-gpu
 curl -fsS http://127.0.0.1:8000/healthz
 curl -fsS http://127.0.0.1:8000/readyz
 curl -fsS http://127.0.0.1:8000/capabilities
-curl -fsS -X POST http://127.0.0.1:8000/generate \
+curl -fsS -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"input_ids":[1,2,3],"max_new_tokens":4}'
+  -d '{"model":"Qwen2.5-Coder-7B-Instruct","messages":[{"role":"user","content":"Hello"}],"temperature":0,"max_tokens":16}'
 ```
+
+`/v1/completions`、`/v1/chat/completions` 同时支持流式与非流式响应；`/generate`、`/generate/stream` 继续作为
+token-ID 调试接口。`--tokenizer` 必须指向本地 tokenizer 目录，启动过程不联网且不执行远程代码。
 
 正式切换前要在相同模型、请求序列、到达时间和输出 token 下比较原生与容器：
 

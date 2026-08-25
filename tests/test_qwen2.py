@@ -288,3 +288,30 @@ def test_qwen2_logits_match_transformers_reference() -> None:
         actual = _dense_forward(model, input_ids)[0].logits
 
     torch.testing.assert_close(actual, expected[0], atol=1e-6, rtol=1e-5)
+
+
+def test_qwen2_greedy_tokens_match_transformers_reference() -> None:
+    transformers = pytest.importorskip("transformers")
+    config_values = qwen2_args(tie_word_embeddings=False)
+    hf_config = transformers.Qwen2Config(**config_values)
+    hf_config._attn_implementation = "eager"
+    torch.manual_seed(23)
+    reference = transformers.Qwen2ForCausalLM(hf_config).eval()
+    model = Qwen2ForCausalLM(Qwen2Config.from_mapping(config_values)).eval()
+    model.load_state_dict(reference.state_dict(), strict=True)
+    reference_tokens = [1, 2, 3]
+    actual_tokens = list(reference_tokens)
+
+    with torch.inference_mode():
+        for _ in range(4):
+            expected_logits = reference(
+                input_ids=torch.tensor([reference_tokens]),
+                use_cache=False,
+            ).logits[0, -1]
+            actual_logits = _dense_forward(model, torch.tensor([actual_tokens]))[0].logits[-1]
+            expected_token = int(expected_logits.argmax().item())
+            actual_token = int(actual_logits.argmax().item())
+            reference_tokens.append(expected_token)
+            actual_tokens.append(actual_token)
+
+    assert actual_tokens == reference_tokens

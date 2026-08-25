@@ -42,6 +42,7 @@ from light_vllm.runtime.observability.interfaces import (
     PerformanceObserver,
     StepObservation,
 )
+from light_vllm.runtime.sampling import SamplingParams, resolve_sampling_seed
 from light_vllm.runtime.scheduler.interfaces import Scheduler, SchedulerError, SchedulerOutput
 
 
@@ -58,6 +59,7 @@ class _RequestState:
     request_id: str
     request: GenerateRequest
     token_ids: list[int]
+    sampling: SamplingParams
     generated_count: int = 0
     events: asyncio.Queue[_QueueItem] = field(default_factory=asyncio.Queue)
 
@@ -268,7 +270,12 @@ class EngineCore:
                 raise
 
             request_id = f"request-{next(self._request_ids)}"
-            state = _RequestState(request_id, request, list(request.input_ids))
+            state = _RequestState(
+                request_id,
+                request,
+                list(request.input_ids),
+                resolve_sampling_seed(request.sampling),
+            )
             self._states[request_id] = state
             capacity = len(request.input_ids) + request.max_new_tokens
             try:
@@ -432,6 +439,8 @@ class EngineCore:
                     max_output_tokens=item.max_output_tokens,
                     block_ids=item.block_ids,
                     num_readonly_prefix_blocks=item.num_readonly_prefix_blocks,
+                    sampling=state.sampling,
+                    output_position=state.generated_count,
                 )
             )
         return ExecutionBatch(requests=tuple(requests))

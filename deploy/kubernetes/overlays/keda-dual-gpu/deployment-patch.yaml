@@ -7,12 +7,6 @@ spec:
     spec:
       containers:
         - name: inference
-          # 每个 Pod 申请一张完整 GPU；Device Plugin 负责分配不同设备。
-          resources:
-            requests:
-              nvidia.com/gpu: "1"
-            limits:
-              nvidia.com/gpu: "1"
           lifecycle:
             preStop:
               exec:

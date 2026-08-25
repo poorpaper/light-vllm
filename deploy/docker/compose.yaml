@@ -33,6 +33,12 @@ services:
       - safetensors
       - --weights
       - /models/${LIGHT_VLLM_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --tokenizer
+      - /models/${LIGHT_VLLM_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --served-model-name
+      - ${LIGHT_VLLM_SERVED_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --request-timeout-seconds
+      - ${LIGHT_VLLM_REQUEST_TIMEOUT_SECONDS:-300}
       - --device
       - cuda:0
       - --dtype
@@ -52,18 +58,6 @@ services:
       - ${LIGHT_VLLM_KV_BLOCK_SIZE:-16}
       - --kv-cache-memory-fraction
       - ${LIGHT_VLLM_KV_CACHE_MEMORY_FRACTION:-0.8}
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - >-
-          import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).read()
-      interval: 10s
-      timeout: 3s
-      start_period: 10m
-      retries: 3
     stop_grace_period: 3m
     security_opt:
       - no-new-privileges:true

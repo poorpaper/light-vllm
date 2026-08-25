@@ -27,7 +27,12 @@ from light_vllm.runtime.execution.interfaces import (
 )
 from light_vllm.runtime.execution.layout import linear_query_layout
 from light_vllm.runtime.execution.worker import _forward
-from light_vllm.runtime.sampling import Sampler
+from light_vllm.runtime.sampling import (
+    Sampler,
+    SamplingMetadata,
+    SamplingParams,
+    resolve_sampling_seed,
+)
 
 
 class _LocalTokenExecutionSession:
@@ -38,10 +43,13 @@ class _LocalTokenExecutionSession:
         model: ModelSession,
         sampler: Sampler,
         *,
+        sampling: SamplingParams | None = None,
         device: str | torch.device = "cpu",
     ) -> None:
         self._model = model
         self._sampler = sampler
+        self._sampling = resolve_sampling_seed(sampling or SamplingParams())
+        self._output_position = 0
         self._device = torch.device(device)
 
     def next_token(self, token_ids: tuple[int, ...]) -> int:
@@ -74,7 +82,12 @@ class _LocalTokenExecutionSession:
             expected_layers = frozenset(layer.layer_id for layer in model_spec.layers)
             if attention.layer_ids != expected_layers:
                 raise ExecutionError("model did not execute every configured dense attention layer")
-        return self._sampler.sample(output.logits[-1:])[0]
+        token_id = self._sampler.sample(
+            output.logits[-1:],
+            (SamplingMetadata(self._sampling, self._output_position),),
+        )[0]
+        self._output_position += 1
+        return token_id
 
 
 class LocalTokenExecutor:
@@ -95,12 +108,20 @@ class LocalTokenExecutor:
     def ready(self) -> bool:
         return self._runner.generation > 0
 
-    def open_session(self) -> TokenExecutionSession:
+    def open_session(
+        self,
+        sampling: SamplingParams | None = None,
+    ) -> TokenExecutionSession:
         try:
             model = self._runner.open_session()
         except ModelNotLoadedError as exc:
             raise ExecutionNotReadyError("load a model before executing") from exc
-        return _LocalTokenExecutionSession(model, self._sampler, device=self._device)
+        return _LocalTokenExecutionSession(
+            model,
+            self._sampler,
+            sampling=sampling,
+            device=self._device,
+        )
 
 
 class LocalModelExecutor:

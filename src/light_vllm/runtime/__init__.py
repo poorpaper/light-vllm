@@ -63,7 +63,14 @@ from light_vllm.runtime.kv_cache import (
     PagedKVCacheManager,
     UnboundedKVCacheManager,
 )
-from light_vllm.runtime.sampling import GreedySampler, Sampler, SamplingError
+from light_vllm.runtime.sampling import (
+    ConfigurableSampler,
+    GreedySampler,
+    Sampler,
+    SamplingError,
+    SamplingMetadata,
+    SamplingParams,
+)
 from light_vllm.runtime.scheduler import (
     DecodingBudget,
     ScheduledRequest,
@@ -80,6 +87,7 @@ __all__ = [
     "ContiguousKVCacheConfig",
     "ContiguousKVCacheState",
     "ContiguousLayerKV",
+    "ConfigurableSampler",
     "CudaMemoryKVCachePlanner",
     "DenseAttentionMetadata",
     "CapacityAdmission",
@@ -127,6 +135,8 @@ __all__ = [
     "RequestAdmission",
     "Sampler",
     "SamplingError",
+    "SamplingMetadata",
+    "SamplingParams",
     "ScheduledRequest",
     "Scheduler",
     "SchedulerError",
