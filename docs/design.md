@@ -451,7 +451,7 @@ flowchart LR
     Kernel --> Metrics["性能指标 + Prometheus/Grafana/HPA<br/>完成"]
     Metrics --> SLO["短请求池 + TTFT 早拒 + 可选 self-resubmit<br/>完成"]
     SLO --> OpenAI["本地 tokenizer + OpenAI Completion / Chat<br/>CPU/E2E 测试完成"]
-    OpenAI --> TP["单机 TP / NCCL<br/>双 5090 裸机验收完成"]
+    OpenAI --> TP["单机 TP / NCCL<br/>短序列/显存/故障验收<br/>长生成待量化"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
@@ -459,8 +459,9 @@ Torch 2.8.0、Triton 3.4.0 环境完成既有线性场景的 JIT 和数值对照
 加入，但仍需 CUDA 环境验收。TP 的并行层数学、Qwen 分片声明、KV head 复制和 safetensors rank-local 加载除
 CPU 测试外，已在双 RTX 5090 上覆盖 NCCL、TP=1/2 短序列逐 token 对照、显存、性能、取消和 Rank 故障退出。
 该机器无 CUDA P2P/NVLink，TP=2 使单卡峰值显存从 25,381 MiB 降到 13,237 MiB，但固定解码吞吐为 TP=1 的
-82.8%；这证明了分片容量，不证明该拓扑有加速收益。BF16 长生成会因归约顺序变化在近似并列 logits 处产生不同
-轨迹，尚未完成逐步 logits 容差和质量验收。Docker/Kubernetes TP=2 仍待有容器运行权限的双卡宿主机完成性能 A/B。
+82.8%；这证明了分片容量，不证明该拓扑有加速收益。BF16 长生成已观察到跨 TP size 和同一 TP=1 重复运行的
+轨迹分叉；现象与数值路径差异的自回归放大相符，但分叉点 logits 尚未采集，根因仍待量化，也未完成逐步 logits
+容差和质量验收。Docker/Kubernetes TP=2 仍待有容器运行权限的双卡宿主机完成性能 A/B。
 
 ## 13. 验证要求
 

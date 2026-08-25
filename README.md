@@ -51,7 +51,7 @@
 | --- | --- |
 | 模型与权重 | 原生 Qwen2/Qwen2.5；full attention、default RoPE、GQA、tied embedding；读取 HF/ModelScope 兼容的本地 safetensors 快照 |
 | 执行 | token-major packed query、chunked prefill、连续与分页 KV、PyTorch correctness attention、可选 Triton fused paged attention |
-| 单机并行 | torchrun + NCCL Tensor Parallel；列/行/词表并行、rank-local 权重与 KV；已完成双 RTX 5090 正确性、显存、性能与故障退出验收 |
+| 单机并行 | torchrun + NCCL Tensor Parallel；列/行/词表并行、rank-local 权重与 KV；已完成双 RTX 5090 短序列正确性、显存、性能与故障退出验收 |
 | 调度 | 统一 token budget、严格非抢占 completion claim、prefix cache、短请求资源池、TTFT 早拒、可选 self-resubmit |
 | 解码 | Greedy、temperature、top-k、top-p、逐请求 seed；N-Gram Chain/Trie proposer 共用树形验证和 KV compact |
 | 服务 | 本地 tokenizer、OpenAI-compatible Completion/Chat 流式与非流式 API、token-ID 调试 API、独立 Engine 进程、取消与异常清理、Prometheus 指标 |
@@ -249,15 +249,21 @@ TP=2 把 light-vllm 的单卡峰值显存降低了 47.8%，达到“模型分片
 是扩展可加载模型容量，不是让 7B 模型在该拓扑上加速。8 req/s 时 light-vllm TP=1/2 吞吐分别是同条件 vLLM 的
 92.4%/89.4%；2 req/s 到达受限场景四个配置都约为 202 tok/s，不能用来证明饱和吞吐接近。
 
-单卡回归另用 TP 引入前的 `aa791aa` 与当前 TP=1 路径做 5+5 轮同条件 A/B：吞吐中位数从 1,260.92 提升到
-1,275.37 tok/s（+1.15%），TPOT P50 从 12.567 降到 12.462 ms/token（-0.84%），未观察到性能劣化。直接模型
-step 剖析中，TP=1/2 分别为 11.785/12.545 ms；TP=2 的 GEMM CUDA 时间从 9.044 降到 4.660 ms，但 57 次
-AllReduce 与一次 LM Head AllGather 的设备时间约 0.912 ms，另有 CPU 发起/同步与 Gloo 控制通信，最终未形成加速。
+单卡回归另用 TP 引入前的 `aa791aa` 与 clean `b71d9db` TP=1 路径做 5+5 轮同条件 A/B：吞吐中位数从
+1,260.92 提升到 1,276.92 tok/s（+1.27%），TPOT P50 从 12.567 降到 12.462 ms/token（-0.83%），未观察到
+性能劣化。
+
+直接模型 step 的 100 次计时均值中，TP=1/2 分别为 11.785/12.545 ms。另一个 Rank 0 单 step profiler 样本中，
+TP=2 的 GEMM CUDA 时间从 9.044 降到 4.660 ms，57 次 AllReduce 与一次 LM Head AllGather 的 device operator
+合计约 0.912 ms；该单 Rank 样本不等于双 Rank 端到端通信占比。独立 primitive 测试的每 Rank 中位数为
+56 次 AllReduce 1.126 ms、词表 AllGather 0.138 ms，量级约为 model step 均值的 10%，但两者不是同一次测量，
+只能作诊断参考。CPU 发起/同步与 Gloo 控制通信也存在，最终未形成加速。
 
 正确性测试对 TP=1/2 的 4 个不同 prompt、每个 8 个输出 token 逐 token 对照，无差异。BF16 长解码不承诺跨
-TP size 位一致：1×512 实验会在后段分叉，同一 TP=1 服务重复运行也出现不同轨迹；TP 改变 GEMM/AllReduce
-求和顺序后，近似并列的 logits 会被自回归放大。它不影响上述等工作量性能比较，但仍需补充逐步 logits 容差和
-质量评测，不能写成“长序列完全一致”。故障测试在活动请求中终止 Rank 1，其余进程在 16.9 秒内退出、端口释放、
+TP size 位一致：1×512 实验曾从第 36 个输出 token 分叉，同一 TP=1 服务重复运行也出现不同轨迹。该现象与
+BF16 数值路径差异在自回归生成中被放大相符，但尚未采集分叉步骤的 logits，根因仍待量化。它不影响上述等工作量
+性能比较，但仍需补充逐步 logits 容差和质量评测，不能写成“长序列完全一致”。故障测试在活动请求中终止 Rank 1，
+其余进程在 16.9 秒内退出、端口释放、
 两张卡显存归零。复现实验入口是
 [`run_tp_comparison_matrix.sh`](benchmarks/remote_5090/run_tp_comparison_matrix.sh)、
 [`analyze_tp_comparison.py`](benchmarks/remote_5090/analyze_tp_comparison.py) 和

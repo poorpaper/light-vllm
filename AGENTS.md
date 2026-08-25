@@ -83,9 +83,9 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 
 当前尚未实现第三方 victim preemption、sliding-window/rope-scaling Qwen 配置、量化、多节点通信和 MaaS 控制面。
 单机 TP/NCCL 已完成双 RTX 5090 上的 TP=1/2 短序列逐 token 对照、显存、性能、取消与 Rank 故障退出验收；
-该机器无 CUDA P2P/NVLink，TP=2 降低单卡显存但不产生吞吐加速。BF16 长生成会因跨 TP size 的归约顺序变化
-在近似并列 logits 处产生不同轨迹，尚未完成逐步 logits 容差和质量验收。Docker/Kubernetes TP=2 仍需在有容器
-运行权限的双卡宿主机上完成性能 A/B。
+该机器无 CUDA P2P/NVLink，TP=2 降低单卡显存但不产生吞吐加速。BF16 长生成已观察到跨 TP size 和同一 TP=1
+重复运行的轨迹分叉；现象与数值路径差异的自回归放大相符，但尚未采集分叉点 logits，根因仍待量化，也未完成
+逐步 logits 容差和质量验收。Docker/Kubernetes TP=2 仍需在有容器运行权限的双卡宿主机上完成性能 A/B。
 OpenAI v0.2 首版不支持 tools、多 choice、logprobs 或批量 prompt，随机 sampling 不与投机解码组合。
 PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend 已在 RTX 5090 上完成 FP16/BF16 数值对照，
 但尚未完成长上下文性能与跨显卡验收，仍不代表生产吞吐。当前也不宣称支持大多数 Transformers 模型。
