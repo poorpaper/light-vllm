@@ -11,7 +11,9 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.sse import EventSourceResponse, format_sse_event
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,6 +30,12 @@ from light_vllm.runtime.generation.interfaces import (
     TokenGenerated,
 )
 from light_vllm.runtime.observability.interfaces import PerformanceMetricsReader
+from light_vllm.serving.interfaces import TextProcessingError
+from light_vllm.serving.openai import (
+    OpenAIServingConfig,
+    create_openai_router,
+    openai_error_response,
+)
 from light_vllm.serving.prometheus import PROMETHEUS_CONTENT_TYPE, render_prometheus
 
 TokenId = Annotated[int, Field(strict=True, ge=0)]
@@ -216,6 +224,7 @@ def create_http_app(
     *,
     lifespan: Lifespan | None = None,
     performance_metrics: PerformanceMetricsReader | None = None,
+    openai_config: OpenAIServingConfig | None = None,
 ) -> FastAPI:
     """用给定的 ``EngineClient`` 创建 FastAPI 应用。
 
@@ -223,6 +232,15 @@ def create_http_app(
     """
 
     app = FastAPI(title="light-vllm", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith("/v1/"):
+            return openai_error_response(TextProcessingError("invalid request parameters"))
+        return await request_validation_exception_handler(request, exc)
+
+    if openai_config is not None:
+        app.include_router(create_openai_router(engine, openai_config))
 
     @app.get("/healthz", response_model=StatusResponse)
     def health() -> StatusResponse:

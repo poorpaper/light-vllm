@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import count
+from secrets import randbits
 
 from light_vllm.runtime.engine.admission import CapacityAdmission, SafeTTFTAdmission
 from light_vllm.runtime.engine.execution_lane import ExecutionLane
@@ -58,6 +59,7 @@ class _RequestState:
     request_id: str
     request: GenerateRequest
     token_ids: list[int]
+    sampling_seed: int
     generated_count: int = 0
     events: asyncio.Queue[_QueueItem] = field(default_factory=asyncio.Queue)
 
@@ -268,7 +270,12 @@ class EngineCore:
                 raise
 
             request_id = f"request-{next(self._request_ids)}"
-            state = _RequestState(request_id, request, list(request.input_ids))
+            state = _RequestState(
+                request_id,
+                request,
+                list(request.input_ids),
+                request.sampling.seed if request.sampling.seed is not None else randbits(63),
+            )
             self._states[request_id] = state
             capacity = len(request.input_ids) + request.max_new_tokens
             try:
@@ -432,6 +439,8 @@ class EngineCore:
                     max_output_tokens=item.max_output_tokens,
                     block_ids=item.block_ids,
                     num_readonly_prefix_blocks=item.num_readonly_prefix_blocks,
+                    sampling=replace(state.request.sampling, seed=state.sampling_seed),
+                    output_position=state.generated_count,
                 )
             )
         return ExecutionBatch(requests=tuple(requests))

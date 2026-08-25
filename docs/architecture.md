@@ -80,7 +80,8 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `Sampler` | 从 logits 选择 token | 模型 forward、调度、停止条件 |
 | `ModelRunner` | 当前模型生命周期和固定 `ModelSession` | 请求调度、具体模型/loader 条件分发 |
 | `EngineClient` | serving 到 engine 的异步端口 | HTTP schema、具体运行拓扑 |
-| HTTP adapter | JSON/SSE 与 generation 契约转换 | runner、torch、scheduler |
+| `TextProcessor` | 本地 tokenizer、chat template、EOS 和增量解码 | Engine、模型计算、HTTP wire format |
+| HTTP/OpenAI adapter | 文本/token-ID、JSON/SSE、stop、usage、错误码与 generation 契约转换 | runner、torch、scheduler |
 
 ## 统一 token-budget 调度
 
@@ -245,8 +246,8 @@ CPU reference/连续 KV 路径通过执行层接入可读的 `TorchDenseAttentio
 `qwen2` 与 `qwen2.5` 注册项指向同一个 Qwen family factory，因为官方 Qwen2.5 checkpoint 仍使用
 `model_type: qwen2` 和 `Qwen2ForCausalLM` 权重结构；模型规模完全由快照配置决定，核心路由不按 3B 等尺寸
 分支。当前用官方 Qwen2.5-3B-Instruct 配置覆盖 36 层、GQA 和 BF16 目标构造，并继续支持
-full-attention、default-RoPE、tied embedding 和分片 safetensors。sliding-window、rope scaling、量化权重
-和 tokenizer 尚未实现，遇到这些配置会明确拒绝，不会回退到近似计算。
+full-attention、default-RoPE、tied embedding 和分片 safetensors。sliding-window、rope scaling 和量化权重
+尚未实现，遇到这些配置会明确拒绝，不会回退到近似计算。tokenizer 只存在于 serving 边界，不改变 Qwen 模型执行。
 
 Hugging Face 和 ModelScope 只负责把模型快照下载到本地。两边常见的 `config.json + model*.safetensors +
 model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`；loader 解析配置、逐分片复制权重并检查
@@ -282,12 +283,17 @@ Sampler 是独立策略：
 
 ```python
 class Sampler(Protocol):
-    def sample(self, logits: Tensor) -> tuple[int, ...]: ...
+    def sample(
+        self,
+        logits: Tensor,
+        metadata: tuple[SamplingMetadata, ...] | None = None,
+    ) -> tuple[int, ...]: ...
 ```
 
-`LocalTokenExecutor` 和 `LocalModelExecutor` 都通过组合使用同一个 Sampler。当前 `GreedySampler` 只执行
-argmax；以后增加 temperature、top-k 或 top-p 时，不修改 Engine、Scheduler、ModelRunner 或 Executor
-接口。
+`LocalTokenExecutor` 和 `LocalModelExecutor` 都通过组合使用同一个 Sampler。`ConfigurableSampler` 根据不可变
+`SamplingParams` 执行 greedy、temperature、top-k 和 top-p；固定 seed 与输出位置共同确定每一步随机数，因此同一
+请求不受动态 batching 的行顺序和其他请求生命周期影响。`temperature=0` 始终使用 argmax。Sampler 不拥有请求级
+可变状态；Engine 只传采样事实，不包含采样算法分支。
 
 投机解码的 acceptance sampling 与普通 Sampler 是不同职责。`NGramChainProposer` 保留最近命中的线性续写，
 `NGramTrieProposer` 将最长重复后缀的所有历史续写按频次、最近位置和 token ID 确定性裁剪为有界 BFS 树。二者只
@@ -299,7 +305,10 @@ argmax；以后增加 temperature、top-k 或 top-p 时，不修改 Engine、Sch
 
 ```mermaid
 flowchart LR
-    HTTP["HTTP adapter"] --> Client["EngineClient"]
+    OpenAI["OpenAI text/chat"] --> Text["TextProcessor"]
+    Text --> HTTP["HTTP adapter"]
+    TokenAPI["token-ID debug API"] --> HTTP
+    HTTP --> Client["EngineClient"]
     Client --> Core["EngineCore"]
     Client --> Bridge["InProcessEngineClient"]
     Bridge --> Reference["ReferenceGenerationService"]
@@ -315,6 +324,9 @@ Reference 路径保留同步、全序列重算和逐 token 语义，用于教学
 ModelRunner 和 Sampler，但不通过兼容 facade 强行共享执行契约。
 
 HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClient.capabilities`，而不是 transport 常量。
+OpenAI Completion/Chat 在 adapter 内调用本地 `TextProcessor`，再构造仍以 token ID 驱动的 `GenerateRequest`。
+流式和非流式响应消费同一 Engine event stream；增量 decoder 与 stop matcher 共同保证跨 token/chunk 的 stop 不泄漏，
+timeout、stop 和断连都关闭 stream。tokenizer 禁止联网和 `trust_remote_code`，不会进入 Engine、Scheduler 或 Worker。
 进程拆分时可以新增 `ProcessEngineClient`，但不得
 改变 `EngineClient`、generation 事件或 HTTP adapter。
 
@@ -355,9 +367,9 @@ HPA 位于仓库外控制面：前者查询 histogram/计数，后者经 Prometh
 
 ## 后续演进顺序
 
-1. 增加 Triton 长上下文分段并行与归并，并补充跨显卡性能验收。
-2. Scheduler-owned victim preemption。
-3. 普通随机 Sampler。
-4. 进程/分布式 Worker 与生产级 serving。
+1. 单机多卡 Tensor Parallel：`torch.distributed`/NCCL、分片权重与可替换的分布式 Executor。
+2. 量化、显存治理和长上下文；Triton 长上下文分段并行与归并继续按独立 backend 演进。
+3. 多机多卡通信，再进入 Prefill/Decode 分离与 KV 传输。
+4. MaaS 控制面。Agent Harness 保持独立项目，只通过 OpenAI API 接入。
 
 任何新能力都应先证明现有事实型契约表达不了，再新增字段或接口；不为未来功能预建空包。

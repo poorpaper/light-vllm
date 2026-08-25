@@ -18,13 +18,16 @@ dependencies = [
 [project.optional-dependencies]
 serve = [
   "fastapi>=0.135",
+  "transformers>=4.43,<5",
   "uvicorn>=0.35",
 ]
 dev = [
   "fastapi>=0.135",
   "httpx2>=2.0",
+  "openai>=1.0",
   "pytest>=8.0",
   "ruff>=0.9",
+  "transformers>=4.43,<5",
 ]
 validation = [
   "transformers>=4.43,<5",

@@ -313,6 +313,8 @@ class SpeculativeDecodeHandler:
         drafts_by_request: list[DraftTree] = []
         model_requests: list[ModelStepRequest] = []
         for request in batch.requests:
+            if not request.sampling.is_greedy:
+                raise ExecutionError("random sampling cannot be combined with speculative decoding")
             max_nodes = min(
                 request.num_lookahead_tokens,
                 max(0, request.max_output_tokens - 1),

@@ -165,6 +165,12 @@ def test_cli_can_disable_load_dependent_ttft_gates() -> None:
     assert args.ttft_kv_cache_watermark is None
 
 
+@pytest.mark.parametrize("value", ("0", "nan", "inf", "-inf"))
+def test_cli_rejects_invalid_openai_request_timeouts(value: str) -> None:
+    with pytest.raises(SystemExit):
+        _create_parser().parse_args(["--request-timeout-seconds", value])
+
+
 def test_http_adapter_streams_generation_events_as_sse() -> None:
     client = TestClient(create_http_app(StubEngineClient()))
 

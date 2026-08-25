@@ -66,14 +66,17 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   prompt，普通 decode 通常贡献当前 1 个 token，不提前展开未来输出预算。预测器冷启动时 fail-open，但前两级
   门控仍生效；请求可以覆盖全局 TTFT SLO。它是独立控制组件，不属于只读 `PerformanceObserver`。HTTP 分别把
   容量拒绝和当前负载过载表达为 422/429。
-- `Sampler` 独立于 Executor；当前只有 `GreedySampler`。
+- `Sampler` 独立于 Executor；`ConfigurableSampler` 消费不可变 `SamplingParams` 和逐请求 `SamplingMetadata`，支持
+  greedy、temperature、top-k、top-p 与 seed。Engine 固定请求私有 seed，随机序列不受动态 batching 行顺序影响。
 - `PerformanceObserver` 在 Engine 已生效的生命周期边界记录 TTFT、可见 token 间隔、step 延迟与请求结果，只读取
   Scheduler/KV 不可变快照；Prometheus、Grafana、HPA 和 KEDA 不进入推理热路径。
-- FastAPI 生成路由只依赖 `EngineClient`；`/metrics` 只依赖独立的 `PerformanceMetricsReader`，两者都不知道
-  scheduler、runner、torch 或具体模型。
+- FastAPI token 路由只依赖 `EngineClient`；OpenAI 文本路由额外依赖 serving 自己的 `TextProcessor`，把本地
+  tokenizer、chat template、增量解码、stop、usage 和 wire format 留在 adapter。`/metrics` 只依赖独立的
+  `PerformanceMetricsReader`；这些路由都不知道 scheduler、runner、torch 或具体模型。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
-当前尚未实现第三方 victim preemption、分布式执行、tokenizer、sliding-window/rope-scaling Qwen 配置和生产级 serving。
+当前尚未实现第三方 victim preemption、分布式执行、sliding-window/rope-scaling Qwen 配置、量化和 MaaS 控制面。
+OpenAI v0.2 首版不支持 tools、多 choice、logprobs 或批量 prompt，随机 sampling 不与投机解码组合。
 PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend 已在 RTX 5090 上完成 FP16/BF16 数值对照，
 但尚未完成长上下文性能与跨显卡验收，仍不代表生产吞吐。当前也不宣称支持大多数 Transformers 模型。
 
@@ -90,7 +93,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/modeling/catalog.py` | model/loader 扩展点集合 |
 | `src/light_vllm/runtime/generation/interfaces.py` | 生成请求、结果和事件 |
 | `src/light_vllm/runtime/generation/reference.py` | 同步正确性基线 |
-| `src/light_vllm/runtime/sampling.py` | Sampler 契约与贪心实现 |
+| `src/light_vllm/runtime/sampling.py` | 逐请求采样参数、元数据与 greedy/top-k/top-p 实现 |
 | `src/light_vllm/runtime/kv_cache.py` | 逻辑 block manager 与连续 K/V tensor 存储 |
 | `src/light_vllm/runtime/scheduler/interfaces.py` | `SchedulerOutput` 等稳定调度契约 |
 | `src/light_vllm/runtime/scheduler/token_budget.py` | 分层 token-budget Scheduler、短请求资源池与可选 self-resubmit |
@@ -111,6 +114,9 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/runtime/observability/performance.py` | 进程内 TTFT/ITL、step、token 与请求结果聚合 |
 | `src/light_vllm/runtime/observability/dispatch.py` | observer 故障隔离与组合分发 |
 | `src/light_vllm/serving/http.py` | FastAPI JSON/SSE adapter |
+| `src/light_vllm/serving/interfaces.py` | 文本编码与增量解码契约 |
+| `src/light_vllm/serving/text.py` | 本地 Hugging Face tokenizer adapter |
+| `src/light_vllm/serving/openai.py` | OpenAI Completion/Chat、stop、usage 与错误映射 |
 | `src/light_vllm/serving/prometheus.py` | 性能快照到 Prometheus 文本格式的转换 |
 | `src/light_vllm/entrypoints/http.py` | 具体组件的装配入口 |
 
@@ -126,8 +132,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 6. 所有模型接受 `ForwardBatch`，返回只包含其中明确请求 query 行 logits 的 `ModelOutput`；未指定行选择时返回
    全部有效 query。K/V 读写由 `AttentionContext` 和 Step Handler 完成，loader 负责 device、dtype 与 `eval()`。
 7. `ReferenceGenerationService` 只依赖 `TokenExecutor`，不得依赖 runner、torch 或具体模型。
-8. transport 的生成路由只依赖 `EngineClient`；监控路由可以额外依赖独立只读指标端口。HTTP/RPC schema、
-   Prometheus 格式和 wire format 均不得进入核心契约。
+8. transport 的运行时生成依赖只允许 `EngineClient`；文本协议可以额外依赖 serving 域的 `TextProcessor`，监控路由
+   可以额外依赖独立只读指标端口。HTTP/RPC schema、tokenizer、Prometheus 格式和 wire format 均不得进入核心契约。
 9. `stream` 是同步与异步生成的唯一执行路径；`generate` 只收集同一事件流。
 10. 流在取消、关闭和异常时必须释放资源；首事件后的错误由 adapter 编码到流中。
 11. `InProcessEngineClient` 只做 sync-to-async 适配，不承担 scheduling。
@@ -142,7 +148,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 18. 取消请求必须立即退出后续调度；已开始执行的同步步骤到达安全边界后，其结果必须丢弃。
 19. Scheduler/Engine Core 管理 KV reservation、逻辑 block ID、prefix cache、self-resubmit 和未来 victim preemption；
     Worker/Step Handler 管理 tensor、物理页池、block table 消费与 Paged Attention kernel。
-20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。
+20. `Sampler` 是独立策略；greedy、top-k、top-p 不得通过新增 Executor 表达。固定 seed 的逐请求随机序列不得受
+    动态 batching 的行顺序、其他请求进入或取消影响；Sampler 不得持有需要按请求清理的可变 RNG 状态。
 21. 投机解码由 proposer、target verify 与 acceptance sampler 组成，不新增模式专用 Executor 或 Worker。
     proposer 只返回 `DraftTree`；Decode Handler 将其降为 `QueryLayout`，并在返回前调用 `compact()` 压实命中路径。
     Engine、Scheduler、Executor、Worker 和模型不得理解具体树策略。
@@ -234,7 +241,8 @@ pump 和请求 stream 公平执行机会；检查点只能推进已经 ready 的
 `SpeculativeDecodeHandler`；只有验收语义变化时才新增 `AcceptanceSampler`。复用同一 Worker、Step Handler 和
 `QueryLayout`，不修改 Scheduler、Engine 或模型分发。
 
-新增 serving 协议：只消费 `EngineClient`，在 adapter 内转换请求、结果、错误和 wire format。
+新增 serving 协议：运行时只消费 `EngineClient`；文本协议通过 `TextProcessor` 扩展点接入 tokenizer，并在 adapter
+内转换请求、结果、stop、usage、错误和 wire format。
 
 新增指标后端：实现 `PerformanceMetricsReader` 的表达适配器，消费不可变快照；不要把 Prometheus SDK、Grafana
 或 HPA 逻辑放进 Engine、Scheduler、Worker 或模型。
@@ -252,6 +260,6 @@ git diff --check
 
 ## 下一步
 
-下一阶段先完成 Triton tree visibility 的 CUDA 数值验收，再针对长上下文实现分段计算与归并并补充跨显卡
-性能验收；之后继续实现
-Scheduler-owned victim preemption。两项能力都不得改变 EngineClient、generation 事件或 HTTP adapter。
+v0.2 OpenAI 文本服务验收后进入单机多卡 Tensor Parallel/NCCL。首版必须通过 `ParallelContext/Collective`、
+`DistributedModelExecutor`、模型自有分片描述和 safetensors 切片加载扩展；Engine、Scheduler、HTTP 与 TP=1 热路径
+不得出现分布式条件树。量化、长上下文、多机通信、Prefill/Decode 分离和 MaaS 控制面按路线图顺序继续推进。

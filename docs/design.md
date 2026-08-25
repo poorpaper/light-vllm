@@ -60,7 +60,10 @@ Attention` 架构，不覆盖旧图。
 
 ```mermaid
 flowchart TB
-    HTTP["FastAPI adapter"] --> Client["EngineClient"]
+    OpenAI["OpenAI Completion / Chat"] --> Text["TextProcessor<br/>local tokenizer"]
+    Text --> HTTP["FastAPI adapter"]
+    TokenAPI["token-ID debug API"] --> HTTP
+    HTTP --> Client["EngineClient"]
 
     Client --> Core["EngineCore"]
     Client --> Bridge["InProcessEngineClient"]
@@ -82,7 +85,7 @@ flowchart TB
     Step --> Paged["PagedStepHandler<br/>global physical pages"]
     Contiguous --> Dense["TorchDenseAttention<br/>contiguous correctness"]
     Paged --> Attention["PagedAttentionBackend<br/>Torch / Triton"]
-    Decode --> Sampler["GreedySampler"]
+    Decode --> Sampler["ConfigurableSampler<br/>greedy / top-k / top-p"]
     Reference --> TokenExecutor["LocalTokenExecutor"]
     TokenExecutor --> Sampler
 
@@ -123,12 +126,14 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ModelWorker` | 一个设备 rank 内固定模型版本并编排请求生命周期 |
 | `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回连续有效 logits 与请求边界 |
 | `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
-| `Sampler` | 从二维 `[batch, vocabulary]` logits 选择 token |
+| `SamplingParams` / `SamplingMetadata` | 不可变逐请求采样参数，以及与动态 batching 顺序无关的请求/输出位置事实 |
+| `Sampler` | 从二维 `[batch, vocabulary]` logits 按逐请求元数据选择 token |
 | `ForwardBatch` / `ModelOutput` | 一维 token 流、请求边界、绝对 position、attention 上下文与对应 logits 的统一模型边界 |
 | `ModelKVCacheSpec` | 模型声明的逐 attention 层 K/V 形状 |
 | `AttentionContext` | 模型调用连续或分页 attention 后端的稳定边界 |
 | `EngineCapabilities` | 初始化后可发现的模型、KV、并发和单轮容量事实 |
 | `EngineClient` | serving 使用的异步生成端口和 capabilities 查询 |
+| `TextProcessor` / `IncrementalTextDecoder` | serving 内的文本编码、chat template 和 Unicode 安全增量解码端口 |
 | `SchedulerStats` / `KVCacheStats` | 队列、token backlog 与 KV 容量的一次性不可变事实 |
 | `ShortRequestPolicy` / `SelfResubmitPolicy` | 可选调度策略配置，不进入 Engine、Worker 或协议契约 |
 | `StepLatencyPredictor` / `TTFTAdmission` | 用已完成 step 更新的独立延迟预测与动态准入控制端口 |
@@ -306,10 +311,11 @@ completion claim；若一整轮候选都撞墙，最早回滚者也会进入这�
 
 ## 8. Sampler
 
-`GreedySampler` 已从本地 Executor 中抽离。普通解码通过 `StandardDecodeHandler` 接收它：
+`Sampler` 已从本地 Executor 中抽离。composition root 为 reference 与普通 Engine 路径装配同一个
+`ConfigurableSampler`：
 
 ```python
-sampler = GreedySampler()
+sampler = ConfigurableSampler()
 reference_executor = LocalTokenExecutor(runner, sampler)
 step_factory = partial(
     PagedStepHandler,
@@ -320,7 +326,12 @@ worker = LocalModelWorker(runner, step_factory, StandardDecodeHandler(sampler))
 model_executor = LocalModelExecutor(worker)
 ```
 
-新增 top-k/top-p 时实现新的 Sampler 并装配。投机解码的 acceptance sampler 不等同于普通 Sampler：
+`SamplingParams` 表达 temperature、top-k、top-p 和可选 seed；`temperature=0` 始终走 greedy。Engine 为未指定 seed
+的请求生成一次私有 seed，并把 request ID、固定 seed 和当前输出位置作为 `SamplingMetadata` 传给 Sampler。
+因此同一请求的随机序列不受并发请求进入、退出或批次行顺序影响，取消、异常和结束也无需在 Sampler 内维护可泄漏
+的可变状态。v0.2 明确拒绝“随机 sampling + speculative decoding”的组合。
+
+投机解码的 acceptance sampler 不等同于普通 Sampler：
 `NGramChainProposer` 和 `NGramTrieProposer` 都返回 `DraftTree`，通用 `SpeculativeDecodeHandler` 将正式输入和草稿
 降为 `QueryLayout`，交给目标模型一次验证。`GreedyTreeAcceptanceSampler` 沿目标 token 命中的唯一分支前进；第一次
 不命中时返回已接受路径和目标 token，命中叶子时再返回 bonus token。Handler 在返回前 compact 非连续路径，
@@ -329,6 +340,13 @@ Scheduler 只提交真实接受的草稿节点。
 ## 9. Reference 与 Engine Core
 
 Reference 是同步、无调度、每轮全序列重算的语义基线；`InProcessEngineClient` 仅把它适配到异步端口。
+
+OpenAI adapter 只依赖 `EngineClient` 和 serving 自己的 `TextProcessor`。本地 Hugging Face tokenizer 负责普通 prompt、
+`apply_chat_template(add_generation_prompt=True)`、EOS 和增量解码；模型目录只以 `local_files_only=True`、
+`trust_remote_code=False` 打开。Completion 不套 chat template，Chat 首版只接受 system/user/assistant 字符串消息。
+流式与非流式响应共用同一条 Engine event stream、增量 decoder 和 stop matcher；stop、超时和客户端取消最终都关闭
+Engine stream，沿已有安全取消边界释放 Scheduler、KV 和 Worker 资源。usage 的 completion token 包含为了识别 stop
+已经计算但未返回的 token。OpenAI schema、SSE、错误对象和状态码都不进入 `GenerateRequest` 或 Engine。
 
 Engine Core 是后续性能能力唯一继续生长的路径。旧的 `FullSequenceBatchEngine`、`KVCacheBatchEngine`、
 `GreedyFullSequenceBatchExecutor`、`GreedyContiguousKVCacheExecutor` 和 `KVCacheBatchTokenExecutor` 已删除，
@@ -388,6 +406,9 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也�
 | 进程内性能聚合 | `src/light_vllm/runtime/observability/performance.py` |
 | 性能观察者隔离 | `src/light_vllm/runtime/observability/dispatch.py` |
 | HTTP adapter | `src/light_vllm/serving/http.py` |
+| 文本处理契约 | `src/light_vllm/serving/interfaces.py` |
+| 本地 tokenizer | `src/light_vllm/serving/text.py` |
+| OpenAI adapter | `src/light_vllm/serving/openai.py` |
 | Prometheus adapter | `src/light_vllm/serving/prometheus.py` |
 | 装配入口 | `src/light_vllm/entrypoints/http.py` |
 
@@ -398,7 +419,7 @@ flowchart LR
     Model["Model path<br/>完成"] --> Serving["Reference serving<br/>完成"]
     Serving --> Core["Token-budget Engine Core<br/>完成"]
     Core --> Logical["逻辑 block reserve/commit/rollback<br/>完成"]
-    Logical --> Sampling["独立 Greedy Sampler<br/>完成"]
+    Logical --> Sampling["逐请求 greedy / top-k / top-p<br/>完成"]
     Sampling --> Paged["物理 Paged Attention<br/>PyTorch correctness 完成"]
     Paged --> Capacity["capacity discovery + admission<br/>完成"]
     Capacity --> Prefix["Prefix cache<br/>完成"]
@@ -406,6 +427,7 @@ flowchart LR
     Spec --> Kernel["Packed Triton tree mask<br/>代码/测试完成 · GPU 待验收"]
     Kernel --> Metrics["性能指标 + Prometheus/Grafana/HPA<br/>完成"]
     Metrics --> SLO["短请求池 + TTFT 早拒 + 可选 self-resubmit<br/>完成"]
+    SLO --> OpenAI["本地 tokenizer + OpenAI Completion / Chat<br/>CPU/E2E 测试完成"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
@@ -426,7 +448,9 @@ git diff --check
 测试必须覆盖固定 ModelSession、token budget、chunked prefill、多 token 与已缓存输出前缀、容量规划与 admission、
 prefix 命中/LRU/epoch、草稿树约束/兄弟隔离/非连续路径验收/compact、无候选退化、逻辑 block 回滚、
 非连续物理页、block table
-别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、短请求 token/KV/sequence 预留与 aging、TTFT 预测/冷启动/429、
+别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、逐请求固定 seed 与 batch 交错、tokenizer/chat template、
+Unicode 增量解码、跨 chunk stop、OpenAI SDK、流式/非流式一致性、usage、超时取消、标准错误码、
+短请求 token/KV/sequence 预留与 aging、TTFT 预测/冷启动/429、
 self-resubmit 的 prompt+1 block/global watermark、不重复输出/严格 fallback/资源归还、TTFT/ITL、step 延迟、
 两种 token backlog、KV 使用率、执行失败和
 取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。

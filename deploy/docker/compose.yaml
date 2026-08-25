@@ -33,6 +33,12 @@ services:
       - safetensors
       - --weights
       - /models/${LIGHT_VLLM_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --tokenizer
+      - /models/${LIGHT_VLLM_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --served-model-name
+      - ${LIGHT_VLLM_SERVED_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --request-timeout-seconds
+      - ${LIGHT_VLLM_REQUEST_TIMEOUT_SECONDS:-300}
       - --device
       - cuda:0
       - --dtype

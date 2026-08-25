@@ -45,6 +45,12 @@ spec:
             - safetensors
             - --weights
             - /models/$(LIGHT_VLLM_MODEL_NAME)
+            - --tokenizer
+            - /models/$(LIGHT_VLLM_MODEL_NAME)
+            - --served-model-name
+            - $(LIGHT_VLLM_SERVED_MODEL_NAME)
+            - --request-timeout-seconds
+            - "300"
             - --device
             - cuda:0
             - --dtype
@@ -68,6 +74,8 @@ spec:
             - name: LIGHT_VLLM_ARCHITECTURE
               value: qwen2.5
             - name: LIGHT_VLLM_MODEL_NAME
+              value: Qwen2.5-Coder-7B-Instruct
+            - name: LIGHT_VLLM_SERVED_MODEL_NAME
               value: Qwen2.5-Coder-7B-Instruct
             - name: XDG_CACHE_HOME
               value: /var/cache/light-vllm

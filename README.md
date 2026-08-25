@@ -52,16 +52,19 @@
 | 模型与权重 | 原生 Qwen2/Qwen2.5；full attention、default RoPE、GQA、tied embedding；读取 HF/ModelScope 兼容的本地 safetensors 快照 |
 | 执行 | token-major packed query、chunked prefill、连续与分页 KV、PyTorch correctness attention、可选 Triton fused paged attention |
 | 调度 | 统一 token budget、严格非抢占 completion claim、prefix cache、短请求资源池、TTFT 早拒、可选 self-resubmit |
-| 解码 | Greedy sampler；N-Gram Chain/Trie proposer 共用树形验证和 KV compact |
-| 服务 | JSON/SSE token-ID API、独立 Engine 进程、取消与异常清理、Prometheus 指标 |
+| 解码 | Greedy、temperature、top-k、top-p、逐请求 seed；N-Gram Chain/Trie proposer 共用树形验证和 KV compact |
+| 服务 | 本地 tokenizer、OpenAI-compatible Completion/Chat 流式与非流式 API、token-ID 调试 API、独立 Engine 进程、取消与异常清理、Prometheus 指标 |
 
-暂时没有 tokenizer、文本 prompt、随机 sampling、sliding-window/RoPE scaling、量化权重、第三方 victim preemption、分布式执行或 OpenAI-compatible API。Triton 路径已在 RTX 5090 上完成现有场景的数值与性能验收，但长上下文、跨显卡和更多模型仍未验证。
+暂时没有 sliding-window/RoPE scaling、量化权重、第三方 victim preemption 或分布式执行。v0.2 文本接口首版不支持 tools、多个 choice、logprobs 或批量 prompt，随机 sampling 也不与投机解码组合。Triton 路径已在 RTX 5090 上完成现有场景的数值与性能验收，但长上下文、跨显卡和更多模型仍未验证。
 
 ## 一张图看懂
 
 ```mermaid
 flowchart LR
-    HTTP["FastAPI<br/>JSON · SSE"] --> Client["EngineClient"]
+    OpenAI["OpenAI-compatible<br/>text · chat"] --> Text["TextProcessor<br/>local tokenizer"]
+    Text --> HTTP["FastAPI adapter<br/>JSON · SSE"]
+    Debug["token-ID debug API"] --> HTTP
+    HTTP --> Client["EngineClient"]
     Client --> Process["ProcessEngineClient"]
     Client -. correctness baseline .-> Reference["ReferenceGenerationService"]
     Process -->|IPC| Core["EngineCore<br/>schedule → execute → update"]
@@ -132,6 +135,9 @@ python -m venv .venv
   --architecture qwen2.5 \
   --loader safetensors \
   --weights /models/Qwen2.5-Coder-7B-Instruct \
+  --tokenizer /models/Qwen2.5-Coder-7B-Instruct \
+  --served-model-name Qwen2.5-Coder-7B-Instruct \
+  --request-timeout-seconds 300 \
   --device cuda \
   --dtype bfloat16 \
   --runtime engine \
@@ -140,7 +146,24 @@ python -m venv .venv
   --paged-attention-backend triton
 ```
 
-当前 HTTP 接口直接接收 token IDs：
+OpenAI Python SDK 可以直接连接本地服务：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local-only")
+response = client.chat.completions.create(
+    model="Qwen2.5-Coder-7B-Instruct",
+    messages=[{"role": "user", "content": "写一个 Python 快速排序"}],
+    temperature=0,
+    max_tokens=128,
+)
+print(response.choices[0].message.content)
+```
+
+`/v1/completions` 与 `/v1/chat/completions` 都支持流式和非流式返回，以及 `temperature`、`top_k`、`top_p`、`stop`、`seed`、`max_tokens` 和 usage。tokenizer 只从本地目录加载，不联网，也不启用 `trust_remote_code`。
+
+原有 token-ID 接口保留用于引擎调试：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/generate \
@@ -148,7 +171,7 @@ curl -X POST http://127.0.0.1:8000/generate \
   -d '{"input_ids":[1,2,3],"max_new_tokens":4}'
 ```
 
-`POST /generate/stream` 返回 SSE；`GET /capabilities` 给出模型、KV 与 Scheduler 容量；`GET /metrics` 返回性能快照。完整参数以 `light-vllm-serve --help` 为准。
+`POST /generate/stream` 返回 token-ID SSE；`GET /capabilities` 给出模型、KV 与 Scheduler 容量；`GET /metrics` 返回性能快照。完整参数以 `light-vllm-serve --help` 为准。
 
 原生 systemd、Docker Compose 和 Kubernetes 的最小生产骨架见
 [生产部署骨架](docs/deployment.md)。三种方式复用同一个服务入口，部署配置不进入推理热路径。

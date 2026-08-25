@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Literal, Protocol, TypeAlias
 
+from light_vllm.runtime.sampling import SamplingParams
+
 FinishReason: TypeAlias = Literal["length", "eos"]
 
 
@@ -32,6 +34,7 @@ class GenerateRequest:
     max_new_tokens: int = 16
     eos_token_id: int | None = None
     max_tolerable_ttft_seconds: float | None = None
+    sampling: SamplingParams = SamplingParams()
 
     def __post_init__(self) -> None:
         input_ids = tuple(self.input_ids)
@@ -52,6 +55,8 @@ class GenerateRequest:
             or self.max_tolerable_ttft_seconds <= 0
         ):
             raise ValueError("max_tolerable_ttft_seconds must be finite and positive")
+        if not isinstance(self.sampling, SamplingParams):
+            raise TypeError("sampling must be SamplingParams")
         object.__setattr__(self, "input_ids", input_ids)
 
 
