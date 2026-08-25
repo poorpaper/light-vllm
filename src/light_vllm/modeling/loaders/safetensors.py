@@ -13,6 +13,7 @@ from torch import Tensor, nn
 
 from light_vllm.modeling.loaders.torch import ModelLoadError, _prepare_for_inference
 from light_vllm.modeling.models.interfaces import ModelFactory, ModelSpec
+from light_vllm.modeling.tensor_parallel import TensorShardSpec, checkpoint_shards
 
 
 def _read_json(path: Path) -> Mapping[str, object]:
@@ -79,8 +80,25 @@ def _optional_weight_keys(model: nn.Module) -> frozenset[str]:
     return keys
 
 
-def _copy_weight(name: str, source: Tensor, target: Tensor) -> None:
-    """把一个文件张量复制到已经创建好的模型参数中。"""
+def _copy_weight(
+    name: str,
+    source: Tensor,
+    target: Tensor,
+    shard: TensorShardSpec | None = None,
+) -> None:
+    """把完整权重或其中一个声明式切片复制到目标参数。"""
+
+    if shard is not None:
+        if shard.dimension >= source.ndim:
+            raise ModelLoadError(f"weight {name!r} has no shard dimension {shard.dimension}")
+        if source.shape[shard.dimension] != shard.full_size:
+            raise ModelLoadError(
+                f"weight {name!r} shard dimension has size "
+                f"{source.shape[shard.dimension]}, expected {shard.full_size}"
+            )
+        # 与 vLLM/SGLang 的通用 weight-loader 方式一致：checkpoint 保持
+        # HF 原始布局，并行层只声明本 Rank 应复制的连续区间。
+        source = source.narrow(shard.dimension, shard.start, shard.length)
 
     if source.shape != target.shape:
         raise ModelLoadError(
@@ -105,6 +123,7 @@ class SafetensorsModelLoader:
         # 先按配置创建空模型，权重文件只负责填充参数，不负责定义结构。
         model = factory(resolved_spec).to(device=spec.device, dtype=spec.dtype).eval()
         targets = model.state_dict()
+        parameter_shards = checkpoint_shards(model)
         optional = _optional_weight_keys(model)
         loaded: set[str] = set()
         unexpected: set[str] = set()
@@ -124,7 +143,12 @@ class SafetensorsModelLoader:
                             if target is None:
                                 unexpected.add(name)
                                 continue
-                            _copy_weight(name, reader.get_tensor(name), target)
+                            _copy_weight(
+                                name,
+                                reader.get_tensor(name),
+                                target,
+                                parameter_shards.get(name),
+                            )
                 except (OSError, SafetensorError) as exc:
                     raise ModelLoadError(f"cannot read checkpoint shard {shard}") from exc
 

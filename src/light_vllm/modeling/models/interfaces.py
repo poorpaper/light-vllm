@@ -9,6 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from light_vllm.modeling.attention.interfaces import AttentionContext, ModelKVCacheSpec
+from light_vllm.modeling.tensor_parallel import TensorParallelContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +22,7 @@ class ModelSpec:
     weights: Path | None = None
     device: str | torch.device = "cpu"
     dtype: torch.dtype = torch.float32
+    tensor_parallel: TensorParallelContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +169,9 @@ class ModelSession(Protocol):
 
     @property
     def max_model_tokens(self) -> int | None: ...
+
+    @property
+    def tensor_parallel_size(self) -> int: ...
 
     def forward(self, batch: ForwardBatch) -> ModelOutput: ...
 

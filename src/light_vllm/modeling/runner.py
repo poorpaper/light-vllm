@@ -33,6 +33,13 @@ def _max_model_tokens(model: nn.Module) -> int | None:
     return value
 
 
+def _tensor_parallel_size(model: nn.Module) -> int:
+    value = getattr(model, "tensor_parallel_size", 1)
+    if type(value) is not int or value <= 0:
+        raise TypeError("model tensor_parallel_size must be a positive integer")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class _PinnedModelSession:
     """保存本次执行选中的模型；之后重新加载模型不会影响本次执行。"""
@@ -41,6 +48,7 @@ class _PinnedModelSession:
     _model: nn.Module
     kv_cache_spec: ModelKVCacheSpec | None
     max_model_tokens: int | None
+    tensor_parallel_size: int
 
     @torch.inference_mode()
     def forward(self, batch: ForwardBatch) -> ModelOutput:
@@ -92,4 +100,5 @@ class ModelRunner:
             _model=model,
             kv_cache_spec=_kv_cache_spec(model),
             max_model_tokens=_max_model_tokens(model),
+            tensor_parallel_size=_tensor_parallel_size(model),
         )

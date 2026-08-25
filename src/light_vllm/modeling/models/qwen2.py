@@ -25,6 +25,14 @@ from light_vllm.modeling.models.interfaces import (
     ModelSpec,
     select_query_states,
 )
+from light_vllm.modeling.tensor_parallel import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    TensorParallelContext,
+    VocabParallelEmbedding,
+    VocabParallelLinear,
+    partition_dimension,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,27 +177,31 @@ class Qwen2MLP(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
+        parallel: TensorParallelContext,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.gate_proj = nn.Linear(
+        self.gate_proj = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
+            parallel,
             bias=False,
             **factory_kwargs,
         )
-        self.up_proj = nn.Linear(
+        self.up_proj = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
+            parallel,
             bias=False,
             **factory_kwargs,
         )
-        self.down_proj = nn.Linear(
+        self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
+            parallel,
             bias=False,
             **factory_kwargs,
         )
@@ -207,7 +219,8 @@ class Qwen2MLP(nn.Module):
             return self.down_proj(silu_and_mul(gate, up))
         else:
             gate, up = torch.mm(hidden_states, merged_weight_t).chunk(2, dim=-1)
-        return torch.mm(silu_and_mul(gate, up), down_weight_t)
+        local_output = torch.mm(silu_and_mul(gate, up), down_weight_t)
+        return self.down_proj.reduce_output(local_output)
 
     def prepare_for_inference(self) -> None:
         """Pack checkpoint-compatible Gate/Up weights into one inference GEMM."""
@@ -229,6 +242,7 @@ class Qwen2Attention(nn.Module):
         self,
         config: Qwen2Config,
         layer_index: int,
+        parallel: TensorParallelContext,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -236,31 +250,60 @@ class Qwen2Attention(nn.Module):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self._layer_id = f"model.layers.{layer_index}.self_attn"
-        self._num_query_heads = config.num_attention_heads
-        self._num_kv_heads = config.num_key_value_heads
+        tp_size = parallel.world_size
+        if config.num_attention_heads % tp_size:
+            raise ValueError("Qwen2 query heads must be divisible by tensor parallel size")
+        if config.num_key_value_heads >= tp_size:
+            if config.num_key_value_heads % tp_size:
+                raise ValueError("Qwen2 KV heads must be divisible by tensor parallel size")
+            kv_rank = parallel.rank
+            kv_world_size = tp_size
+        else:
+            if tp_size % config.num_key_value_heads:
+                raise ValueError(
+                    "tensor parallel size must be divisible by Qwen2 KV heads when replicating"
+                )
+            # KV head 少于 Rank 时，让相邻 Rank 共享同一个 KV head。每个 Rank
+            # 仍有独立物理 KV，不需要改变 attention backend。
+            replicas_per_kv_head = tp_size // config.num_key_value_heads
+            kv_rank = parallel.rank // replicas_per_kv_head
+            kv_world_size = config.num_key_value_heads
+        self._num_query_heads = config.num_attention_heads // tp_size
+        self._num_kv_heads = max(1, config.num_key_value_heads // tp_size)
         self._head_size = config.head_size
         self._scale = 1 / sqrt(config.head_size)
-        self.q_proj = nn.Linear(
+        kv_output_partition = partition_dimension(
+            config.num_key_value_heads * config.head_size,
+            kv_rank,
+            kv_world_size,
+        )
+        self.q_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * config.head_size,
+            parallel,
             bias=True,
             **factory_kwargs,
         )
-        self.k_proj = nn.Linear(
+        self.k_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * config.head_size,
+            parallel,
             bias=True,
+            output_partition=kv_output_partition,
             **factory_kwargs,
         )
-        self.v_proj = nn.Linear(
+        self.v_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_key_value_heads * config.head_size,
+            parallel,
             bias=True,
+            output_partition=kv_output_partition,
             **factory_kwargs,
         )
-        self.o_proj = nn.Linear(
+        self.o_proj = RowParallelLinear(
             config.num_attention_heads * config.head_size,
             config.hidden_size,
+            parallel,
             bias=False,
             **factory_kwargs,
         )
@@ -323,12 +366,10 @@ class Qwen2Attention(nn.Module):
             scale=self._scale,
         )
         attended = attended.reshape(num_tokens, -1)
-        output = (
-            self.o_proj(attended)
-            if output_weight_t is None
-            else torch.mm(attended, output_weight_t)
-        )
-        return output
+        if output_weight_t is None:
+            return self.o_proj(attended)
+        local_output = torch.mm(attended, output_weight_t)
+        return self.o_proj.reduce_output(local_output)
 
     def prepare_for_inference(self) -> None:
         """Pack checkpoint-compatible Q/K/V weights into one inference GEMM."""
@@ -353,14 +394,15 @@ class Qwen2DecoderLayer(nn.Module):
         self,
         config: Qwen2Config,
         layer_index: int,
+        parallel: TensorParallelContext,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.self_attn = Qwen2Attention(config, layer_index, **factory_kwargs)
-        self.mlp = Qwen2MLP(config, **factory_kwargs)
+        self.self_attn = Qwen2Attention(config, layer_index, parallel, **factory_kwargs)
+        self.mlp = Qwen2MLP(config, parallel, **factory_kwargs)
         self.input_layernorm = Qwen2RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -415,20 +457,22 @@ class Qwen2Model(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
+        parallel: TensorParallelContext,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.embed_tokens = nn.Embedding(
+        self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            parallel,
             config.pad_token_id,
             **factory_kwargs,
         )
         self.layers = nn.ModuleList(
-            Qwen2DecoderLayer(config, layer_index, **factory_kwargs)
+            Qwen2DecoderLayer(config, layer_index, parallel, **factory_kwargs)
             for layer_index in range(config.num_hidden_layers)
         )
         self.norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps, **factory_kwargs)
@@ -440,17 +484,23 @@ class Qwen2ForCausalLM(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
+        parallel: TensorParallelContext | None = None,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        parallel = parallel or TensorParallelContext()
+        if config.intermediate_size % parallel.world_size:
+            raise ValueError("Qwen2 intermediate size must be divisible by tensor parallel size")
         factory_kwargs = {"device": device, "dtype": dtype}
         self.config = config
-        self.model = Qwen2Model(config, **factory_kwargs)
-        self.lm_head = nn.Linear(
+        self._parallel = parallel
+        self.model = Qwen2Model(config, parallel, **factory_kwargs)
+        self.lm_head = VocabParallelLinear(
             config.hidden_size,
             config.vocab_size,
+            parallel,
             bias=False,
             **factory_kwargs,
         )
@@ -466,6 +516,7 @@ class Qwen2ForCausalLM(nn.Module):
     def from_spec(cls, spec: ModelSpec) -> Qwen2ForCausalLM:
         return cls(
             Qwen2Config.from_mapping(spec.model_args),
+            parallel=spec.tensor_parallel,
             device=spec.device,
             dtype=spec.dtype,
         )
@@ -475,6 +526,10 @@ class Qwen2ForCausalLM(nn.Module):
         return self.config.max_position_embeddings
 
     @property
+    def tensor_parallel_size(self) -> int:
+        return self._parallel.world_size
+
+    @property
     def kv_cache_spec(self) -> ModelKVCacheSpec:
         """告诉执行端每一层需要怎样的 K/V 张量。"""
 
@@ -482,11 +537,11 @@ class Qwen2ForCausalLM(nn.Module):
             layers=tuple(
                 AttentionLayerSpec(
                     layer_id=f"model.layers.{layer_index}.self_attn",
-                    num_query_heads=self.config.num_attention_heads,
-                    num_kv_heads=self.config.num_key_value_heads,
+                    num_query_heads=layer.self_attn._num_query_heads,
+                    num_kv_heads=layer.self_attn._num_kv_heads,
                     head_size=self.config.head_size,
                 )
-                for layer_index in range(self.config.num_hidden_layers)
+                for layer_index, layer in enumerate(self.model.layers)
             )
         )
 
@@ -534,11 +589,11 @@ class Qwen2ForCausalLM(nn.Module):
             self.model.norm.eps,
         )
         hidden_states = select_query_states(hidden_states, batch)
-        logits = (
-            self.lm_head(hidden_states)
-            if self._lm_head_weight_t is None
-            else torch.mm(hidden_states, self._lm_head_weight_t)
-        )
+        if self._lm_head_weight_t is None:
+            logits = self.lm_head(hidden_states)
+        else:
+            local_logits = torch.mm(hidden_states, self._lm_head_weight_t)
+            logits = self.lm_head.gather_output(local_logits)
         return ModelOutput(logits=logits)
 
     def prepare_for_inference(self) -> None:
