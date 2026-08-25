@@ -23,6 +23,18 @@ def test_temperature_zero_is_greedy() -> None:
     ) == (1,)
 
 
+def test_greedy_batch_with_metadata_matches_vectorized_argmax() -> None:
+    logits = torch.tensor([[0.0, 2.0, 1.0], [4.0, 1.0, 3.0]])
+
+    assert ConfigurableSampler().sample(
+        logits,
+        (
+            SamplingMetadata(SamplingParams(seed=7), 0),
+            SamplingMetadata(SamplingParams(top_k=1, top_p=0.1), 9),
+        ),
+    ) == (1, 0)
+
+
 def test_top_k_one_and_small_top_p_keep_the_best_token() -> None:
     logits = torch.tensor([[1.0, 3.0, 2.0], [1.0, 3.0, 2.0]])
 

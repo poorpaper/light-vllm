@@ -131,7 +131,7 @@ class ConfigurableSampler:
         metadata: tuple[SamplingMetadata, ...] | None = None,
     ) -> tuple[int, ...]:
         metadata = _validate_logits(logits, metadata)
-        if metadata is None:
+        if metadata is None or all(item.params.is_greedy for item in metadata):
             return tuple(int(token_id) for token_id in logits.argmax(dim=-1).tolist())
 
         sampled: list[int] = []
