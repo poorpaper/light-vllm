@@ -1,8 +1,8 @@
 # RTX 5090 comparison harness
 
 This directory contains the reproducible serving harness used to compare
-light-vllm and vLLM on one RTX 5090. Both adapters receive the same pre-tokenized
-prompt IDs and the same open-loop arrival trace.
+light-vllm and vLLM on one or two RTX 5090 GPUs. Both adapters receive the same
+pre-tokenized prompt IDs and the same open-loop arrival trace.
 
 The harness deliberately lives outside `src/`: it may depend on benchmark-only
 packages and must not change runtime behavior.
@@ -26,6 +26,15 @@ packages and must not change runtime behavior.
   proposer.
 - `launch_vllm_profile.sh`: captures a delayed vLLM Torch profiler trace for a
   bounded number of active steps.
+- `run_tp_comparison_matrix.sh`: runs matched light-vllm/vLLM TP=1/2 serving
+  cases. It keeps the workload, KV token capacity, scheduling limits, warmup,
+  and repeat count fixed across configurations.
+- `analyze_tp_comparison.py`: validates request and output-token work, reports
+  per-run medians, and renders throughput, latency, scaling, and memory charts.
+- `profile_tp_primitives.py`: measures NCCL tensor collectives separately from
+  the Gloo control channel used by the TP executor.
+- `test_tp_failure_exit.sh`: kills one active Rank and verifies bounded process
+  exit, port release, and GPU-memory cleanup.
 
 Typical remote usage:
 

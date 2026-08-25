@@ -31,8 +31,8 @@ flowchart LR
     Scheduler --> Plan["SchedulerOutput<br/>token 数 · optional block table"]
     Plan --> Core
     Core --> Batch["ExecutionBatch<br/>本轮 token 切片"]
-    Batch --> Executor["LocalModelExecutor"]
-    Executor --> Worker["LocalModelWorker<br/>固定模型版本"]
+    Batch --> Executor["ModelExecutor<br/>local 或 tensor parallel"]
+    Executor --> Worker["LocalModelWorker<br/>每个设备 Rank 固定模型版本"]
     Worker --> Step["ModelStepHandler<br/>contiguous 或 paged"]
     Worker --> Decode["DecodeHandler<br/>ordinary 或 speculative"]
     Worker --> Session["ModelSession<br/>fixed generation"]
@@ -52,8 +52,8 @@ flowchart LR
 - 本地、CUDA、多进程才是合理的 Executor 拓扑差异。
 
 `LocalModelExecutor` 与 `ModelWorker` 看起来薄，是有意保留的两层：Executor 表达 Engine 可替换的执行拓扑，
-Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；KV 和 attention 交给 Step Handler。未来多进程或多 rank Executor 可以管理多个 Worker，
-不会迫使单机 Worker 契约进入 Engine。
+Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；KV 和 attention 交给 Step Handler。
+`TensorParallelModelExecutor` 用这个边界管理多个 Rank，不会迫使单机 Worker 契约进入 Engine。
 
 ## 模块边界
 
@@ -67,9 +67,12 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `PagedKVCacheManager` | 逻辑 block、prefix 索引、引用计数、LRU 与回滚 | K/V tensor、attention kernel |
 | `ModelExecutor` | 执行已可行批次、物理资源租约 | admission、请求队列、HTTP |
 | `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
+| `TensorParallelModelExecutor` | Rank 0 顺序广播批次与请求生命周期，汇总 Rank 结果 | 调度、模型专用切分、HTTP |
+| `TensorParallelContext` | 显式提供 rank、world size 与模型集合通信 | torchrun 启动、进程生命周期 |
+| `TorchDistributedGroup` | torchrun rank/device 映射、NCCL tensor 与 Gloo 控制通信 | Engine 状态、模型结构 |
 | `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
 | `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
-| `PagedStepHandler` | padded batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
+| `PagedStepHandler` | token-major batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
 | `StandardDecodeHandler` | 普通 prefill/单 token decode 的结果转换与采样 | KV 布局、调度 |
 | `SpeculativeDecodeHandler` | 草稿树提议、目标验证、路径验收与 KV 压实 | KV 布局、调度 |
 | `PagedKVCachePlanner` | 模型加载后把固定页数或空闲显存预算解析为容量 | 请求调度、page ownership |
@@ -82,6 +85,35 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `EngineClient` | serving 到 engine 的异步端口 | HTTP schema、具体运行拓扑 |
 | `TextProcessor` | 本地 tokenizer、chat template、EOS 和增量解码 | Engine、模型计算、HTTP wire format |
 | HTTP/OpenAI adapter | 文本/token-ID、JSON/SSE、stop、usage、错误码与 generation 契约转换 | runner、torch、scheduler |
+
+## 单机 Tensor Parallel
+
+TP 只替换模型参数布局和 Executor 拓扑，不改变 `ExecutionBatch → ExecutionOutput`。Rank 0 独占 HTTP、Engine、
+Scheduler 和逻辑 KV；Rank 1..N-1 阻塞在 Worker 命令循环。一次 step 的数据流是：
+
+```text
+EngineCore (rank 0)
+    │ ExecutionBatch
+    ▼
+TensorParallelModelExecutor
+    ├── rank 0 LocalModelWorker ── local parameter shard + local physical KV
+    └── rank N LocalModelWorker ── local parameter shard + local physical KV
+              ▲
+              └── NCCL AllReduce / AllGather
+```
+
+模型侧只依赖显式 `TensorParallelContext` 和最小 `TensorCollectives` 端口，不直接导入进程组。Q/Gate/Up/LM Head
+使用列并行，O/Down 使用行并行，Embedding 使用词表并行；并行层用 `TensorShardSpec` 声明完整 checkpoint 到本
+Rank 参数的切片，`SafetensorsModelLoader` 不按 Qwen 参数名分支。TP=1 使用同一套层和 forward，只把 collective
+退化为本地操作。
+
+Qwen 的 query heads 始终按完整 head 均分。KV heads 不少于 TP size 时同样切分；KV heads 少于 Rank 时复制完整
+KV head，使 attention backend 继续只处理普通 local GQA。每个 Rank 的物理 KV 因此只保存 local KV heads；
+logical block ID 保持一致。自动显存规划取所有 Rank 的最小页数，防止 Rank 0 宣布其他卡无法提供的容量。
+
+设备 tensor collective 使用 NCCL，控制命令使用独立 Gloo group。只有 Engine 的单在途 Execution Lane 执行
+collective；add/free 先更新 Rank 0 本地 Worker，再在下一 step 或 shutdown 前顺序发送。这样取消仍服从已有 lease
+安全边界，不会在 collective 中途回收远端 KV。
 
 ## 统一 token-budget 调度
 
@@ -249,6 +281,9 @@ CPU reference/连续 KV 路径通过执行层接入可读的 `TorchDenseAttentio
 full-attention、default-RoPE、tied embedding 和分片 safetensors。sliding-window、rope scaling 和量化权重
 尚未实现，遇到这些配置会明确拒绝，不会回退到近似计算。tokenizer 只存在于 serving 边界，不改变 Qwen 模型执行。
 
+TP 模式仍从同一 factory 构造 Qwen；`ModelSpec.tensor_parallel` 只提供显式并行事实。模型由通用并行层组成并公开
+rank-local checkpoint slice，`ModelRunner`、Catalog 和 Worker 不按 TP size 分支。
+
 Hugging Face 和 ModelScope 只负责把模型快照下载到本地。两边常见的 `config.json + model*.safetensors +
 model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`；loader 解析配置、逐分片复制权重并检查
 重复、缺失、多余和形状错误。`ModelRunner` 仍然只按 Catalog 解析 `qwen2 + safetensors`，不知道快照来自哪个
@@ -256,7 +291,7 @@ model.safetensors.index.json` 目录都交给同一个 `SafetensorsModelLoader`�
 
 ## Capabilities、admission 与非抢占策略
 
-容量事实从拥有它的实体向上汇总：模型声明 `max_model_tokens`，Step Handler 通过 Worker 报告
+容量与拓扑事实从拥有它的实体向上汇总：模型声明 `max_model_tokens` 和 TP size，Step Handler 通过 Worker 报告
 `max_kv_cache_tokens`，Scheduler
 报告并发槽和单轮 token budget。`EngineCapabilities.max_request_tokens` 取模型与单请求可用 KV 上限的较小值。
 HTTP 通过 `/capabilities` 展示这些事实，不再硬编码 prompt 长度。
@@ -365,10 +400,12 @@ HPA 位于仓库外控制面：前者查询 histogram/计数，后者经 Prometh
 6. Reference 请求和 Worker 都在请求开始前固定 session，一个请求绝不跨 generation。
 7. 可缓存模型的 KV 规格由 session 中的模型声明；Worker 只能在模型加载完成且无活动请求时初始化或重建 Step Handler。
 8. reload 后旧请求继续使用旧 session；Worker 暂停新准入，活动请求清空后才按新 generation 重新初始化。
+9. TP 模型的并行层声明 checkpoint slice；loader 只消费切片事实。所有 Rank 完整加载成功并达成 capabilities 一致后，
+   Rank 0 才允许 Engine 接收请求。
 
 ## 后续演进顺序
 
-1. 单机多卡 Tensor Parallel：`torch.distributed`/NCCL、分片权重与可替换的分布式 Executor。
+1. 在有容器运行权限的双卡宿主机补齐 Docker/Kubernetes TP=2 A/B，并在更大模型或 P2P 拓扑上补充容量边界。
 2. 量化、显存治理和长上下文；Triton 长上下文分段并行与归并继续按独立 backend 演进。
 3. 多机多卡通信，再进入 Prefill/Decode 分离与 KV 传输。
 4. MaaS 控制面。Agent Harness 保持独立项目，只通过 OpenAI API 接入。

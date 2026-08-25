@@ -22,6 +22,8 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - 原生 `Qwen2ForCausalLM` 支持 Qwen2/Qwen2.5 的 full-attention、default-RoPE 配置；HF 与 ModelScope 下载的
   兼容目录共用 `SafetensorsModelLoader`，不进入 Runner 或 Worker 分支。loader 在权重就绪后调用可选的模型自有
   `prepare_for_inference()` hook；Qwen 用它准备打包权重和 RoPE table。
+- 模型通过显式 `TensorParallelContext` 组合列并行、行并行、词表并行和集合通信；并行层声明 checkpoint 切片，
+  `SafetensorsModelLoader` 通用地读取本 Rank 权重，不按 Qwen 参数名分支。TP=1 使用同一套模型 forward。
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
 - `EngineCore` 按 `schedule → execute → update` 驱动异步请求和事件流；每次至多保留一个不可变
   `PreparedStep` 在模型侧执行。上一轮结果、执行结束状态和下一轮计划在同一个锁区原子推进，并只发布一次稳定
@@ -39,6 +41,9 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   `ModelStepHandler`；该选择不得进入 Engine、Executor 或 Worker 热路径。
 - `LocalModelExecutor` 只把执行端口委托给一个 `LocalModelWorker`。Worker 固定当前模型版本和请求生命周期；
   `ContiguousStepHandler` / `PagedStepHandler` 分别负责连续与分页 KV 的输入准备、物理缓存和模型 forward。
+- 单机 TP 由 `TensorParallelModelExecutor` 表达：Rank 0 独占现有 Engine、Scheduler 和 serving，按顺序广播原有
+  `ExecutionBatch`；每个 Rank 复用同一套 `LocalModelWorker` 和物理 KV。NCCL 只承载 device tensor collective，
+  独立 Gloo group 承载控制命令；各 Rank 的 KV 规划统一取最小页数。
 - `StandardDecodeHandler` 负责普通单 token 解码；`SpeculativeDecodeHandler` 组合 `DraftProposer`、目标验证和
   `AcceptanceSampler`。`NGramChainProposer` 与 `NGramTrieProposer` 共用同一树形执行流程，不新增模式专用 Worker。
 - `DraftTree` 只表达候选父子关系；`QueryLayout` 把正式输入与草稿树降为一次 model step 的位置和可见性事实。
@@ -60,7 +65,7 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   `stack` 回同一矩阵。
 - `ExecutionRequest` 的完整 `context_token_ids` 快照只为草稿 proposer 物化；普通执行只携带本轮
   `input_token_ids`，不得在每个 decode step 复制和校验完整历史。
-- `EngineCapabilities` 汇总模型上限、KV 容量和 Scheduler 上限；`CapacityAdmission` 只拒绝确定性不可满足的请求。
+- `EngineCapabilities` 汇总模型上限、KV 容量、Scheduler 上限和 TP size；`CapacityAdmission` 只拒绝确定性不可满足的请求。
 - `PredictiveTTFTAdmission` 先检查 pending 请求数与 KV 水位，再用
   `prompt + waiting pending + running pending` 的全局当前工作量和真实 step 延迟做动态早拒；prefill 贡献剩余
   prompt，普通 decode 通常贡献当前 1 个 token，不提前展开未来输出预算。预测器冷启动时 fail-open，但前两级
@@ -76,7 +81,11 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   `PerformanceMetricsReader`；这些路由都不知道 scheduler、runner、torch 或具体模型。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
-当前尚未实现第三方 victim preemption、分布式执行、sliding-window/rope-scaling Qwen 配置、量化和 MaaS 控制面。
+当前尚未实现第三方 victim preemption、sliding-window/rope-scaling Qwen 配置、量化、多节点通信和 MaaS 控制面。
+单机 TP/NCCL 已完成双 RTX 5090 上的 TP=1/2 短序列逐 token 对照、显存、性能、取消与 Rank 故障退出验收；
+该机器无 CUDA P2P/NVLink，TP=2 降低单卡显存但不产生吞吐加速。BF16 长生成会因跨 TP size 的归约顺序变化
+在近似并列 logits 处产生不同轨迹，尚未完成逐步 logits 容差和质量验收。Docker/Kubernetes TP=2 仍需在有容器
+运行权限的双卡宿主机上完成性能 A/B。
 OpenAI v0.2 首版不支持 tools、多 choice、logprobs 或批量 prompt，随机 sampling 不与投机解码组合。
 PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend 已在 RTX 5090 上完成 FP16/BF16 数值对照，
 但尚未完成长上下文性能与跨显卡验收，仍不代表生产吞吐。当前也不宣称支持大多数 Transformers 模型。
@@ -90,6 +99,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/modeling/loaders/interfaces.py` | 权重加载器契约 |
 | `src/light_vllm/modeling/loaders/safetensors.py` | HF/ModelScope 兼容的本地分片快照加载 |
 | `src/light_vllm/modeling/models/qwen2.py` | 原生 Qwen2/Qwen2.5 推理模型 |
+| `src/light_vllm/modeling/tensor_parallel.py` | 显式 TP 上下文、并行层与 checkpoint 切片描述 |
 | `src/light_vllm/modeling/runner.py` | 模型生命周期与固定 `ModelSession` |
 | `src/light_vllm/modeling/catalog.py` | model/loader 扩展点集合 |
 | `src/light_vllm/runtime/generation/interfaces.py` | 生成请求、结果和事件 |
@@ -101,6 +111,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/runtime/execution/interfaces.py` | 执行、model-step、草稿树与投机观测契约 |
 | `src/light_vllm/runtime/execution/layout.py` | 从父链推导线性/树形 query 的位置和可见性 |
 | `src/light_vllm/runtime/execution/local.py` | 本地 Executor 与 reference token 执行 |
+| `src/light_vllm/runtime/execution/distributed.py` | torchrun 进程组、TP Executor 与 Rank Worker 循环 |
 | `src/light_vllm/runtime/execution/worker.py` | 本地 Worker、Step Handler 与普通 Decode Handler |
 | `src/light_vllm/runtime/execution/dense_attention.py` | reference/连续缓存共用的 dense attention 上下文 |
 | `src/light_vllm/runtime/execution/paged_cache.py` | 分页 Step Handler 拥有的物理 K/V tensor |
@@ -201,6 +212,18 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
     运行时状态或按 architecture/模型尺寸分支。安全组合器必须在 observer 首次失败后停用它，且不得在 Engine
     热路径同步写日志或让指标故障改变推理结果。
     Prometheus/Grafana/HPA/KEDA 表达必须留在控制面 adapter。
+42. TP 必须通过 `TensorParallelContext` 和 `TensorCollectives` 显式注入模型；不得新增进程级可变 parallel
+    singleton，也不得让模型直接初始化或销毁 `torch.distributed`。
+43. 并行层必须声明完整 checkpoint 到本 Rank 参数的连续切片；loader 只消费该描述，不得按 architecture 或参数名
+    维护切分条件树。TP=1 与 TP>1 必须共用同一模型 forward。
+44. `TensorParallelModelExecutor` 只改变执行拓扑。Rank 0 独占 Engine、Scheduler、逻辑 KV 和 serving；其他 Rank
+    只执行顺序一致的 Worker 命令。HTTP、Engine 和 Scheduler 不得感知 rank 或 NCCL。
+45. 每个 Rank 持有本地参数与物理 KV；同一请求在各 Rank 使用相同逻辑 block ID。自动容量规划必须采用所有 Rank
+    都能满足的最小页数，不得让 Rank 0 暴露更大的逻辑容量。
+46. 模型 tensor collective 与控制通信必须分组。NCCL 只接收当前 Rank CUDA device 上的 tensor；Python 控制对象
+    使用独立 CPU group。所有 Rank 必须以相同顺序执行 initialize、请求生命周期、model step 和 shutdown。
+47. Qwen query heads 和 MLP 中间维按 TP 切分；KV heads 足够时切分，不足时按完整 head 复制。不得把一个 attention
+    head 切到两个 Rank，也不得让 attention backend 理解复制策略。
 
 ## 锁与资源的准确含义
 
@@ -219,6 +242,10 @@ Observer 反向修改请求和 Scheduler 状态。`ExecutionLane` 只跨线程�
 lane 的常驻线程。独立 Engine 进程可以省略 lane，但必须在同步模型步骤之间通过事件循环检查点给 IPC command
 pump 和请求 stream 公平执行机会；检查点只能推进已经 ready 的任务，不得用固定时长 sleep 调节吞吐或 TTFT。
 
+TP 模式仍保留 Engine 的单在途执行边界：只有 Execution Lane 线程执行分布式 collective。请求加入和取消先更新
+Rank 0 本地 Worker，再排队为控制命令，在下一个 model step 或 shutdown 前按序送达其他 Rank。取消不会在一次
+collective 中途释放远端物理 KV；Engine 越过原有 lease 安全边界后才处理对应 free。
+
 `TTFTAdmission` 是控制组件：在 Engine 锁内读取一次 Scheduler 快照做准入，在 step 完成后消费真实延迟；
 `PerformanceObserver` 只记录同一事实。投机细节通过独立 `SpeculationObserver` 端口上报，包括候选/命中节点、
 验证产出 token、树形状和 KV 搬运；其首次失败后必须停用。
@@ -236,6 +263,10 @@ pump 和请求 stream 公平执行机会；检查点只能推进已经 ready 的
 
 新增执行拓扑：实现 `ModelExecutor`，保持 `ExecutionBatch → ExecutionOutput` 语义；本地、CUDA、多进程是
 合理的 Executor 差异，greedy、KV 模式、prefill/decode 不是。
+
+新增 tensor parallel 模型：组合 `modeling/tensor_parallel.py` 的通用并行层，或让新并行层公开
+`checkpoint_shards`；不得修改 safetensors loader 增加模型专用参数名。新增 collective 后端只实现
+`TensorCollectives` 并在 composition root 注入。
 
 新增本地 KV 布局或 attention 后端：实现 `ModelStepHandler`，创建相应 `AttentionContext`，分页 kernel 再通过
 `PagedAttentionBackend` 组合；模型保持唯一调用入口，并继续只声明 `ModelKVCacheSpec`。
@@ -263,6 +294,6 @@ git diff --check
 
 ## 下一步
 
-v0.2 OpenAI 文本服务验收后进入单机多卡 Tensor Parallel/NCCL。首版必须通过 `ParallelContext/Collective`、
-`DistributedModelExecutor`、模型自有分片描述和 safetensors 切片加载扩展；Engine、Scheduler、HTTP 与 TP=1 热路径
-不得出现分布式条件树。量化、长上下文、多机通信、Prefill/Decode 分离和 MaaS 控制面按路线图顺序继续推进。
+先补齐有容器运行权限的双 GPU Docker/Kubernetes A/B，并在更大模型或具备 P2P 的拓扑上补充“单卡无法加载、
+双卡可加载”和通信收益边界。之后按路线图进入量化、显存治理和长上下文，再推进多机通信、Prefill/Decode 分离
+与 MaaS 控制面。
