@@ -1,0 +1,141 @@
+{
+  "baseline_commit": "fc285b9be276563686107ccff5462056d8657e72",
+  "candidate_before_fix_commit": "f7e37b1c1d69981bdf2fed3a7076fda17c4689a7",
+  "candidate_commit": "9afada2b9d824e1995c9f853abd654b0a2c6fe3f",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 5090, 32607 MiB",
+    "driver": "580.95.05",
+    "power_limit_watts": 575,
+    "python": "3.12.13",
+    "torch": "2.8.0+cu128",
+    "triton": "3.4.0",
+    "transformers": "4.57.6",
+    "model": "Qwen2.5-Coder-7B-Instruct",
+    "dtype": "bfloat16",
+    "engine_process": true,
+    "paged_attention_backend": "triton",
+    "max_num_sequences": 16,
+    "max_num_scheduled_tokens": 512,
+    "kv_blocks": 2048,
+    "kv_block_size": 16,
+    "kv_tokens": 32768
+  },
+  "method": {
+    "baseline_position": "three valid runs before and three runs after the candidate",
+    "candidate_runs": 3,
+    "aggregation": "median",
+    "production_baseline_files": [
+      "baseline/production-r3.json",
+      "baseline/production-r6.json",
+      "baseline/production-r7.json",
+      "baseline-reverse/production-r1.json",
+      "baseline-reverse/production-r2.json",
+      "baseline-reverse/production-r3.json"
+    ],
+    "fixed_baseline_files": [
+      "baseline/fixed-r1.json",
+      "baseline/fixed-r2.json",
+      "baseline/fixed-r3.json",
+      "baseline-reverse/fixed-r1.json",
+      "baseline-reverse/fixed-r2.json",
+      "baseline-reverse/fixed-r3.json"
+    ],
+    "candidate_production_files": [
+      "candidate-fixed/production-r1.json",
+      "candidate-fixed/production-r2.json",
+      "candidate-fixed/production-r3.json"
+    ],
+    "candidate_fixed_files": [
+      "candidate-fixed/fixed-r1.json",
+      "candidate-fixed/fixed-r2.json",
+      "candidate-fixed/fixed-r3.json"
+    ],
+    "excluded_production_files": {
+      "baseline/production-r1.json": "first Triton shape compilation",
+      "baseline/production-r2.json": "remaining first-shape compilation gap",
+      "baseline/production-r4.json": "accidentally overlapped with r5 against the same server",
+      "baseline/production-r5.json": "accidentally overlapped with r4 against the same server"
+    }
+  },
+  "candidate_before_fix_relative_to_bracketing_baseline": {
+    "production_like": {
+      "throughput_change_percent": -0.4891,
+      "ttft_p95_change_milliseconds": -0.2211,
+      "tpot_p50_change_percent": 1.5528,
+      "tpot_p95_change_percent": 1.8077
+    },
+    "fixed_decode": {
+      "throughput_change_percent": -1.0796,
+      "ttft_p95_change_milliseconds": 5.2084,
+      "tpot_p50_change_percent": 0.9665,
+      "tpot_p95_change_percent": 0.9716
+    }
+  },
+  "final": {
+    "production_like": {
+      "requests_per_run": 64,
+      "output_tokens_per_run": 7514,
+      "throughput_tokens_per_second": {
+        "baseline": 605.870851534788,
+        "candidate": 606.673423054492,
+        "relative_change_percent": 0.132465775118629
+      },
+      "ttft_p95_milliseconds": {
+        "baseline": 50.4869636613875,
+        "candidate": 50.5647174082696,
+        "absolute_change_milliseconds": 0.0777537468821023
+      },
+      "tpot_p50_milliseconds": {
+        "baseline": 12.6064043294496,
+        "candidate": 12.5769281570617,
+        "relative_change_percent": -0.23381903053068
+      },
+      "tpot_p95_milliseconds": {
+        "baseline": 13.3156791317091,
+        "candidate": 13.2803107659841,
+        "relative_change_percent": -0.265614433745087
+      },
+      "e2e_p95_seconds": {
+        "baseline": 6.56115440707654,
+        "candidate": 6.54158762898296,
+        "relative_change_percent": -0.298221576259095
+      }
+    },
+    "fixed_decode": {
+      "requests_per_run": 16,
+      "output_tokens_per_run": 8192,
+      "throughput_tokens_per_second": {
+        "baseline": 1270.38797871449,
+        "candidate": 1277.55617066598,
+        "relative_change_percent": 0.56425218685876
+      },
+      "ttft_p95_milliseconds": {
+        "baseline": 72.6394241210073,
+        "candidate": 75.9683083742857,
+        "absolute_change_milliseconds": 3.32888425327837
+      },
+      "tpot_p50_milliseconds": {
+        "baseline": 12.4830242452337,
+        "candidate": 12.3924913099892,
+        "relative_change_percent": -0.725248413092605
+      },
+      "tpot_p95_milliseconds": {
+        "baseline": 12.4918805861776,
+        "candidate": 12.404219703038,
+        "relative_change_percent": -0.70174288438688
+      },
+      "e2e_p95_seconds": {
+        "baseline": 6.44621116062626,
+        "candidate": 6.40966920321807,
+        "relative_change_percent": -0.566874967289155
+      }
+    }
+  },
+  "gates": {
+    "throughput_or_tpot_regression_limit_percent": 3.0,
+    "ttft_p95_absolute_increase_limit_milliseconds": 5.0,
+    "native_mode_passed": true,
+    "docker_mode_tested": false,
+    "docker_mode_reason": "The supplied GPU host has no Docker-compatible container runtime."
+  }
+}
