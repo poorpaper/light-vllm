@@ -24,16 +24,19 @@
     "light_gloo": {
       "throughput_runs": [1130.575484, 1105.376371, 1125.475739],
       "throughput_median": 1125.475739,
+      "tpot_p50_ms_runs": [14.033842, 14.342965, 14.030866],
       "tpot_p50_ms_median": 14.033842
     },
     "light_socket": {
       "throughput_runs": [1200.428992, 1209.987871, 1209.680760],
       "throughput_median": 1209.680760,
+      "tpot_p50_ms_runs": [13.208544, 13.095935, 13.101131],
       "tpot_p50_ms_median": 13.101131
     },
     "vllm_eager": {
       "throughput_runs": [1296.848576, 1302.809314, 1309.126208],
       "throughput_median": 1302.809314,
+      "tpot_p50_ms_runs": [12.237281, 12.161358, 12.104500],
       "tpot_p50_ms_median": 12.161358
     },
     "socket_vs_gloo_throughput_percent": 7.481727,

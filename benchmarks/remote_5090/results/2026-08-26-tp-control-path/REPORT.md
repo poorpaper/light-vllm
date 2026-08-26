@@ -29,6 +29,8 @@
 | light-vllm Unix socket 控制 | 1209.68 tok/s | 13.101 ms/token |
 | vLLM eager | 1302.81 tok/s | 12.161 ms/token |
 
+![light-vllm TP=2 与 vLLM 性能对比](tp2-vllm-comparison.png)
+
 ## 正确性与故障
 
 - TP=1/2 对 4 个 prompt、每个 8 个输出 token 逐 token 比较，无差异。

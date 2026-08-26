@@ -283,6 +283,8 @@ Unix socket 后降至约 `0.170 ms/step`，而 NCCL 仍只负责模型 tensor co
 | light-vllm Unix socket 控制 | 1,209.68 tok/s | 13.101 ms/token |
 | vLLM 0.26.0 eager | 1,302.81 tok/s | 12.161 ms/token |
 
+![light-vllm TP=2 与 vLLM 性能对比](benchmarks/remote_5090/results/2026-08-26-tp-control-path/tp2-vllm-comparison.png)
+
 新路径相对旧路径提升 `7.48%`，达到同条件 vLLM 吞吐的 `92.85%`，差距为 `7.15%`。TP=1 用相反运行顺序各做
 一组 `3+3`，合计每个版本 6 轮；中位吞吐从 `1,194.14` 到 `1,194.96 tok/s`（`+0.07%`），未观察到单卡
 性能劣化。4×8 token 的 TP=1/2 逐 token 对照仍完全一致，活动请求中终止 Rank 1 后 16.519 秒内整组退出、端口
