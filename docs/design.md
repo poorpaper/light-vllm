@@ -170,9 +170,11 @@ AllGather 恢复完整 logits。KV head 数不少于 TP 时按 head 切分；少
 参数名。TP=1 使用无通信 collective，保留相同参数名、形状和 forward。
 
 进程拓扑也保持单一职责：Rank 0 独占 Engine、Scheduler、逻辑 KV 和 HTTP；它广播现有 `ExecutionBatch`，每个
-Rank 用同一 `LocalModelWorker` 管理本地分片参数和物理 KV。设备 tensor 用 NCCL，Python 控制命令用独立 Gloo
-group。KV 自动规划先在每张卡本地计算，再取所有 Rank 的最小页数，使逻辑容量不会超过任一物理页池。请求取消
-先进入 Rank 0 已有 lease 边界，远端 free 只在当前 model step 结束后按序送达。
+Rank 用同一 `LocalModelWorker` 管理本地分片参数和物理 KV。设备 tensor 用 NCCL，Worker 命令走可替换命令通道：
+单机 POSIX 默认使用有序 Unix socket，跨主机或显式配置时回退 Gloo。Gloo 仍负责启动期地址协调和容量事实，避免
+在每个 decode step 上执行 Python object collective。KV 自动规划先在每张卡本地计算，再取所有 Rank 的最小页数，
+使逻辑容量不会超过任一物理页池。请求取消先进入 Rank 0 已有 lease 边界，远端 free 只在当前 model step 结束后
+按序送达；任一 Rank 或命令通道失败后整组状态直接作废。
 
 ## 5. 一次迭代
 

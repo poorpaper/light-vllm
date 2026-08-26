@@ -69,7 +69,7 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
 | `TensorParallelModelExecutor` | Rank 0 顺序广播批次与请求生命周期，汇总 Rank 结果 | 调度、模型专用切分、HTTP |
 | `TensorParallelContext` | 显式提供 rank、world size 与模型集合通信 | torchrun 启动、进程生命周期 |
-| `TorchDistributedGroup` | torchrun rank/device 映射、NCCL tensor 与 Gloo 控制通信 | Engine 状态、模型结构 |
+| `TorchDistributedGroup` | torchrun rank/device 映射、NCCL tensor、控制通道装配与 Gloo 协调 | Engine 状态、模型结构 |
 | `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
 | `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
 | `PagedStepHandler` | token-major batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
@@ -111,9 +111,11 @@ Qwen 的 query heads 始终按完整 head 均分。KV heads 不少于 TP size �
 KV head，使 attention backend 继续只处理普通 local GQA。每个 Rank 的物理 KV 因此只保存 local KV heads；
 logical block ID 保持一致。自动显存规划取所有 Rank 的最小页数，防止 Rank 0 宣布其他卡无法提供的容量。
 
-设备 tensor collective 使用 NCCL，控制命令使用独立 Gloo group。只有 Engine 的单在途 Execution Lane 执行
-collective；add/free 先更新 Rank 0 本地 Worker，再在下一 step 或 shutdown 前顺序发送。这样取消仍服从已有 lease
-安全边界，不会在 collective 中途回收远端 KV。
+设备 tensor collective 使用 NCCL，Worker 命令通过独立 `_CommandChannel` 传输。单机 POSIX 的 `auto` 选择有序
+Unix socket，命令只序列化一次并向各 Worker 扇出；跨主机、非 POSIX 或显式 `gloo` 使用原 CPU collective 通道。
+Gloo 仍负责启动期地址协调与容量事实。只有 Engine 的单在途 Execution Lane 执行 collective；add/free 先更新
+Rank 0 本地 Worker，再在下一 step 或 shutdown 前顺序发送。这样取消仍服从已有 lease 安全边界，不会在 collective
+中途回收远端 KV；任一 Rank 或命令通道失败后整组 Executor 不再复用。
 
 ## 统一 token-budget 调度
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
@@ -29,6 +30,7 @@ from light_vllm.runtime.execution.distributed import (
     SynchronizedPagedKVCachePlanner,
     TensorParallelModelExecutor,
     TorchDistributedGroup,
+    _SocketCommandChannel,
 )
 from light_vllm.runtime.execution.interfaces import (
     ExecutionBatch,
@@ -302,6 +304,45 @@ def test_distributed_kv_planner_uses_the_smallest_rank_capacity() -> None:
     assert planner.num_blocks == 7
     assert planner.block_size == 4
     assert planner.device == torch.device("cpu")
+
+
+def test_local_socket_command_channel_preserves_rank_order() -> None:
+    driver_socket, worker_socket = socket.socketpair()
+    driver = _SocketCommandChannel(rank=0, peers={1: driver_socket})
+    worker = _SocketCommandChannel(rank=1, peers={0: worker_socket})
+    command = {"request_ids": tuple(f"request-{index}" for index in range(16))}
+
+    def run_worker() -> object:
+        received = worker.broadcast(None)
+        worker.complete({"rank": 1}, failed=False, require_consensus=False)
+        return received
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_worker)
+            assert driver.broadcast(command) == command
+            results = driver.complete(
+                {"rank": 0},
+                failed=False,
+                require_consensus=False,
+            )
+            assert future.result() == command
+        assert results == ({"rank": 0}, {"rank": 1})
+    finally:
+        worker.close()
+        driver.close()
+
+
+def test_local_socket_command_channel_reports_a_closed_peer() -> None:
+    driver_socket, worker_socket = socket.socketpair()
+    worker = _SocketCommandChannel(rank=1, peers={0: worker_socket})
+    driver_socket.close()
+
+    try:
+        with pytest.raises(ExecutionError, match="peer exited"):
+            worker.broadcast(None)
+    finally:
+        worker.close()
 
 
 def test_tensor_parallel_executor_delivers_lifecycle_at_safe_boundaries() -> None:

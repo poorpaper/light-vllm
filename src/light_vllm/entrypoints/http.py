@@ -324,6 +324,7 @@ def _create_engine_runtime(
         model_executor = TensorParallelModelExecutor(
             LocalModelExecutor(components.worker),
             tensor_parallel_group,
+            command_channel=tensor_parallel_group.command_channel,
             timer=_create_execution_timer(spec),
         )
         shutdown = model_executor.shutdown
@@ -398,7 +399,11 @@ def _run_tensor_parallel_rank(
         tensor_parallel_group=group,
     )
     components.runner.load(spec)
-    run_tensor_parallel_worker(LocalModelExecutor(components.worker), group)
+    run_tensor_parallel_worker(
+        LocalModelExecutor(components.worker),
+        group,
+        command_channel=group.command_channel,
+    )
 
 
 def _create_started_engine_process_runtime(
@@ -716,6 +721,12 @@ def _create_parser() -> argparse.ArgumentParser:
         default=120.0,
         help="maximum wait for a failed or stalled distributed operation",
     )
+    parallel.add_argument(
+        "--distributed-control-transport",
+        choices=("auto", "socket", "gloo"),
+        default="auto",
+        help="single-node command transport; auto prefers Unix sockets",
+    )
     parser.add_argument(
         "--kv-reservation",
         choices=("blocks", "unbounded"),
@@ -870,6 +881,7 @@ def _initialize_tensor_parallel(
         raise ValueError("Gloo tensor parallelism requires --device cpu")
     return TorchDistributedGroup.initialize(
         backend=args.distributed_backend,
+        control_transport=args.distributed_control_transport,
         timeout_seconds=args.distributed_timeout_seconds,
     )
 

@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import os
+import pickle
+import socket
+import struct
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from math import isfinite
+from pathlib import Path
 from threading import Lock
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
@@ -51,6 +57,7 @@ class TorchDistributedGroup(TensorCollectives):
         self._control_group = control_group
         self._tensor_group = tensor_group
         self._owns_world_group = owns_world_group
+        self._command_channel: _CommandChannel | None = None
         self._closed = False
 
     @classmethod
@@ -58,6 +65,7 @@ class TorchDistributedGroup(TensorCollectives):
         cls,
         *,
         backend: str = "nccl",
+        control_transport: str = "auto",
         timeout_seconds: float = 120.0,
     ) -> TorchDistributedGroup:
         """按 torchrun 环境变量初始化一组 Rank。"""
@@ -66,6 +74,8 @@ class TorchDistributedGroup(TensorCollectives):
             raise ExecutionError("this PyTorch build does not provide distributed execution")
         if not isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("distributed timeout must be positive")
+        if control_transport not in {"auto", "socket", "gloo"}:
+            raise ValueError("distributed control transport must be auto, socket, or gloo")
         try:
             rank = int(os.environ["RANK"])
             world_size = int(os.environ["WORLD_SIZE"])
@@ -111,8 +121,8 @@ class TorchDistributedGroup(TensorCollectives):
                 timeout=timeout,
                 pg_options=options,
             )
-        # NCCL 只处理 device tensor；控制命令使用独立 Gloo group，避免把
-        # Python 对象序列化后再绕到 GPU。vLLM/SGLang 也采用双 group 边界。
+        # NCCL 只处理 device tensor；独立 Gloo group 负责启动协调、容量
+        # 事实和可选命令回退，避免 Python 对象经 GPU collective 传输。
         try:
             control_group = (
                 dist.new_group(backend="gloo", timeout=timeout)
@@ -123,7 +133,7 @@ class TorchDistributedGroup(TensorCollectives):
             if owns_world_group and dist.is_initialized():
                 dist.destroy_process_group()
             raise
-        return cls(
+        group = cls(
             rank=rank,
             world_size=world_size,
             local_rank=local_rank,
@@ -132,6 +142,23 @@ class TorchDistributedGroup(TensorCollectives):
             tensor_group=dist.group.WORLD,
             owns_world_group=owns_world_group,
         )
+        try:
+            group._command_channel = _create_command_channel(
+                group,
+                transport=control_transport,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception:
+            group.close()
+            raise
+        return group
+
+    @property
+    def command_channel(self) -> _CommandChannel:
+        channel = self._command_channel
+        if channel is None:
+            raise ExecutionError("tensor parallel command channel is not initialized")
+        return channel
 
     def all_reduce_sum(self, tensor: Tensor) -> Tensor:
         self._ensure_open()
@@ -198,6 +225,8 @@ class TorchDistributedGroup(TensorCollectives):
         if self._closed:
             return
         self._closed = True
+        if self._command_channel is not None:
+            self._command_channel.close()
         if self._control_group is not dist.group.WORLD:
             dist.destroy_process_group(self._control_group)
         if self._owns_world_group and dist.is_initialized():
@@ -286,6 +315,263 @@ class _CommandResult:
     error_message: str | None = None
 
 
+class _CommandChannel(Protocol):
+    """把一条命令交给所有 Rank，并把执行结果收回 Rank 0。"""
+
+    def broadcast(self, value: object | None) -> object: ...
+
+    def complete(
+        self,
+        value: object,
+        *,
+        failed: bool,
+        require_consensus: bool,
+    ) -> tuple[object, ...]: ...
+
+    def abort(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class _GlooCommandChannel:
+    """保留原有 collective 控制通道，供显式回退和非 POSIX 环境使用。"""
+
+    def __init__(self, group: TorchDistributedGroup) -> None:
+        self._group = group
+
+    def broadcast(self, value: object | None) -> object:
+        return self._group.broadcast_object(value)
+
+    def complete(
+        self,
+        value: object,
+        *,
+        failed: bool,
+        require_consensus: bool,
+    ) -> tuple[object, ...]:
+        if require_consensus:
+            return self._group.all_gather_object(value)
+
+        # 正常模型 step 只同步一个成功标记；异常文本仅在失败时广播。
+        failure_rank = self._group.first_rank(failed)
+        if failure_rank is None:
+            return (value,) if self._group.rank == 0 else ()
+        failure = self._group.broadcast_object(
+            value if self._group.rank == failure_rank else None,
+            src=failure_rank,
+        )
+        return (failure,)
+
+    def abort(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _SocketCommandChannel:
+    """单机 Rank 间的有序 Unix socket 命令通道。
+
+    每条 ``ExecutionBatch`` 只序列化一次；各 Worker 通过本地 socket 收取
+    同一份字节，并只回传小结果。NCCL 仍只负责模型 tensor collective。
+    """
+
+    _HEADER = struct.Struct("!Q")
+    _MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        peers: dict[int, socket.socket],
+        socket_path: Path | None = None,
+    ) -> None:
+        self._rank = rank
+        self._peers = peers
+        self._socket_path = socket_path
+        self._closed = False
+
+    @classmethod
+    def initialize(
+        cls,
+        group: TorchDistributedGroup,
+        *,
+        timeout_seconds: float,
+    ) -> _SocketCommandChannel:
+        listener: socket.socket | None = None
+        socket_path: Path | None = None
+        peers: dict[int, socket.socket] = {}
+        try:
+            if group.rank == 0:
+                directory = Path(tempfile.mkdtemp(prefix="light-vllm-tp-"))
+                socket_path = directory / "commands.sock"
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.settimeout(timeout_seconds)
+                listener.bind(str(socket_path))
+                os.chmod(socket_path, 0o600)
+                listener.listen(group.world_size - 1)
+            address = group.broadcast_object(str(socket_path) if socket_path else None)
+            if not isinstance(address, str):
+                raise ExecutionError("tensor parallel command socket address is invalid")
+
+            if group.rank == 0:
+                assert listener is not None
+                for _ in range(1, group.world_size):
+                    peer, _ = listener.accept()
+                    peer.settimeout(timeout_seconds)
+                    try:
+                        peer_rank = cls._receive_object(peer)
+                    except Exception:
+                        peer.close()
+                        raise
+                    if (
+                        type(peer_rank) is not int
+                        or not 1 <= peer_rank < group.world_size
+                        or peer_rank in peers
+                    ):
+                        peer.close()
+                        raise ExecutionError(
+                            "tensor parallel command socket received an invalid rank"
+                        )
+                    peers[peer_rank] = peer
+                return cls(rank=0, peers=peers, socket_path=socket_path)
+
+            peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            peer.settimeout(timeout_seconds)
+            peer.connect(address)
+            peers[0] = peer
+            cls._send_object(peer, group.rank)
+            return cls(rank=group.rank, peers=peers)
+        except Exception as exc:
+            for peer in peers.values():
+                peer.close()
+            if socket_path is not None:
+                cls._remove_socket_path(socket_path)
+            if isinstance(exc, ExecutionError):
+                raise
+            raise ExecutionError("failed to initialize the local TP command socket") from exc
+        finally:
+            if listener is not None:
+                listener.close()
+
+    def broadcast(self, value: object | None) -> object:
+        self._ensure_open()
+        if self._rank == 0:
+            payload = self._serialize(value)
+            for rank in sorted(self._peers):
+                self._send_payload(self._peers[rank], payload)
+            return value
+        return self._receive_object(self._peers[0])
+
+    def complete(
+        self,
+        value: object,
+        *,
+        failed: bool,
+        require_consensus: bool,
+    ) -> tuple[object, ...]:
+        # Worker 回包本身就是完成确认，两种上层策略都复用同一有序收集。
+        del failed, require_consensus
+        self._ensure_open()
+        if self._rank != 0:
+            self._send_object(self._peers[0], value)
+            return ()
+        results = [value]
+        for rank in sorted(self._peers):
+            results.append(self._receive_object(self._peers[rank]))
+        return tuple(results)
+
+    def abort(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for peer in self._peers.values():
+            peer.close()
+        self._peers.clear()
+        if self._socket_path is not None:
+            self._remove_socket_path(self._socket_path)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ExecutionError("tensor parallel command socket is closed")
+
+    @classmethod
+    def _serialize(cls, value: object) -> bytes:
+        payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        if len(payload) > cls._MAX_PAYLOAD_BYTES:
+            raise ExecutionError("tensor parallel command exceeds the local IPC limit")
+        return payload
+
+    @classmethod
+    def _send_object(cls, peer: socket.socket, value: object) -> None:
+        cls._send_payload(peer, cls._serialize(value))
+
+    @classmethod
+    def _send_payload(cls, peer: socket.socket, payload: bytes) -> None:
+        try:
+            peer.sendall(cls._HEADER.pack(len(payload)) + payload)
+        except OSError as exc:
+            raise ExecutionError("tensor parallel command socket send failed") from exc
+
+    @classmethod
+    def _receive_object(cls, peer: socket.socket) -> object:
+        try:
+            header = cls._receive_exact(peer, cls._HEADER.size)
+            (size,) = cls._HEADER.unpack(header)
+            if size > cls._MAX_PAYLOAD_BYTES:
+                raise ExecutionError("tensor parallel command socket payload is too large")
+            return pickle.loads(cls._receive_exact(peer, size))
+        except (OSError, pickle.PickleError, EOFError) as exc:
+            raise ExecutionError("tensor parallel command socket receive failed") from exc
+
+    @staticmethod
+    def _receive_exact(peer: socket.socket, size: int) -> bytes:
+        chunks = bytearray(size)
+        view = memoryview(chunks)
+        received = 0
+        while received < size:
+            count = peer.recv_into(view[received:])
+            if count == 0:
+                raise ExecutionError("tensor parallel command socket peer exited")
+            received += count
+        return bytes(chunks)
+
+    @staticmethod
+    def _remove_socket_path(socket_path: Path) -> None:
+        try:
+            socket_path.unlink(missing_ok=True)
+            socket_path.parent.rmdir()
+        except OSError:
+            # 关闭阶段以释放通信资源为主；临时目录清理失败不应覆盖原异常。
+            pass
+
+
+def _create_command_channel(
+    group: TorchDistributedGroup,
+    *,
+    transport: str,
+    timeout_seconds: float,
+) -> _CommandChannel:
+    if transport == "gloo":
+        return _GlooCommandChannel(group)
+    supports_socket = os.name == "posix" and hasattr(socket, "AF_UNIX")
+    hostnames = group.all_gather_object(socket.gethostname())
+    single_host = len(set(hostnames)) == 1
+    selected = "socket" if transport == "auto" and supports_socket and single_host else transport
+    if selected == "auto":
+        selected = "gloo"
+    if selected == "gloo":
+        return _GlooCommandChannel(group)
+    if selected != "socket" or not supports_socket:
+        raise ExecutionError("Unix socket TP control transport is unavailable on this host")
+    if not single_host:
+        raise ExecutionError("Unix socket TP control transport requires all ranks on one host")
+    return _SocketCommandChannel.initialize(group, timeout_seconds=timeout_seconds)
+
+
 def _apply_command(executor: ModelExecutor, command: _Command) -> object | None:
     if isinstance(command, _Initialize):
         executor.initialize()
@@ -348,27 +634,6 @@ def _validate_results(
     return values[0]
 
 
-def _raise_synchronized_error(
-    group: TorchDistributedGroup,
-    local_result: _CommandResult,
-) -> None:
-    """同步执行成败；仅在失败时传输异常文本。"""
-
-    failure_rank = group.first_rank(local_result.error_type is not None)
-    if failure_rank is None:
-        return
-    failure = group.broadcast_object(
-        local_result if group.rank == failure_rank else None,
-        src=failure_rank,
-    )
-    if not isinstance(failure, _CommandResult) or failure.error_type is None:
-        raise ExecutionError("tensor parallel rank returned an invalid failure result")
-    raise ExecutionError(
-        "tensor parallel command failed: "
-        f"rank {failure_rank}: {failure.error_type}: {failure.error_message}"
-    )
-
-
 class TensorParallelModelExecutor:
     """Rank 0 的 Executor；请求状态仍由现有 EngineCore 独占。"""
 
@@ -377,12 +642,14 @@ class TensorParallelModelExecutor:
         local: ModelExecutor,
         group: TorchDistributedGroup,
         *,
+        command_channel: _CommandChannel | None = None,
         timer: ExecutionTimer | None = None,
     ) -> None:
         if group.rank != 0:
             raise ValueError("only rank 0 can own TensorParallelModelExecutor")
         self._local = local
         self._group = group
+        self._commands = command_channel or _GlooCommandChannel(group)
         self._timer = timer
         self._pending: list[_AddRequest | _FreeRequest] = []
         self._active_requests: set[str] = set()
@@ -539,15 +806,19 @@ class TensorParallelModelExecutor:
         *,
         require_consensus: bool,
     ) -> object | None:
-        self._group.broadcast_object(command)
-        local_result = _command_result(operation)
-        if not require_consensus:
-            # Rank 0 独占 Engine 状态和对外输出；其他 Rank 只需保持模型与 KV
-            # 状态同步。成功时不再序列化所有 Rank 的完整 ExecutionOutput。
-            _raise_synchronized_error(self._group, local_result)
-            return local_result.value
-        results = self._group.all_gather_object(local_result)
-        return _validate_results(results, require_consensus=require_consensus)
+        try:
+            self._commands.broadcast(command)
+            local_result = _command_result(operation)
+            results = self._commands.complete(
+                local_result,
+                failed=local_result.error_type is not None,
+                require_consensus=require_consensus,
+            )
+            return _validate_results(results, require_consensus=require_consensus)
+        except Exception:
+            # 任一 Rank 失败后，其他 Rank 的模型/KV 状态不再可安全复用。
+            self._commands.abort()
+            raise
 
 
 class _TensorParallelLease:
@@ -574,24 +845,38 @@ class _TensorParallelLease:
 def run_tensor_parallel_worker(
     executor: ModelExecutor,
     group: TorchDistributedGroup,
+    *,
+    command_channel: _CommandChannel | None = None,
 ) -> None:
     """非零 Rank 的阻塞命令循环；所有模型步骤顺序与 Rank 0 一致。"""
 
     if group.rank == 0:
         raise ValueError("rank 0 owns the engine and cannot enter the worker loop")
+    commands = command_channel or _GlooCommandChannel(group)
     while True:
-        command = group.broadcast_object(None)
-        if not isinstance(command, (_Initialize, _UpdateRequests, _Execute, _Shutdown)):
-            result = _CommandResult(
-                error_type="TypeError",
-                error_message="received an invalid tensor parallel command",
+        try:
+            command = commands.broadcast(None)
+            if not isinstance(command, (_Initialize, _UpdateRequests, _Execute, _Shutdown)):
+                result = _CommandResult(
+                    error_type="TypeError",
+                    error_message="received an invalid tensor parallel command",
+                )
+            else:
+                result = _command_result(lambda current=command: _apply_command(executor, current))
+            require_consensus = not isinstance(command, _Execute)
+            # Rank 0 独占生成结果；正常 execute 只回传小型成功/失败状态。
+            wire_result = result if require_consensus else replace(result, value=None)
+            results = commands.complete(
+                wire_result,
+                failed=result.error_type is not None,
+                require_consensus=require_consensus,
             )
-        else:
-            result = _command_result(lambda current=command: _apply_command(executor, current))
-        if isinstance(command, _Execute):
-            _raise_synchronized_error(group, result)
-        else:
-            results = group.all_gather_object(result)
-            _validate_results(results, require_consensus=False)
+            _validate_results(
+                results or (wire_result,),
+                require_consensus=False,
+            )
+        except Exception:
+            commands.abort()
+            raise
         if isinstance(command, _Shutdown):
             return

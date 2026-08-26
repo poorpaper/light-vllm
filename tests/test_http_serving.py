@@ -169,6 +169,13 @@ def test_cli_can_disable_load_dependent_ttft_gates() -> None:
     assert args.ttft_kv_cache_watermark is None
 
 
+def test_cli_selects_the_tensor_parallel_control_transport() -> None:
+    assert _create_parser().parse_args([]).distributed_control_transport == "auto"
+    args = _create_parser().parse_args(["--distributed-control-transport", "gloo"])
+
+    assert args.distributed_control_transport == "gloo"
+
+
 def test_cli_requires_torchrun_world_size_to_match_tensor_parallel_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
