@@ -33,6 +33,9 @@ packages and must not change runtime behavior.
   per-run medians, and renders throughput, latency, scaling, and memory charts.
 - `profile_tp_primitives.py`: measures NCCL tensor collectives separately from
   the Gloo control channel used by the TP executor.
+- `profile_tp_runtime.py`: records per-Rank model, command-channel and Engine
+  wall-clock stages; set `TP_RUNTIME_PROFILE_OUTPUT='/path/rank-{rank}.json'`
+  when invoking `run_runtime_gap_case.sh` to enable it.
 - `test_tp_failure_exit.sh`: kills one active Rank and verifies bounded process
   exit, port release, and GPU-memory cleanup.
 

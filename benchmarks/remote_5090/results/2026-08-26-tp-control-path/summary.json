@@ -1,0 +1,67 @@
+{
+  "date": "2026-08-26",
+  "hardware": {
+    "gpus": "2 x NVIDIA GeForce RTX 5090 32607 MiB",
+    "topology": "SYS",
+    "cuda_p2p": false,
+    "driver": "580.95.05"
+  },
+  "software": {
+    "python": "3.12",
+    "torch": "2.11.0+cu130",
+    "vllm": "0.26.0"
+  },
+  "workload": {
+    "model": "Qwen2.5-Coder-7B-Instruct",
+    "dtype": "bfloat16",
+    "requests": 16,
+    "output_tokens_per_request": 512,
+    "formal_runs": 3,
+    "warmup_excluded": true,
+    "vllm_enforce_eager": true
+  },
+  "tp2": {
+    "light_gloo": {
+      "throughput_runs": [1130.575484, 1105.376371, 1125.475739],
+      "throughput_median": 1125.475739,
+      "tpot_p50_ms_median": 14.033842
+    },
+    "light_socket": {
+      "throughput_runs": [1200.428992, 1209.987871, 1209.680760],
+      "throughput_median": 1209.680760,
+      "tpot_p50_ms_median": 13.101131
+    },
+    "vllm_eager": {
+      "throughput_runs": [1296.848576, 1302.809314, 1309.126208],
+      "throughput_median": 1302.809314,
+      "tpot_p50_ms_median": 12.161358
+    },
+    "socket_vs_gloo_throughput_percent": 7.481727,
+    "socket_vs_vllm_throughput_ratio_percent": 92.851713,
+    "socket_vs_vllm_gap_percent": 7.148287
+  },
+  "control_trace_rank0": {
+    "old_gloo_ms_per_step": 1.00713,
+    "socket_ms_per_step": 0.170132,
+    "saved_ms_per_step": 0.836998,
+    "reduction_percent": 83.107
+  },
+  "tp1_regression": {
+    "method": "two opposite-order 3+3 run blocks; six formal runs per revision",
+    "baseline_throughput_median": 1194.136492,
+    "candidate_throughput_median": 1194.960984,
+    "candidate_vs_baseline_percent": 0.069045
+  },
+  "correctness": {
+    "prompts": 4,
+    "output_tokens_per_prompt": 8,
+    "tp1_tp2_mismatched_requests": 0
+  },
+  "rank_failure": {
+    "killed_local_rank": 1,
+    "exit_elapsed_ms": 16519,
+    "timed_out": false,
+    "port_released": true,
+    "gpu_memory_released": true
+  }
+}

@@ -22,6 +22,8 @@ REPLAY_REFERENCE=${REPLAY_REFERENCE:-/root/autodl-tmp/light-vllm-results/preempt
 PROFILE_DETAIL=${PROFILE_DETAIL:-full}
 RUNS=${RUNS:-3}
 TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+DISTRIBUTED_CONTROL_TRANSPORT=${DISTRIBUTED_CONTROL_TRANSPORT:-auto}
+TP_RUNTIME_PROFILE_OUTPUT=${TP_RUNTIME_PROFILE_OUTPUT:-}
 PAGED_ATTENTION_BACKEND=${PAGED_ATTENTION_BACKEND:-triton}
 SHORT_REQUEST_RESERVED_SEQUENCES=${SHORT_REQUEST_RESERVED_SEQUENCES:-}
 SERVER_PREFIX=${MODE}-${CASE}
@@ -33,6 +35,14 @@ if [[ ! "$TENSOR_PARALLEL_SIZE" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if (( TENSOR_PARALLEL_SIZE > 1 )) && [[ "$PROFILE_DETAIL" != off ]]; then
   echo "tensor-parallel benchmark currently requires PROFILE_DETAIL=off" >&2
+  exit 2
+fi
+if [[ -n "$TP_RUNTIME_PROFILE_OUTPUT" ]] && (( TENSOR_PARALLEL_SIZE == 1 )); then
+  echo "TP_RUNTIME_PROFILE_OUTPUT requires tensor parallel execution" >&2
+  exit 2
+fi
+if [[ -n "$TP_RUNTIME_PROFILE_OUTPUT" && "$TP_RUNTIME_PROFILE_OUTPUT" != *'{rank}'* ]]; then
+  echo "TP_RUNTIME_PROFILE_OUTPUT must contain a {rank} placeholder" >&2
   exit 2
 fi
 if (( TENSOR_PARALLEL_SIZE > 1 )) && [[ "${ENGINE_PROCESS:-0}" == 1 ]]; then
@@ -49,6 +59,14 @@ configure_case() {
     RATE=1
     KV_TOKENS=32768
     WARMUP_LIMIT=16
+    USE_REPLAY=0
+    ;;
+  correctness)
+    WORKLOAD=${WORKLOAD_DIR}/correctness.json
+    ARRIVAL_MODE=burst
+    RATE=1
+    KV_TOKENS=32768
+    WARMUP_LIMIT=4
     USE_REPLAY=0
     ;;
   normal-low)
@@ -183,6 +201,37 @@ light_profile_pid() {
   printf '%s\n' "${children[0]}"
 }
 
+dump_tp_runtime_profile() {
+  local rank output pid_file profile_pid
+  for rank in $(seq 0 $((TENSOR_PARALLEL_SIZE - 1))); do
+    output=${TP_RUNTIME_PROFILE_OUTPUT/'{rank}'/$rank}
+    pid_file=${output%.*}.pid
+    profile_pid=$(<"$pid_file")
+    kill -USR2 "$profile_pid"
+  done
+  for _ in $(seq 1 60); do
+    if "$PYTHON" - "$TP_RUNTIME_PROFILE_OUTPUT" "$TENSOR_PARALLEL_SIZE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+pattern = sys.argv[1]
+world_size = int(sys.argv[2])
+for rank in range(world_size):
+    path = Path(pattern.replace("{rank}", str(rank)))
+    if not path.is_file() or not path.stat().st_size:
+        raise SystemExit(1)
+    json.loads(path.read_text(encoding="utf-8"))
+PY
+    then
+      return
+    fi
+    sleep 1
+  done
+  echo "TP runtime profile did not become valid JSON" >&2
+  exit 1
+}
+
 MAX_SEQS=${MAX_NUM_SEQUENCES:-16}
 if [[ ! "$MAX_SEQS" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_NUM_SEQUENCES must be a positive integer" >&2
@@ -201,8 +250,16 @@ if (( TENSOR_PARALLEL_SIZE > 1 )); then
     "$PYTHON" -m torch.distributed.run
     --standalone
     --nproc-per-node "$TENSOR_PARALLEL_SIZE"
-    --module light_vllm.entrypoints.http
   )
+  if [[ -n "$TP_RUNTIME_PROFILE_OUTPUT" ]]; then
+    LIGHT_ENTRY+=("$HARNESS_ROOT/benchmarks/remote_5090/profile_tp_runtime.py")
+    SERVER_ENV+=(
+      LIGHT_VLLM_TP_PROFILE_OUTPUT="$TP_RUNTIME_PROFILE_OUTPUT"
+      LIGHT_VLLM_TP_PROFILE_AUTO_START=1
+    )
+  else
+    LIGHT_ENTRY+=(--module light_vllm.entrypoints.http)
+  fi
   SERVER_ENV+=(
     NCCL_DEBUG=${NCCL_DEBUG:-WARN}
     TORCH_NCCL_ASYNC_ERROR_HANDLING=1
@@ -235,7 +292,10 @@ LIGHT_COMMON=(
   --ttft-kv-cache-watermark off
 )
 if (( TENSOR_PARALLEL_SIZE > 1 )); then
-  LIGHT_COMMON+=(--tensor-parallel-size "$TENSOR_PARALLEL_SIZE")
+  LIGHT_COMMON+=(
+    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
+    --distributed-control-transport "$DISTRIBUTED_CONTROL_TRANSPORT"
+  )
 fi
 if [[ "${ENGINE_PROCESS:-0}" == 1 ]]; then
   LIGHT_COMMON+=(--engine-process)
@@ -388,6 +448,10 @@ for benchmark_case in "${BENCHMARK_CASES[@]}"; do
     run_case "r${run}"
   done
 done
+
+if [[ -n "$TP_RUNTIME_PROFILE_OUTPUT" ]]; then
+  dump_tp_runtime_profile
+fi
 
 if [[ "$PROFILE_DETAIL" != off ]]; then
   if [[ "$BACKEND" == light-vllm ]]; then

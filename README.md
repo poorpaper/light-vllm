@@ -270,6 +270,25 @@ BF16 数值路径差异在自回归生成中被放大相符，但尚未采集分
 [`test_tp_failure_exit.sh`](benchmarks/remote_5090/test_tp_failure_exit.sh)。Docker/Kubernetes TP=2 配置已经提供，
 但容器性能 A/B 仍需在具有 Docker/K3s 权限的双卡宿主机上完成，不能由静态 YAML 渲染替代。
 
+### TP=2 控制路径优化
+
+后续在另一台双 RTX 5090（`SYS` 拓扑、无 P2P）上复核了 TP 热路径。旧实现每个 step 都通过 Gloo 广播
+`ExecutionBatch` 并同步执行状态；Rank 0 分层计时显示两者合计约 `1.007 ms/step`。单机默认控制通道改为有序
+Unix socket 后降至约 `0.170 ms/step`，而 NCCL 仍只负责模型 tensor collective。固定 `16×512` decode、warmup
+后 3 轮的结果如下：
+
+| 实现 | 输出吞吐中位数 | TPOT P50 中位数 |
+| --- | ---: | ---: |
+| light-vllm Gloo 控制 | 1,125.48 tok/s | 14.034 ms/token |
+| light-vllm Unix socket 控制 | 1,209.68 tok/s | 13.101 ms/token |
+| vLLM 0.26.0 eager | 1,302.81 tok/s | 12.161 ms/token |
+
+新路径相对旧路径提升 `7.48%`，达到同条件 vLLM 吞吐的 `92.85%`，差距为 `7.15%`。TP=1 用相反运行顺序各做
+一组 `3+3`，合计每个版本 6 轮；中位吞吐从 `1,194.14` 到 `1,194.96 tok/s`（`+0.07%`），未观察到单卡
+性能劣化。4×8 token 的 TP=1/2 逐 token 对照仍完全一致，活动请求中终止 Rank 1 后 16.519 秒内整组退出、端口
+释放且显存归零。完整条件与边界见
+[TP 控制路径优化验收](benchmarks/remote_5090/results/2026-08-26-tp-control-path/REPORT.md)。
+
 ## 运行时边界
 
 - `reference` 是无调度、全序列重算的语义基线；`engine` 才使用 token budget、KV cache 和增量执行。
