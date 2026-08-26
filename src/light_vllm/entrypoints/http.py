@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from math import isfinite
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -30,7 +32,12 @@ from light_vllm.runtime.engine.admission import (
 from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
-from light_vllm.runtime.engine.process import EngineProcessRuntime, ProcessEngineClient
+from light_vllm.runtime.engine.process import (
+    ConnectionEngineClient,
+    EngineProcessRuntime,
+    ProcessEngineClient,
+    run_engine_server,
+)
 from light_vllm.runtime.execution.distributed import (
     SynchronizedPagedKVCachePlanner,
     TensorParallelModelExecutor,
@@ -143,6 +150,16 @@ class _ExecutionComponents:
     logical_cache: KVCacheManager
     performance_observer: InMemoryPerformanceObserver
     decoding_budget: DecodingBudget | None
+
+
+@dataclass(frozen=True, slots=True)
+class _HttpFrontendConfig:
+    host: str
+    port: int
+    tokenizer: Path | None
+    served_model_name: str | None
+    request_timeout_seconds: float | None
+    speculative_decoding: bool
 
 
 def _create_paged_cache_planner(
@@ -409,8 +426,14 @@ def _run_tensor_parallel_rank(
 def _create_started_engine_process_runtime(
     spec: ModelSpec,
     config: _EngineRuntimeConfig,
+    tensor_parallel_group: TorchDistributedGroup | None = None,
 ) -> EngineProcessRuntime:
-    runtime = _create_engine_runtime(spec, config, cooperative_inline=True)
+    runtime = _create_engine_runtime(
+        spec,
+        config,
+        cooperative_inline=True,
+        tensor_parallel_group=tensor_parallel_group,
+    )
     runtime.start()
     return EngineProcessRuntime(
         engine=runtime.engine,
@@ -886,6 +909,121 @@ def _initialize_tensor_parallel(
     )
 
 
+def _http_frontend_config_from_args(args: argparse.Namespace) -> _HttpFrontendConfig:
+    if args.tokenizer is not None:
+        served_model_name = args.served_model_name or (
+            args.weights.name if args.weights is not None else args.architecture
+        )
+    else:
+        if args.served_model_name is not None:
+            raise ValueError("--served-model-name requires --tokenizer")
+        served_model_name = None
+    return _HttpFrontendConfig(
+        host=args.host,
+        port=args.port,
+        tokenizer=args.tokenizer,
+        served_model_name=served_model_name,
+        request_timeout_seconds=args.request_timeout_seconds,
+        speculative_decoding=bool(args.num_speculative_tokens),
+    )
+
+
+def _create_connected_http_app(
+    config: _HttpFrontendConfig,
+    connection: Connection,
+) -> FastAPI:
+    """创建只负责协议与流写出的 HTTP 前端。"""
+
+    from light_vllm.serving.http import create_http_app
+    from light_vllm.serving.openai import OpenAIServingConfig
+
+    engine = ConnectionEngineClient(connection)
+    text_processor = None
+    if config.tokenizer is not None:
+        from light_vllm.serving.text import HuggingFaceTextProcessor
+
+        text_processor = HuggingFaceTextProcessor.from_pretrained(config.tokenizer)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        await engine.start()
+        try:
+            yield
+        finally:
+            await engine.close()
+
+    openai_config = (
+        OpenAIServingConfig(
+            text_processor=text_processor,
+            served_model_name=config.served_model_name,
+            request_timeout_seconds=config.request_timeout_seconds,
+            speculative_decoding=config.speculative_decoding,
+        )
+        if text_processor is not None and config.served_model_name is not None
+        else None
+    )
+    return create_http_app(
+        engine,
+        lifespan=lifespan,
+        performance_metrics=engine,
+        openai_config=openai_config,
+    )
+
+
+def _run_http_frontend_process(
+    config: _HttpFrontendConfig,
+    connection: Connection,
+) -> None:
+    import uvicorn
+
+    try:
+        uvicorn.run(
+            _create_connected_http_app(config, connection),
+            host=config.host,
+            port=config.port,
+        )
+    finally:
+        connection.close()
+
+
+def _run_tensor_parallel_leader(
+    spec: ModelSpec,
+    config: _EngineRuntimeConfig,
+    group: TorchDistributedGroup,
+    frontend: _HttpFrontendConfig,
+) -> None:
+    """让 rank 0 专注 Engine，并把 HTTP/Tokenizer 放到独立进程。"""
+
+    context = multiprocessing.get_context("spawn")
+    engine_connection, frontend_connection = context.Pipe(duplex=True)
+    frontend_process = context.Process(
+        target=_run_http_frontend_process,
+        args=(frontend, frontend_connection),
+        name="light-vllm-http-frontend",
+        daemon=True,
+    )
+    frontend_process.start()
+    frontend_connection.close()
+    try:
+        run_engine_server(
+            engine_connection,
+            partial(_create_started_engine_process_runtime, spec, config, group),
+        )
+    except BaseException:
+        if frontend_process.is_alive():
+            frontend_process.terminate()
+        frontend_process.join(timeout=30)
+        raise
+
+    frontend_process.join(timeout=30)
+    if frontend_process.is_alive():
+        frontend_process.terminate()
+        frontend_process.join(timeout=30)
+        raise RuntimeError("HTTP frontend did not stop after the Engine closed")
+    if frontend_process.exitcode != 0:
+        raise RuntimeError(f"HTTP frontend exited with code {frontend_process.exitcode}")
+
+
 def _run_http_entrypoint(
     args: argparse.Namespace,
     group: TorchDistributedGroup | None,
@@ -917,17 +1055,16 @@ def _run_http_entrypoint(
         _run_tensor_parallel_rank(spec, config, group)
         return
 
+    frontend = _http_frontend_config_from_args(args)
+    if group is not None:
+        _run_tensor_parallel_leader(spec, config, group, frontend)
+        return
+
     text_processor = None
-    served_model_name = None
-    if args.tokenizer is not None:
+    if frontend.tokenizer is not None:
         from light_vllm.serving.text import HuggingFaceTextProcessor
 
-        text_processor = HuggingFaceTextProcessor.from_pretrained(args.tokenizer)
-        served_model_name = args.served_model_name or (
-            args.weights.name if args.weights is not None else args.architecture
-        )
-    elif args.served_model_name is not None:
-        raise ValueError("--served-model-name requires --tokenizer")
+        text_processor = HuggingFaceTextProcessor.from_pretrained(frontend.tokenizer)
 
     uvicorn.run(
         create_serving_app(
@@ -963,8 +1100,8 @@ def _run_http_entrypoint(
             self_resubmit_kv_admission_watermark=config.self_resubmit_kv_admission_watermark,
             engine_process=args.engine_process,
             text_processor=text_processor,
-            served_model_name=served_model_name,
-            request_timeout_seconds=args.request_timeout_seconds,
+            served_model_name=frontend.served_model_name,
+            request_timeout_seconds=frontend.request_timeout_seconds,
             tensor_parallel_group=group,
         ),
         host=args.host,

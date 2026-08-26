@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
+from threading import Thread
 
 import pytest
 
 from light_vllm.runtime.engine.interfaces import EngineCapabilities
-from light_vllm.runtime.engine.process import EngineProcessRuntime, ProcessEngineClient
+from light_vllm.runtime.engine.process import (
+    ConnectionEngineClient,
+    EngineProcessRuntime,
+    ProcessEngineClient,
+    run_engine_server,
+)
 from light_vllm.runtime.generation.interfaces import (
     GenerateRequest,
     GenerateResult,
@@ -73,6 +80,46 @@ def test_process_engine_client_streams_metrics_errors_and_closes() -> None:
         await events.aclose()
 
         await client.close()
+        assert not client.ready
+
+    asyncio.run(run())
+
+
+def test_connection_engine_client_uses_an_external_engine_owner() -> None:
+    async def run() -> None:
+        client_connection, engine_connection = multiprocessing.Pipe(duplex=True)
+        server = Thread(
+            target=run_engine_server,
+            args=(engine_connection, _create_fake_process_runtime),
+            daemon=True,
+        )
+        server.start()
+        client = ConnectionEngineClient(
+            client_connection,
+            startup_timeout_seconds=5,
+            shutdown_timeout_seconds=5,
+        )
+
+        await client.start()
+        assert client.ready
+        assert client.capabilities.max_model_tokens == 128
+        results = await asyncio.gather(
+            *(
+                client.generate(GenerateRequest(input_ids=(token,), max_new_tokens=2))
+                for token in range(7, 11)
+            )
+        )
+        assert [result.generated_token_ids for result in results] == [
+            (8, 9),
+            (9, 10),
+            (10, 11),
+            (11, 12),
+        ]
+        assert (await asyncio.to_thread(client.snapshot)).model_name == "fake-process-model"
+
+        await client.close()
+        await asyncio.to_thread(server.join, 5)
+        assert not server.is_alive()
         assert not client.ready
 
     asyncio.run(run())
