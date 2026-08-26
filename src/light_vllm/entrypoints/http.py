@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ import torch
 
 from light_vllm.bootstrap import create_runner
 from light_vllm.modeling.models.interfaces import ModelSpec
+from light_vllm.modeling.runner import ModelRunner
+from light_vllm.modeling.tensor_parallel import TensorParallelContext
 from light_vllm.runtime.engine.admission import (
     PredictiveTTFTAdmission,
     SlidingWindowStepLatencyPredictor,
@@ -28,6 +31,12 @@ from light_vllm.runtime.engine.core import EngineCore
 from light_vllm.runtime.engine.in_process import InProcessEngineClient
 from light_vllm.runtime.engine.interfaces import EngineClient
 from light_vllm.runtime.engine.process import EngineProcessRuntime, ProcessEngineClient
+from light_vllm.runtime.execution.distributed import (
+    SynchronizedPagedKVCachePlanner,
+    TensorParallelModelExecutor,
+    TorchDistributedGroup,
+    run_tensor_parallel_worker,
+)
 from light_vllm.runtime.execution.interfaces import ExecutionTimer
 from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
 from light_vllm.runtime.execution.paged_attention import (
@@ -58,6 +67,7 @@ from light_vllm.runtime.execution.worker import (
 from light_vllm.runtime.generation.reference import ReferenceGenerationService
 from light_vllm.runtime.kv_cache import (
     ContiguousKVCacheConfig,
+    KVCacheManager,
     PagedKVCacheManager,
     UnboundedKVCacheManager,
 )
@@ -123,6 +133,16 @@ class _EngineRuntime:
     engine: EngineCore
     performance_metrics: InMemoryPerformanceObserver
     start: Callable[[], None]
+    shutdown: Callable[[], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionComponents:
+    runner: ModelRunner
+    worker: LocalModelWorker
+    logical_cache: KVCacheManager
+    performance_observer: InMemoryPerformanceObserver
+    decoding_budget: DecodingBudget | None
 
 
 def _create_paged_cache_planner(
@@ -175,13 +195,28 @@ def _create_execution_timer(spec: ModelSpec) -> ExecutionTimer:
     return WallClockExecutionTimer()
 
 
-def _create_engine_runtime(
+def _create_execution_components(
     spec: ModelSpec,
     config: _EngineRuntimeConfig,
     *,
-    cooperative_inline: bool = False,
-) -> _EngineRuntime:
-    """装配一个 Engine；模型与 CUDA 资源留到 ``start`` 再初始化。"""
+    tensor_parallel_group: TorchDistributedGroup | None = None,
+) -> _ExecutionComponents:
+    """装配每个 Rank 共用的 Runner、Worker、KV 和 Decode Handler。"""
+
+    parallel = spec.tensor_parallel
+    if tensor_parallel_group is None:
+        if parallel is not None and parallel.world_size > 1:
+            raise ValueError("a multi-rank model requires a tensor parallel executor")
+    elif (
+        parallel is None
+        or parallel.rank != tensor_parallel_group.rank
+        or parallel.world_size != tensor_parallel_group.world_size
+        or parallel.collectives is not tensor_parallel_group
+    ):
+        raise ValueError("model tensor parallel context must match the process group")
+    if tensor_parallel_group is not None and config.kv_reservation != "blocks":
+        # 分页 KV 不持有请求级 tensor；首版 TP 只开放这条生命周期边界清晰的路径。
+        raise ValueError("tensor parallel serving requires paged KV reservation")
 
     runner = create_runner()
     performance_observer = InMemoryPerformanceObserver(spec.architecture)
@@ -192,6 +227,11 @@ def _create_engine_runtime(
             block_size=config.kv_block_size,
             memory_fraction=config.kv_cache_memory_fraction,
         )
+        if tensor_parallel_group is not None:
+            cache_planner = SynchronizedPagedKVCachePlanner(
+                cache_planner,
+                tensor_parallel_group,
+            )
         logical_cache = PagedKVCacheManager(
             cache_planner,
             enable_prefix_caching=(config.enable_prefix_caching or config.enable_self_resubmit),
@@ -248,15 +288,51 @@ def _create_engine_runtime(
         decoding_budget = None
 
     worker = LocalModelWorker(runner, step_factory, decode_handler)
-    model_executor = LocalModelExecutor(
-        worker,
-        timer=_create_execution_timer(spec),
+    return _ExecutionComponents(
+        runner=runner,
+        worker=worker,
+        logical_cache=logical_cache,
+        performance_observer=performance_observer,
+        decoding_budget=decoding_budget,
     )
+
+
+def _create_engine_runtime(
+    spec: ModelSpec,
+    config: _EngineRuntimeConfig,
+    *,
+    cooperative_inline: bool = False,
+    tensor_parallel_group: TorchDistributedGroup | None = None,
+) -> _EngineRuntime:
+    """装配一个 Engine；模型与 CUDA 资源留到 ``start`` 再初始化。"""
+
+    components = _create_execution_components(
+        spec,
+        config,
+        tensor_parallel_group=tensor_parallel_group,
+    )
+    if tensor_parallel_group is None:
+        model_executor = LocalModelExecutor(
+            components.worker,
+            timer=_create_execution_timer(spec),
+        )
+
+        def shutdown() -> None:
+            return None
+
+    else:
+        model_executor = TensorParallelModelExecutor(
+            LocalModelExecutor(components.worker),
+            tensor_parallel_group,
+            command_channel=tensor_parallel_group.command_channel,
+            timer=_create_execution_timer(spec),
+        )
+        shutdown = model_executor.shutdown
     scheduler = TokenBudgetScheduler(
-        logical_cache,
+        components.logical_cache,
         max_num_sequences=config.max_num_sequences,
         max_num_scheduled_tokens=config.max_num_scheduled_tokens,
-        decoding_budget=decoding_budget,
+        decoding_budget=components.decoding_budget,
         short_request_policy=config.short_request_policy,
         self_resubmit_policy=(
             SelfResubmitPolicy(
@@ -284,21 +360,49 @@ def _create_engine_runtime(
     engine = EngineCore(
         model_executor,
         scheduler,
-        performance_observer=performance_observer,
+        performance_observer=components.performance_observer,
         ttft_admission=ttft_admission,
         cooperative_inline=cooperative_inline,
     )
 
     def start() -> None:
-        runner.load(spec)
+        components.runner.load(spec)
         model_executor.initialize()
         # CUDA KV 容量直到 executor 初始化后才确定。
         engine.refresh_performance_metrics()
 
     return _EngineRuntime(
         engine=engine,
-        performance_metrics=performance_observer,
+        performance_metrics=components.performance_observer,
         start=start,
+        shutdown=shutdown,
+    )
+
+
+async def _close_engine_runtime(runtime: _EngineRuntime) -> None:
+    try:
+        await runtime.engine.close()
+    finally:
+        runtime.shutdown()
+
+
+def _run_tensor_parallel_rank(
+    spec: ModelSpec,
+    config: _EngineRuntimeConfig,
+    group: TorchDistributedGroup,
+) -> None:
+    """加载非零 Rank 的本地模型，然后进入统一 Worker 命令循环。"""
+
+    components = _create_execution_components(
+        spec,
+        config,
+        tensor_parallel_group=group,
+    )
+    components.runner.load(spec)
+    run_tensor_parallel_worker(
+        LocalModelExecutor(components.worker),
+        group,
+        command_channel=group.command_channel,
     )
 
 
@@ -311,7 +415,7 @@ def _create_started_engine_process_runtime(
     return EngineProcessRuntime(
         engine=runtime.engine,
         performance_metrics=runtime.performance_metrics,
-        close=runtime.engine.close,
+        close=partial(_close_engine_runtime, runtime),
     )
 
 
@@ -349,6 +453,7 @@ def create_serving_app(
     text_processor: TextProcessor | None = None,
     served_model_name: str | None = None,
     request_timeout_seconds: float | None = 300.0,
+    tensor_parallel_group: TorchDistributedGroup | None = None,
 ) -> FastAPI:
     """创建 HTTP 服务，并选择 reference 或批量 Engine Core。"""
 
@@ -369,6 +474,15 @@ def create_serving_app(
         raise ValueError(f"unsupported speculative proposer: {speculative_proposer}")
     if (text_processor is None) != (served_model_name is None):
         raise ValueError("text_processor and served_model_name must be configured together")
+    if tensor_parallel_group is not None:
+        if tensor_parallel_group.rank != 0:
+            raise ValueError("only tensor parallel rank 0 can create the HTTP app")
+        if runtime != "engine":
+            raise ValueError("tensor parallel serving requires the engine runtime")
+        if engine_process:
+            raise ValueError("tensor parallel ranks already provide the engine process boundary")
+    elif spec.tensor_parallel is not None and spec.tensor_parallel.world_size > 1:
+        raise ValueError("a multi-rank model requires a tensor parallel process group")
     if runtime == "reference":
         if engine_process:
             raise ValueError("an engine process requires the engine runtime")
@@ -434,11 +548,15 @@ def create_serving_app(
             start_engine = process_client.start
             close_engine = process_client.close
         else:
-            engine_runtime = _create_engine_runtime(spec, config)
+            engine_runtime = _create_engine_runtime(
+                spec,
+                config,
+                tensor_parallel_group=tensor_parallel_group,
+            )
             engine = engine_runtime.engine
             performance_metrics = engine_runtime.performance_metrics
             start_runtime = engine_runtime.start
-            close_engine = engine_runtime.engine.close
+            close_engine = partial(_close_engine_runtime, engine_runtime)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -584,6 +702,31 @@ def _create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run the stateful Engine and CUDA worker in a dedicated process",
     )
+    parallel = parser.add_argument_group("single-node tensor parallelism")
+    parallel.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="number of torchrun ranks used to shard one model",
+    )
+    parallel.add_argument(
+        "--distributed-backend",
+        choices=("nccl", "gloo"),
+        default="nccl",
+        help="device collective backend; production GPU serving uses NCCL",
+    )
+    parallel.add_argument(
+        "--distributed-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="maximum wait for a failed or stalled distributed operation",
+    )
+    parallel.add_argument(
+        "--distributed-control-transport",
+        choices=("auto", "socket", "gloo"),
+        default="auto",
+        help="single-node command transport; auto prefers Unix sockets",
+    )
     parser.add_argument(
         "--kv-reservation",
         choices=("blocks", "unbounded"),
@@ -673,10 +816,107 @@ def _create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def _engine_config_from_args(args: argparse.Namespace) -> _EngineRuntimeConfig:
+    return _EngineRuntimeConfig(
+        kv_reservation=args.kv_reservation,
+        paged_attention_backend=args.paged_attention_backend,
+        max_num_sequences=args.max_num_sequences,
+        max_num_scheduled_tokens=args.max_num_scheduled_tokens,
+        num_kv_blocks=args.num_kv_blocks,
+        kv_block_size=args.kv_block_size,
+        kv_cache_memory_fraction=args.kv_cache_memory_fraction,
+        enable_prefix_caching=args.enable_prefix_caching,
+        num_speculative_tokens=args.num_speculative_tokens,
+        speculative_proposer=args.speculative_proposer,
+        speculative_ngram_min=args.speculative_ngram_min,
+        speculative_ngram_max=args.speculative_ngram_max,
+        speculative_max_depth=args.speculative_max_depth,
+        speculative_max_branching=args.speculative_max_branching,
+        short_request_policy=_create_short_request_policy(
+            max_effective_prompt_tokens=args.short_request_max_effective_prompt_tokens,
+            max_total_tokens=args.short_request_max_total_tokens,
+            reserved_scheduled_tokens=args.short_request_reserved_scheduled_tokens,
+            reserved_kv_token_slots=args.short_request_reserved_kv_token_slots,
+            reserved_sequences=args.short_request_reserved_sequences,
+            regular_aging_steps=args.regular_request_aging_steps,
+        ),
+        max_tolerable_ttft_seconds=args.max_tolerable_ttft_seconds,
+        ttft_prediction_window_size=args.ttft_prediction_window_size,
+        ttft_prediction_min_observations=args.ttft_prediction_min_observations,
+        ttft_prediction_quantile=args.ttft_prediction_quantile,
+        max_pending_requests=args.max_pending_requests,
+        ttft_kv_cache_watermark=args.ttft_kv_cache_watermark,
+        enable_self_resubmit=args.enable_self_resubmit,
+        max_self_resubmits=args.max_self_resubmits,
+        self_resubmit_strict_fallback_rolled_back_tokens=(
+            args.self_resubmit_strict_fallback_rolled_back_tokens
+        ),
+        self_resubmit_initial_extra_blocks=args.self_resubmit_initial_extra_blocks,
+        self_resubmit_kv_admission_watermark=args.self_resubmit_kv_admission_watermark,
+    )
+
+
+def _initialize_tensor_parallel(
+    args: argparse.Namespace,
+) -> TorchDistributedGroup | None:
+    size = args.tensor_parallel_size
+    if type(size) is not int or size <= 0:
+        raise ValueError("--tensor-parallel-size must be a positive integer")
+    torchrun_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if size == 1:
+        if torchrun_world_size != 1:
+            raise ValueError("torchrun WORLD_SIZE requires matching --tensor-parallel-size")
+        return None
+    if args.runtime != "engine":
+        raise ValueError("tensor parallel serving requires --runtime engine")
+    if args.engine_process:
+        raise ValueError("tensor parallel serving cannot add a second --engine-process")
+    if torchrun_world_size != size:
+        raise ValueError("torchrun WORLD_SIZE must equal --tensor-parallel-size")
+    if args.loader != "safetensors":
+        raise ValueError("tensor parallel serving currently requires --loader safetensors")
+    if args.distributed_backend == "nccl" and torch.device(args.device).type != "cuda":
+        raise ValueError("NCCL tensor parallelism requires --device cuda")
+    if args.distributed_backend == "gloo" and torch.device(args.device).type != "cpu":
+        raise ValueError("Gloo tensor parallelism requires --device cpu")
+    return TorchDistributedGroup.initialize(
+        backend=args.distributed_backend,
+        control_transport=args.distributed_control_transport,
+        timeout_seconds=args.distributed_timeout_seconds,
+    )
+
+
+def _run_http_entrypoint(
+    args: argparse.Namespace,
+    group: TorchDistributedGroup | None,
+) -> None:
     import uvicorn
 
-    args = _create_parser().parse_args()
+    device = group.device if group is not None else torch.device(args.device)
+    tensor_parallel = (
+        TensorParallelContext(
+            rank=group.rank,
+            world_size=group.world_size,
+            collectives=group,
+        )
+        if group is not None
+        else None
+    )
+    spec = ModelSpec(
+        architecture=args.architecture,
+        loader=args.loader,
+        model_args=args.model_args,
+        weights=args.weights,
+        device=device,
+        dtype=_DTYPES[args.dtype],
+        tensor_parallel=tensor_parallel,
+    )
+    config = _engine_config_from_args(args)
+
+    if group is not None and group.rank != 0:
+        _run_tensor_parallel_rank(spec, config, group)
+        return
+
     text_processor = None
     served_model_name = None
     if args.tokenizer is not None:
@@ -688,61 +928,58 @@ def main() -> None:
         )
     elif args.served_model_name is not None:
         raise ValueError("--served-model-name requires --tokenizer")
-    spec = ModelSpec(
-        architecture=args.architecture,
-        loader=args.loader,
-        model_args=args.model_args,
-        weights=args.weights,
-        device=args.device,
-        dtype=_DTYPES[args.dtype],
-    )
+
     uvicorn.run(
         create_serving_app(
             spec,
             runtime=args.runtime,
-            kv_reservation=args.kv_reservation,
-            paged_attention_backend=args.paged_attention_backend,
-            max_num_sequences=args.max_num_sequences,
-            max_num_scheduled_tokens=args.max_num_scheduled_tokens,
-            num_kv_blocks=args.num_kv_blocks,
-            kv_block_size=args.kv_block_size,
-            kv_cache_memory_fraction=args.kv_cache_memory_fraction,
-            enable_prefix_caching=args.enable_prefix_caching,
-            num_speculative_tokens=args.num_speculative_tokens,
-            speculative_proposer=args.speculative_proposer,
-            speculative_ngram_min=args.speculative_ngram_min,
-            speculative_ngram_max=args.speculative_ngram_max,
-            speculative_max_depth=args.speculative_max_depth,
-            speculative_max_branching=args.speculative_max_branching,
-            short_request_policy=_create_short_request_policy(
-                max_effective_prompt_tokens=(args.short_request_max_effective_prompt_tokens),
-                max_total_tokens=args.short_request_max_total_tokens,
-                reserved_scheduled_tokens=(args.short_request_reserved_scheduled_tokens),
-                reserved_kv_token_slots=args.short_request_reserved_kv_token_slots,
-                reserved_sequences=args.short_request_reserved_sequences,
-                regular_aging_steps=args.regular_request_aging_steps,
-            ),
-            max_tolerable_ttft_seconds=args.max_tolerable_ttft_seconds,
-            ttft_prediction_window_size=args.ttft_prediction_window_size,
-            ttft_prediction_min_observations=args.ttft_prediction_min_observations,
-            ttft_prediction_quantile=args.ttft_prediction_quantile,
-            max_pending_requests=args.max_pending_requests,
-            ttft_kv_cache_watermark=args.ttft_kv_cache_watermark,
-            enable_self_resubmit=args.enable_self_resubmit,
-            max_self_resubmits=args.max_self_resubmits,
+            kv_reservation=config.kv_reservation,
+            paged_attention_backend=config.paged_attention_backend,
+            max_num_sequences=config.max_num_sequences,
+            max_num_scheduled_tokens=config.max_num_scheduled_tokens,
+            num_kv_blocks=config.num_kv_blocks,
+            kv_block_size=config.kv_block_size,
+            kv_cache_memory_fraction=config.kv_cache_memory_fraction,
+            enable_prefix_caching=config.enable_prefix_caching,
+            num_speculative_tokens=config.num_speculative_tokens,
+            speculative_proposer=config.speculative_proposer,
+            speculative_ngram_min=config.speculative_ngram_min,
+            speculative_ngram_max=config.speculative_ngram_max,
+            speculative_max_depth=config.speculative_max_depth,
+            speculative_max_branching=config.speculative_max_branching,
+            short_request_policy=config.short_request_policy,
+            max_tolerable_ttft_seconds=config.max_tolerable_ttft_seconds,
+            ttft_prediction_window_size=config.ttft_prediction_window_size,
+            ttft_prediction_min_observations=config.ttft_prediction_min_observations,
+            ttft_prediction_quantile=config.ttft_prediction_quantile,
+            max_pending_requests=config.max_pending_requests,
+            ttft_kv_cache_watermark=config.ttft_kv_cache_watermark,
+            enable_self_resubmit=config.enable_self_resubmit,
+            max_self_resubmits=config.max_self_resubmits,
             self_resubmit_strict_fallback_rolled_back_tokens=(
-                args.self_resubmit_strict_fallback_rolled_back_tokens
+                config.self_resubmit_strict_fallback_rolled_back_tokens
             ),
-            self_resubmit_initial_extra_blocks=(args.self_resubmit_initial_extra_blocks),
-            self_resubmit_kv_admission_watermark=(args.self_resubmit_kv_admission_watermark),
+            self_resubmit_initial_extra_blocks=config.self_resubmit_initial_extra_blocks,
+            self_resubmit_kv_admission_watermark=config.self_resubmit_kv_admission_watermark,
             engine_process=args.engine_process,
             text_processor=text_processor,
             served_model_name=served_model_name,
             request_timeout_seconds=args.request_timeout_seconds,
+            tensor_parallel_group=group,
         ),
         host=args.host,
         port=args.port,
     )
+
+
+def main() -> None:
+    args = _create_parser().parse_args()
+    group = _initialize_tensor_parallel(args)
+    try:
+        _run_http_entrypoint(args, group)
+    finally:
+        if group is not None:
+            group.close()
 
 
 if __name__ == "__main__":

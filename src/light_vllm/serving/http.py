@@ -92,6 +92,7 @@ class CapabilitiesResponse(BaseModel):
     max_request_tokens: int | None
     max_num_sequences: int
     max_num_scheduled_tokens: int | None
+    tensor_parallel_size: int
 
     @classmethod
     def from_contract(cls, capabilities: EngineCapabilities) -> CapabilitiesResponse:
@@ -101,6 +102,7 @@ class CapabilitiesResponse(BaseModel):
             max_request_tokens=capabilities.max_request_tokens,
             max_num_sequences=capabilities.max_num_sequences,
             max_num_scheduled_tokens=capabilities.max_num_scheduled_tokens,
+            tensor_parallel_size=capabilities.tensor_parallel_size,
         )
 
 

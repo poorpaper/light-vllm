@@ -51,11 +51,12 @@
 | --- | --- |
 | 模型与权重 | 原生 Qwen2/Qwen2.5；full attention、default RoPE、GQA、tied embedding；读取 HF/ModelScope 兼容的本地 safetensors 快照 |
 | 执行 | token-major packed query、chunked prefill、连续与分页 KV、PyTorch correctness attention、可选 Triton fused paged attention |
+| 单机并行 | torchrun + NCCL Tensor Parallel；列/行/词表并行、rank-local 权重与 KV；已完成双 RTX 5090 短序列正确性、显存、性能与故障退出验收 |
 | 调度 | 统一 token budget、严格非抢占 completion claim、prefix cache、短请求资源池、TTFT 早拒、可选 self-resubmit |
 | 解码 | Greedy、temperature、top-k、top-p、逐请求 seed；N-Gram Chain/Trie proposer 共用树形验证和 KV compact |
 | 服务 | 本地 tokenizer、OpenAI-compatible Completion/Chat 流式与非流式 API、token-ID 调试 API、独立 Engine 进程、取消与异常清理、Prometheus 指标 |
 
-暂时没有 sliding-window/RoPE scaling、量化权重、第三方 victim preemption 或分布式执行。v0.2 文本接口首版不支持 tools、多个 choice、logprobs 或批量 prompt，随机 sampling 也不与投机解码组合。Triton 路径已在 RTX 5090 上完成现有场景的数值与性能验收，但长上下文、跨显卡和更多模型仍未验证。
+暂时没有 sliding-window/RoPE scaling、量化权重、第三方 victim preemption、多节点通信或 MaaS 控制面。v0.2 文本接口首版不支持 tools、多个 choice、logprobs 或批量 prompt，随机 sampling 也不与投机解码组合。单机 TP/NCCL 已在双 RTX 5090 上完成短序列正确性、显存、性能和故障退出验收；BF16 长生成的跨 TP size 逐 token 一致性、长上下文、跨节点、更多 GPU 拓扑和更多模型仍未完成验收。
 
 ## 一张图看懂
 
@@ -70,8 +71,9 @@ flowchart LR
     Process -->|IPC| Core["EngineCore<br/>schedule → execute → update"]
 
     Core --> Scheduler["TokenBudgetScheduler<br/>logical KV reservation"]
-    Core --> Executor["LocalModelExecutor"]
-    Executor --> Worker["LocalModelWorker<br/>fixed model generation"]
+    Core --> Executor["ModelExecutor<br/>local / tensor parallel"]
+    Executor --> Worker["LocalModelWorker<br/>per-rank model generation"]
+    Executor -. torchrun · NCCL .-> Remote["rank-local Worker"]
     Worker --> Decode["DecodeHandler<br/>standard / speculative"]
     Worker --> Step["ModelStepHandler<br/>contiguous / paged"]
     Decode --> Sampler["Sampler"]
@@ -146,6 +148,28 @@ python -m venv .venv
   --paged-attention-backend triton
 ```
 
+单机两卡 TP 使用 torchrun 启动一张 GPU 一个进程。Rank 0 运行原有 Engine 和 HTTP，其他 Rank 只运行模型 Worker；
+TP 已经提供独立进程边界，因此不要再传 `--engine-process`：
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  -m light_vllm.entrypoints.http \
+  --architecture qwen2.5 \
+  --loader safetensors \
+  --weights /models/Qwen2.5-Coder-7B-Instruct \
+  --tokenizer /models/Qwen2.5-Coder-7B-Instruct \
+  --served-model-name Qwen2.5-Coder-7B-Instruct \
+  --device cuda \
+  --dtype bfloat16 \
+  --runtime engine \
+  --tensor-parallel-size 2 \
+  --distributed-backend nccl \
+  --kv-reservation blocks \
+  --paged-attention-backend triton
+```
+
+当前实机验收结论见下方 TP=1/2 对照。首版 TP 只支持分页 KV；`unbounded` 会在启动时明确拒绝。
+
 OpenAI Python SDK 可以直接连接本地服务：
 
 ```python
@@ -206,6 +230,66 @@ curl -X POST http://127.0.0.1:8000/generate \
 ![投机解码的 workload 依赖](benchmarks/remote_5090/results/2026-08-22-complete-report/analysis/03_speculation_workload_dependence.png)
 
 </details>
+
+### 单机 TP=1/2 实测
+
+TP 对照使用提交 `ae2fef0`、Qwen2.5-Coder-7B-Instruct BF16、两张 RTX 5090 和相同 token workload。
+两卡之间是 `NODE` 拓扑，CUDA P2P 不可用；light-vllm 与 vLLM 都关闭 prefix cache 和 speculative decoding，
+vLLM 使用 eager 模式。每个配置先 warmup，再正式运行 3 轮；表中是逐轮指标的中位数。
+
+| 系统 | 单卡峰值显存 | 固定 16×512 输出吞吐 | 8 req/s 吞吐 | 8 req/s TTFT P95 | 8 req/s TPOT P50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| light-vllm TP=1 | 25,381 MiB | 1,141.01 tok/s | 583.03 tok/s | 49.05 ms | 13.93 ms/token |
+| light-vllm TP=2 | 13,237 MiB | 944.85 tok/s | 520.03 tok/s | 337.50 ms | 16.52 ms/token |
+| vLLM eager TP=1 | 17,333 MiB | 1,357.07 tok/s | 631.13 tok/s | 60.55 ms | 11.70 ms/token |
+| vLLM eager TP=2 | 9,187 MiB | 1,200.21 tok/s | 581.44 tok/s | 61.07 ms | 13.19 ms/token |
+
+TP=2 把 light-vllm 的单卡峰值显存降低了 47.8%，达到“模型分片而不是复制”的目标；但这台没有 P2P/NVLink 的
+机器上，固定解码吞吐只有 TP=1 的 82.8%，8 req/s 吞吐为 89.2%，高负载 TTFT 也明显变差。因此当前 TP 的价值
+是扩展可加载模型容量，不是让 7B 模型在该拓扑上加速。8 req/s 时 light-vllm TP=1/2 吞吐分别是同条件 vLLM 的
+92.4%/89.4%；2 req/s 到达受限场景四个配置都约为 202 tok/s，不能用来证明饱和吞吐接近。
+
+单卡回归另用 TP 引入前的 `aa791aa` 与 clean `b71d9db` TP=1 路径做 5+5 轮同条件 A/B：吞吐中位数从
+1,260.92 提升到 1,276.92 tok/s（+1.27%），TPOT P50 从 12.567 降到 12.462 ms/token（-0.83%），未观察到
+性能劣化。
+
+直接模型 step 的 100 次计时均值中，TP=1/2 分别为 11.785/12.545 ms。另一个 Rank 0 单 step profiler 样本中，
+TP=2 的 GEMM CUDA 时间从 9.044 降到 4.660 ms，57 次 AllReduce 与一次 LM Head AllGather 的 device operator
+合计约 0.912 ms；该单 Rank 样本不等于双 Rank 端到端通信占比。独立 primitive 测试的每 Rank 中位数为
+56 次 AllReduce 1.126 ms、词表 AllGather 0.138 ms，量级约为 model step 均值的 10%，但两者不是同一次测量，
+只能作诊断参考。CPU 发起/同步与 Gloo 控制通信也存在，最终未形成加速。
+
+正确性测试对 TP=1/2 的 4 个不同 prompt、每个 8 个输出 token 逐 token 对照，无差异。BF16 长解码不承诺跨
+TP size 位一致：1×512 实验曾从第 36 个输出 token 分叉，同一 TP=1 服务重复运行也出现不同轨迹。该现象与
+BF16 数值路径差异在自回归生成中被放大相符，但尚未采集分叉步骤的 logits，根因仍待量化。它不影响上述等工作量
+性能比较，但仍需补充逐步 logits 容差和质量评测，不能写成“长序列完全一致”。故障测试在活动请求中终止 Rank 1，
+其余进程在 16.9 秒内退出、端口释放、
+两张卡显存归零。复现实验入口是
+[`run_tp_comparison_matrix.sh`](benchmarks/remote_5090/run_tp_comparison_matrix.sh)、
+[`analyze_tp_comparison.py`](benchmarks/remote_5090/analyze_tp_comparison.py) 和
+[`test_tp_failure_exit.sh`](benchmarks/remote_5090/test_tp_failure_exit.sh)。Docker/Kubernetes TP=2 配置已经提供，
+但容器性能 A/B 仍需在具有 Docker/K3s 权限的双卡宿主机上完成，不能由静态 YAML 渲染替代。
+
+### TP=2 控制路径优化
+
+后续在另一台双 RTX 5090（`SYS` 拓扑、无 P2P）上复核了 TP 热路径。旧实现每个 step 都通过 Gloo 广播
+`ExecutionBatch` 并同步执行状态；Rank 0 分层计时显示两者合计约 `1.007 ms/step`。单机默认控制通道改为有序
+Unix socket 后降至约 `0.170 ms/step`，而 NCCL 仍只负责模型 tensor collective。固定 `16×512` decode、warmup
+后 3 轮的结果如下：
+
+| 实现 | 输出吞吐中位数 | TPOT P50 中位数 |
+| --- | ---: | ---: |
+| light-vllm Gloo 控制 | 1,125.48 tok/s | 14.034 ms/token |
+| light-vllm Unix socket 控制 | 1,209.68 tok/s | 13.101 ms/token |
+| vLLM 0.26.0 eager | 1,302.81 tok/s | 12.161 ms/token |
+
+![light-vllm TP=2 与 vLLM 性能对比](benchmarks/remote_5090/results/2026-08-26-tp-control-path/tp2-vllm-comparison.png)
+
+新路径相对旧路径提升 `7.48%`，达到同条件 vLLM 吞吐的 `92.85%`，差距为 `7.15%`。TP=1 用相反运行顺序各做
+一组 `3+3`，合计每个版本 6 轮；中位吞吐从 `1,194.14` 到 `1,194.96 tok/s`（`+0.07%`），未观察到单卡
+性能劣化。4×8 token 的 TP=1/2 逐 token 对照仍完全一致，活动请求中终止 Rank 1 后 16.519 秒内整组退出、端口
+释放且显存归零。完整条件与边界见
+[TP 控制路径优化验收](benchmarks/remote_5090/results/2026-08-26-tp-control-path/REPORT.md)。
 
 ## 运行时边界
 

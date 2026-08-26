@@ -1,0 +1,71 @@
+{
+  "date": "2026-08-26",
+  "status": "inline candidate rejected; product code reverted",
+  "hardware": {
+    "gpus": "2 x NVIDIA GeForce RTX 5090 32607 MiB",
+    "topology": "SYS",
+    "cuda_p2p": false,
+    "driver": "580.95.05"
+  },
+  "software": {
+    "python": "3.12",
+    "torch": "2.11.0+cu130",
+    "vllm": "0.26.0"
+  },
+  "workload": {
+    "model": "Qwen2.5-Coder-7B-Instruct",
+    "dtype": "bfloat16",
+    "requests": 16,
+    "output_tokens_per_request": 512,
+    "formal_runs": 3,
+    "warmup_excluded": true,
+    "light_control_transport": "unix socket",
+    "vllm_enforce_eager": true
+  },
+  "tp2": {
+    "light_lane": {
+      "throughput_runs": [1199.387205, 1210.196594, 1206.257766],
+      "throughput_median": 1206.257766,
+      "tpot_p50_ms_runs": [13.162210, 13.101553, 13.083859],
+      "tpot_p50_ms_median": 13.101553,
+      "ttft_p95_ms_runs": [101.597817, 72.643812, 103.217429],
+      "ttft_p95_ms_median": 101.597817,
+      "max_itl_p95_ms_runs": [37.669471, 35.418274, 36.522950],
+      "max_itl_p95_ms_median": 36.522950
+    },
+    "light_inline_rejected": {
+      "throughput_runs": [1322.124446, 1318.469666, 1319.039743],
+      "throughput_median": 1319.039743,
+      "tpot_p50_ms_runs": [11.951568, 11.965146, 11.951182],
+      "tpot_p50_ms_median": 11.951568,
+      "ttft_p95_ms_runs": [88.508526, 98.746244, 102.786346],
+      "ttft_p95_ms_median": 98.746244,
+      "max_itl_p95_ms_runs": [41.100202, 40.924938, 41.115055],
+      "max_itl_p95_ms_median": 41.100202
+    },
+    "vllm_eager": {
+      "throughput_runs": [1296.848576, 1302.809314, 1309.126208],
+      "throughput_median": 1302.809314,
+      "tpot_p50_ms_runs": [12.237281, 12.161358, 12.104500],
+      "tpot_p50_ms_median": 12.161358,
+      "ttft_p95_ms_runs": [62.368758, 72.049261, 71.053271],
+      "ttft_p95_ms_median": 71.053271,
+      "max_itl_p95_ms_runs": [25.191209, 20.485067, 19.644032],
+      "max_itl_p95_ms_median": 20.485067
+    }
+  },
+  "comparison": {
+    "inline_vs_lane_throughput_percent": 9.349738,
+    "inline_vs_lane_tpot_reduction_percent": 8.777474,
+    "inline_vs_lane_ttft_p95_change_percent": -2.806711,
+    "inline_vs_lane_max_itl_regression_percent": 12.532383,
+    "inline_vs_vllm_throughput_percent": 1.245802,
+    "inline_vs_vllm_tpot_change_percent": -1.725057
+  },
+  "trace": {
+    "light_lane_inter_step_gap_p50_ms": 1.238,
+    "vllm_engine_step_inter_call_gap_mean_ms": 0.0147,
+    "vllm_scheduler_schedule_mean_ms": 0.121646,
+    "vllm_scheduler_update_mean_ms": 0.053206
+  }
+}

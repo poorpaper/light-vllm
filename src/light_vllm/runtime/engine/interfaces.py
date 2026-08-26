@@ -21,6 +21,7 @@ class EngineCapabilities:
     max_kv_cache_tokens: int | None = None
     max_num_sequences: int = 1
     max_num_scheduled_tokens: int | None = None
+    tensor_parallel_size: int = 1
 
     @property
     def max_request_tokens(self) -> int | None:

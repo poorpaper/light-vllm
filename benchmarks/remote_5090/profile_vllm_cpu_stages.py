@@ -125,6 +125,7 @@ def _install() -> None:
 
     from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.engine.core import EngineCore
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
     from vllm.v1.executor.uniproc_executor import AsyncOutputFuture, UniProcExecutor
 
     output = Path(raw_output.format(pid=os.getpid()))
@@ -137,6 +138,9 @@ def _install() -> None:
         (Scheduler, "update_from_output", "scheduler.update_from_output"),
         (UniProcExecutor, "execute_model", "executor.execute_model"),
         (UniProcExecutor, "sample_tokens", "executor.sample_tokens"),
+        (MultiprocExecutor, "execute_model", "executor.execute_model"),
+        (MultiprocExecutor, "sample_tokens", "executor.sample_tokens"),
+        (MultiprocExecutor, "collective_rpc", "executor.collective_rpc"),
         (AsyncOutputFuture, "result", "executor.future_result"),
         (EngineCore, "_process_aborts_queue", "engine.process_aborts"),
         (EngineCore, "_attach_iteration_details", "engine.attach_iteration_details"),

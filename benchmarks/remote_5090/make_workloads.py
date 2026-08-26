@@ -190,6 +190,22 @@ def main() -> None:
         name="decode-steady-16-512",
         requests=decode_steady,
     )
+    correctness = [
+        _request(
+            tokenizer,
+            request_id=f"correctness-{index:03d}",
+            kind="correctness",
+            text=CODE_CORPUS,
+            prompt_tokens=16,
+            output_tokens=8,
+        )
+        for index in range(4)
+    ]
+    _write(
+        args.output_dir / "correctness.json",
+        name="correctness-4x16-8",
+        requests=correctness,
+    )
     decode_steady_32 = [
         _request(
             tokenizer,

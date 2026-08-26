@@ -1,0 +1,64 @@
+services:
+  inference:
+    # NCCL 的进程间共享内存留在容器内，避免依赖宿主机 IPC namespace。
+    shm_size: 8gb
+    entrypoint:
+      - python
+      - -m
+      - torch.distributed.run
+      - --standalone
+      - --nproc-per-node
+      - ${LIGHT_VLLM_TENSOR_PARALLEL_SIZE:-2}
+      - --module
+      - light_vllm.entrypoints.http
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --architecture
+      - ${LIGHT_VLLM_ARCHITECTURE:-qwen2.5}
+      - --loader
+      - safetensors
+      - --weights
+      - /models/${LIGHT_VLLM_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --tokenizer
+      - /models/${LIGHT_VLLM_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --served-model-name
+      - ${LIGHT_VLLM_SERVED_MODEL_NAME:-Qwen2.5-Coder-7B-Instruct}
+      - --request-timeout-seconds
+      - ${LIGHT_VLLM_REQUEST_TIMEOUT_SECONDS:-300}
+      - --device
+      - cuda
+      - --dtype
+      - ${LIGHT_VLLM_DTYPE:-bfloat16}
+      - --runtime
+      - engine
+      - --kv-reservation
+      - blocks
+      - --paged-attention-backend
+      - triton
+      - --max-num-sequences
+      - ${LIGHT_VLLM_MAX_NUM_SEQUENCES:-16}
+      - --max-num-scheduled-tokens
+      - ${LIGHT_VLLM_MAX_NUM_SCHEDULED_TOKENS:-512}
+      - --kv-block-size
+      - ${LIGHT_VLLM_KV_BLOCK_SIZE:-16}
+      - --kv-cache-memory-fraction
+      - ${LIGHT_VLLM_KV_CACHE_MEMORY_FRACTION:-0.8}
+      - --distributed-timeout-seconds
+      - ${LIGHT_VLLM_DISTRIBUTED_TIMEOUT_SECONDS:-120}
+      - --tensor-parallel-size
+      - ${LIGHT_VLLM_TENSOR_PARALLEL_SIZE:-2}
+    environment:
+      NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
+      TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+      TORCH_NCCL_ENABLE_MONITORING: "1"
+      TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "60"
+    deploy:
+      resources:
+        reservations:
+          devices: !override
+            - driver: nvidia
+              count: ${LIGHT_VLLM_TENSOR_PARALLEL_SIZE:-2}
+              capabilities: [gpu]

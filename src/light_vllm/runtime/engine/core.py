@@ -190,6 +190,7 @@ class EngineCore:
             max_kv_cache_tokens=execution.max_kv_cache_tokens,
             max_num_sequences=self._scheduler.max_num_sequences,
             max_num_scheduled_tokens=self._scheduler.max_num_scheduled_tokens,
+            tensor_parallel_size=execution.tensor_parallel_size,
         )
 
     async def generate(self, request: GenerateRequest) -> GenerateResult:

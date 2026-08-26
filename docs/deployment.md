@@ -1,7 +1,7 @@
 # 生产部署骨架
 
-这一版提供单节点生产运行骨架和访问本地 GPU 的 OpenAI-compatible 文本协议，不引入网关、分布式执行或 Helm。
-原生、Docker 和 Kubernetes 都启动同一个 `light-vllm-serve` 入口：
+这一版提供单节点生产运行骨架和访问本地 GPU 的 OpenAI-compatible 文本协议，不引入网关、多节点通信或 Helm。
+单卡原生、Docker 和 Kubernetes 都启动同一个 `light-vllm-serve` 入口：
 
 ```text
 HTTP 父进程 → ProcessEngineClient → Engine 子进程 → Worker → GPU
@@ -50,7 +50,8 @@ unit 要求 `/etc/light-vllm/light-vllm.env` 存在；站点参数只在该文�
 
 ## 2. Docker Compose
 
-前置条件是 Docker Compose 和 NVIDIA Container Toolkit。复制示例环境文件并填写宿主机模型目录：
+前置条件是 Docker Compose v2.24.4+ 和 NVIDIA Container Toolkit；TP=2 覆盖层使用这一版本开始提供的
+`!override` 合并标签。复制示例环境文件并填写宿主机模型目录：
 
 ```bash
 cp deploy/docker/.env.example deploy/docker/.env
@@ -64,6 +65,20 @@ docker compose \
 镜像内相同的 healthcheck，不重复声明第二份。
 模型只读挂载，Triton/Torch 编译缓存写入独立 volume，容器根文件系统保持只读。当前进程间通信使用 Pipe，
 不依赖 `--ipc=host` 或额外共享内存权限。
+
+单容器两卡 TP 使用额外的 Compose 配置。它以 `torchrun` 取代单卡 entrypoint，并提供 8 GiB 容器内共享内存；
+模型与缓存卷仍沿用基础配置：
+
+```bash
+docker compose \
+  --env-file deploy/docker/.env \
+  -f deploy/docker/compose.yaml \
+  -f deploy/docker/compose.tp2.yaml \
+  up --build -d
+```
+
+`compose.tp2.yaml` 使用 Compose 的 `!override` 标签把单卡 GPU 申请替换成两卡，避免列表合并后同时保留 1 卡和
+2 卡设备申请。TP 已经提供 torchrun 进程边界，因此覆盖后的命令不再使用 `--engine-process`。
 
 ## 3. Kubernetes
 
@@ -83,6 +98,16 @@ kubectl apply -k deploy/kubernetes/base
 启动完成后的 `livenessProbe` 也检查 `/readyz`，Engine 子进程死亡时会重建 Pod。终止时 K8s 先摘除 Pod，
 再给进程 180 秒完成已有请求和释放 CUDA。
 已有的 Prometheus、Grafana 和 HPA 示例继续位于 `examples/monitoring/`。
+
+一个 Pod 内的两卡 Tensor Parallel 使用独立 overlay：
+
+```bash
+kubectl apply -k deploy/kubernetes/overlays/single-node-tp2
+```
+
+它申请两张 GPU、挂载 8 GiB `/dev/shm` 并用 torchrun 启动两个 Rank；与下面的 KEDA 横向扩容是两种不同拓扑。
+详细前置条件和验收边界见
+[`deploy/kubernetes/overlays/single-node-tp2/README.md`](../deploy/kubernetes/overlays/single-node-tp2/README.md)。
 
 单机两张 GPU 时，可以用可选的 KEDA overlay 验证 1→2→1 横向扩缩容：
 

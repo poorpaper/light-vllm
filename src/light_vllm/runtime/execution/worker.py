@@ -428,10 +428,14 @@ class LocalModelWorker:
     def capabilities(self) -> ExecutionCapabilities:
         with self._lock:
             model, step = self._get_runtime_locked()
+            tensor_parallel_size = getattr(model, "tensor_parallel_size", 1)
+            if type(tensor_parallel_size) is not int or tensor_parallel_size <= 0:
+                raise TypeError("model tensor_parallel_size must be a positive integer")
             return ExecutionCapabilities(
                 max_model_tokens=model.max_model_tokens,
                 max_kv_cache_tokens=step.max_kv_cache_tokens,
                 kv_cache_epoch=model.generation,
+                tensor_parallel_size=tensor_parallel_size,
             )
 
     def initialize(self) -> None:

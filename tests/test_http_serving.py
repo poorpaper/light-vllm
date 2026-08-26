@@ -17,7 +17,11 @@ from light_vllm import (
     ModelSpec,
     TokenGenerated,
 )
-from light_vllm.entrypoints.http import _create_parser, create_serving_app
+from light_vllm.entrypoints.http import (
+    _create_parser,
+    _initialize_tensor_parallel,
+    create_serving_app,
+)
 from light_vllm.runtime.scheduler import ShortRequestPolicy
 from light_vllm.serving.http import _encoded_stream, create_http_app
 
@@ -163,6 +167,72 @@ def test_cli_can_disable_load_dependent_ttft_gates() -> None:
 
     assert args.max_pending_requests is None
     assert args.ttft_kv_cache_watermark is None
+
+
+def test_cli_selects_the_tensor_parallel_control_transport() -> None:
+    assert _create_parser().parse_args([]).distributed_control_transport == "auto"
+    args = _create_parser().parse_args(["--distributed-control-transport", "gloo"])
+
+    assert args.distributed_control_transport == "gloo"
+
+
+def test_cli_requires_torchrun_world_size_to_match_tensor_parallel_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    args = _create_parser().parse_args(
+        [
+            "--runtime",
+            "engine",
+            "--device",
+            "cuda",
+            "--tensor-parallel-size",
+            "2",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="WORLD_SIZE"):
+        _initialize_tensor_parallel(args)
+
+
+def test_cli_rejects_a_loader_without_tensor_parallel_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    args = _create_parser().parse_args(
+        [
+            "--runtime",
+            "engine",
+            "--distributed-backend",
+            "gloo",
+            "--tensor-parallel-size",
+            "2",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="safetensors"):
+        _initialize_tensor_parallel(args)
+
+
+def test_cli_rejects_gloo_with_a_cuda_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    args = _create_parser().parse_args(
+        [
+            "--runtime",
+            "engine",
+            "--loader",
+            "safetensors",
+            "--device",
+            "cuda",
+            "--distributed-backend",
+            "gloo",
+            "--tensor-parallel-size",
+            "2",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Gloo.*cpu"):
+        _initialize_tensor_parallel(args)
 
 
 @pytest.mark.parametrize("value", ("0", "nan", "inf", "-inf"))
@@ -325,6 +395,7 @@ def test_engine_capabilities_replace_transport_token_limits() -> None:
         )
 
     assert capabilities.json()["max_request_tokens"] == 4
+    assert capabilities.json()["tensor_parallel_size"] == 1
     assert rejected.status_code == 422
     assert "engine supports at most 4" in rejected.json()["detail"]
 

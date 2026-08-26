@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: light-vllm
+spec:
+  template:
+    spec:
+      # K3s 等没有把 NVIDIA 设为默认 runtime 的集群需要显式选择。
+      runtimeClassName: nvidia
+      containers:
+        - name: inference
+          command:
+            - python
+            - -m
+            - torch.distributed.run
+            - --standalone
+            - --nproc-per-node
+            - "2"
+            - --module
+            - light_vllm.entrypoints.http
+          args:
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --architecture
+            - $(LIGHT_VLLM_ARCHITECTURE)
+            - --loader
+            - safetensors
+            - --weights
+            - /models/$(LIGHT_VLLM_MODEL_NAME)
+            - --tokenizer
+            - /models/$(LIGHT_VLLM_MODEL_NAME)
+            - --served-model-name
+            - $(LIGHT_VLLM_SERVED_MODEL_NAME)
+            - --device
+            - cuda
+            - --dtype
+            - bfloat16
+            - --runtime
+            - engine
+            - --kv-reservation
+            - blocks
+            - --paged-attention-backend
+            - triton
+            - --max-num-sequences
+            - "16"
+            - --max-num-scheduled-tokens
+            - "512"
+            - --kv-block-size
+            - "16"
+            - --kv-cache-memory-fraction
+            - "0.8"
+            - --distributed-timeout-seconds
+            - "120"
+            - --tensor-parallel-size
+            - "2"
+          env:
+            - name: NCCL_DEBUG
+              value: WARN
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_ENABLE_MONITORING
+              value: "1"
+            - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+              value: "60"
+          resources:
+            limits:
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi

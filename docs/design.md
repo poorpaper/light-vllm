@@ -1,4 +1,4 @@
-# light-vllm 架构设计（v0.14）
+# light-vllm 架构设计（v0.15）
 
 这份文档记录当前已经落地的设计。更细的职责说明见 [architecture.md](architecture.md)。
 
@@ -15,6 +15,7 @@
 | 成熟实践 | 采用统一 token budget、Scheduler/KV 协作和 Step Handler 物理缓存边界 |
 | 可观测 | 独立 PerformanceObserver 记录事实，Prometheus/Grafana 只做控制面消费 |
 | SLO 保护 | 短请求资源池与独立 TTFTAdmission 通过组合接入，不污染 Worker 热路径 |
+| 单机并行 | 显式 TP 上下文 + 可替换分布式 Executor，不污染 Engine/Scheduler/serving |
 
 ## 2. 包结构
 
@@ -77,8 +78,12 @@ flowchart TB
     Observer --> Metrics["Prometheus /metrics"]
     Metrics --> Grafana["Grafana / HPA / KEDA"]
     Scheduler --> LogicalKV["KVCacheManager<br/>reservation / logical blocks"]
-    Core --> Executor["LocalModelExecutor"]
-    Executor --> Worker["LocalModelWorker<br/>fixed model version"]
+    Core --> Executor["ModelExecutor"]
+    Executor --> Local["LocalModelExecutor"]
+    Executor --> TP["TensorParallelModelExecutor<br/>rank 0"]
+    Local --> Worker["LocalModelWorker<br/>fixed model version"]
+    TP --> Worker
+    TP --> Remote["rank 1..N-1<br/>LocalModelWorker"]
     Worker --> Step["ModelStepHandler"]
     Worker --> Decode["DecodeHandler"]
     Step --> Contiguous["ContiguousStepHandler<br/>request-level tensors"]
@@ -105,7 +110,7 @@ flowchart TB
 
 两种组合共用一个 `LocalModelWorker`。`LocalModelExecutor`、Worker、Scheduler 和 Engine 不包含 KV 模式判断。
 Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者表示一个设备 rank 内的模型版本和请求生命周期；
-未来多进程 Executor 可以管理多个 Worker。
+`TensorParallelModelExecutor` 已经用这个边界管理 torchrun Rank Worker，而没有改变 Engine 的批次语义。
 `TorchDenseAttention` 是 reference 与连续缓存共用的 dense correctness backend；`TorchPagedAttention` 直接读取
 物理页。可选 `TritonPagedAttention` 复用同一批次事实和物理页池，在一个 kernel 中完成 QK、在线 softmax 与
 PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改变模型、Worker 或 Scheduler 契约。
@@ -123,6 +128,8 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ExecutionOutput` | 每轮请求结果、实际进入模型 forward 的 token 数和可选设备耗时 |
 | `RequestOutput` | 每请求完成的输入计算量、零到多个确认输出与已缓存输出前缀 |
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
+| `TensorParallelContext` / `TensorCollectives` | rank、world size、张量切分和最小集合通信端口 |
+| `TensorShardSpec` | 完整 checkpoint tensor 到本 Rank 参数的连续切片事实 |
 | `ModelWorker` | 一个设备 rank 内固定模型版本并编排请求生命周期 |
 | `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回连续有效 logits 与请求边界 |
 | `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
@@ -131,7 +138,7 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ForwardBatch` / `ModelOutput` | 一维 token 流、请求边界、绝对 position、attention 上下文与对应 logits 的统一模型边界 |
 | `ModelKVCacheSpec` | 模型声明的逐 attention 层 K/V 形状 |
 | `AttentionContext` | 模型调用连续或分页 attention 后端的稳定边界 |
-| `EngineCapabilities` | 初始化后可发现的模型、KV、并发和单轮容量事实 |
+| `EngineCapabilities` | 初始化后可发现的模型、KV、并发、单轮容量和 TP size 事实 |
 | `EngineClient` | serving 使用的异步生成端口和 capabilities 查询 |
 | `TextProcessor` / `IncrementalTextDecoder` | serving 内的文本编码、chat template 和 Unicode 安全增量解码端口 |
 | `SchedulerStats` / `KVCacheStats` | 队列、token backlog 与 KV 容量的一次性不可变事实 |
@@ -155,6 +162,19 @@ Qwen 层只生成带 RoPE 的 Q/K/V 并调用 `AttentionContext`，不再保留�
 扩散到模型、Worker 或 Engine。权重、device、dtype 与 `eval()` 全部就绪后，loader 可以调用模型拥有的
 `prepare_for_inference()` hook；Qwen 用它打包 QKV/Gate-Up 权重并预计算 RoPE table，Runner 仍只接收已经完整
 构造的候选模型。当前支持 full attention 和 default RoPE，未实现配置在加载时直接报错。
+
+TP 不复制第二套 Qwen：Q、Gate、Up 和 LM Head 按输出维切分，O、Down 按输入维切分，Embedding 按词表切分。
+Q/K/V 与 Gate/Up 的推理期打包仍由同一个模型 hook 完成；O、Down 的部分结果经 AllReduce 合并，LM Head 经
+AllGather 恢复完整 logits。KV head 数不少于 TP 时按 head 切分；少于 TP 时复制完整 KV head，attention backend
+只看到本 Rank 的普通 GQA 规格。并行层公开 `checkpoint_shards`，safetensors loader 据此取连续切片，不认识 Qwen
+参数名。TP=1 使用无通信 collective，保留相同参数名、形状和 forward。
+
+进程拓扑也保持单一职责：Rank 0 独占 Engine、Scheduler、逻辑 KV 和 HTTP；它广播现有 `ExecutionBatch`，每个
+Rank 用同一 `LocalModelWorker` 管理本地分片参数和物理 KV。设备 tensor 用 NCCL，Worker 命令走可替换命令通道：
+单机 POSIX 默认使用有序 Unix socket，跨主机或显式配置时回退 Gloo。Gloo 仍负责启动期地址协调和容量事实，避免
+在每个 decode step 上执行 Python object collective。KV 自动规划先在每张卡本地计算，再取所有 Rank 的最小页数，
+使逻辑容量不会超过任一物理页池。请求取消先进入 Rank 0 已有 lease 边界，远端 free 只在当前 model step 结束后
+按序送达；任一 Rank 或命令通道失败后整组状态直接作废。
 
 ## 5. 一次迭代
 
@@ -276,6 +296,8 @@ session；`LocalModelWorker` 初始化时也固定一次 session。reload 只替
 分页组合只创建一个容量策略对象：固定 `num_blocks` 用于 CPU correctness 和确定性测试；CUDA 策略在模型权重
 已加载后读取空闲显存，按 `memory_fraction` 形成预算，再使用唯一的 `ModelKVCacheSpec`、`block_size` 和 dtype
 计算实际页数。逻辑 `PagedKVCacheManager` 与物理 `PagedStepHandler` 共享这个对象，容量不会漂移。
+TP 模式下每个 Rank 执行同一规划，并通过最小值归并为一个共享容量事实；每个 Rank 使用相同逻辑 block ID，
+但 K/V tensor 只包含自己的 local KV heads。
 
 `EngineCapabilities` 汇总模型最大 token、KV token 容量、并发序列数与单轮 token budget。HTTP 的
 `/capabilities` 只展示这些事实，不维护固定 prompt 上限。`CapacityAdmission` 只拒绝空闲引擎也永远无法满足的
@@ -382,6 +404,7 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也�
 | loader 契约 | `src/light_vllm/modeling/loaders/interfaces.py` |
 | safetensors 快照 | `src/light_vllm/modeling/loaders/safetensors.py` |
 | Qwen2 模型 | `src/light_vllm/modeling/models/qwen2.py` |
+| Tensor Parallel 层与分片描述 | `src/light_vllm/modeling/tensor_parallel.py` |
 | 模型生命周期 | `src/light_vllm/modeling/runner.py` |
 | 生成契约 | `src/light_vllm/runtime/generation/interfaces.py` |
 | reference 生成 | `src/light_vllm/runtime/generation/reference.py` |
@@ -393,6 +416,7 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也�
 | query 布局推导 | `src/light_vllm/runtime/execution/layout.py` |
 | chain/trie 树形投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
+| torchrun / TP Executor | `src/light_vllm/runtime/execution/distributed.py` |
 | 执行 step 计时 | `src/light_vllm/runtime/execution/timing.py` |
 | 本地 Worker | `src/light_vllm/runtime/execution/worker.py` |
 | Dense Attention | `src/light_vllm/runtime/execution/dense_attention.py` |
@@ -429,11 +453,17 @@ flowchart LR
     Kernel --> Metrics["性能指标 + Prometheus/Grafana/HPA<br/>完成"]
     Metrics --> SLO["短请求池 + TTFT 早拒 + 可选 self-resubmit<br/>完成"]
     SLO --> OpenAI["本地 tokenizer + OpenAI Completion / Chat<br/>CPU/E2E 测试完成"]
+    OpenAI --> TP["单机 TP / NCCL<br/>短序列/显存/故障验收<br/>长生成待量化"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
 Torch 2.8.0、Triton 3.4.0 环境完成既有线性场景的 JIT 和数值对照；packed tree visibility kernel 测试已经
-加入，但仍需 CUDA 环境验收。长上下文性能、跨显卡和 chain/trie 端到端收益也仍是后续工作。
+加入，但仍需 CUDA 环境验收。TP 的并行层数学、Qwen 分片声明、KV head 复制和 safetensors rank-local 加载除
+CPU 测试外，已在双 RTX 5090 上覆盖 NCCL、TP=1/2 短序列逐 token 对照、显存、性能、取消和 Rank 故障退出。
+该机器无 CUDA P2P/NVLink，TP=2 使单卡峰值显存从 25,381 MiB 降到 13,237 MiB，但固定解码吞吐为 TP=1 的
+82.8%；这证明了分片容量，不证明该拓扑有加速收益。BF16 长生成已观察到跨 TP size 和同一 TP=1 重复运行的
+轨迹分叉；现象与数值路径差异的自回归放大相符，但分叉点 logits 尚未采集，根因仍待量化，也未完成逐步 logits
+容差和质量验收。Docker/Kubernetes TP=2 仍待有容器运行权限的双卡宿主机完成性能 A/B。
 
 ## 13. 验证要求
 
@@ -451,12 +481,17 @@ prefix 命中/LRU/epoch、草稿树约束/兄弟隔离/非连续路径验收/com
 非连续物理页、block table
 别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、逐请求固定 seed 与 batch 交错、tokenizer/chat template、
 Unicode 增量解码、跨 chunk stop、OpenAI SDK、流式/非流式一致性、usage、超时取消、标准错误码、
+TP 维度切分、列/行/词表并行数学、Qwen GQA KV head 切分或复制、rank-local safetensors 加载、
 短请求 token/KV/sequence 预留与 aging、TTFT 预测/冷启动/429、
 self-resubmit 的 prompt+1 block/global watermark、不重复输出/严格 fallback/资源归还、TTFT/ITL、step 延迟、
 两种 token backlog、KV 使用率、执行失败和
 取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
 Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、packed mixed GQA、decode 历史、
 共享 prefix、未使用 lookahead 和 packed mixed tree visibility。
+
+双 GPU 验收必须覆盖 TP=1/2 的短序列逐 token 一致性、长序列逐步 logits 容差与质量、显存、吞吐、TTFT、
+TPOT、NCCL 通信占比，以及一个 Rank 失败时其余进程在超时内退出；更大模型还需覆盖单卡无法加载而双卡可加载。
+裸机与容器结论必须分开记录，静态配置渲染不能替代 Docker/Kubernetes 性能 A/B。
 
 边界命名与职责参考 [vLLM Architecture Overview](https://docs.vllm.ai/en/latest/design/arch_overview/)；分页布局与
 按需读取原则参考 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)。完整页哈希与 LRU 参考
@@ -465,4 +500,8 @@ Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆�
 [SGLang Speculative Decoding](https://github.com/sgl-project/sglang/blob/main/docs_new/docs/advanced_features/speculative_decoding.mdx)。
 Triton kernel 的在线 softmax 组织参考
 [官方 fused attention 教程](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)。本项目保留
-这些成熟边界，但优先选择容易检查和扩展的实现，再逐步增加并行优化。
+这些成熟边界，但优先选择容易检查和扩展的实现，再逐步增加并行优化。TP 层组合与 Qwen GQA 处理参考
+[vLLM Qwen2](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2.py)、
+[vLLM parallel layers](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/linear.py) 与
+[SGLang parallel layers](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/linear.py)；本项目没有
+引入它们的全局 parallel state，而是保留显式 context 注入。

@@ -169,6 +169,7 @@ class ExecutionCapabilities:
     max_kv_cache_tokens: int | None
     # 物理 KV 重新创建时递增；prefix cache 不能跨 epoch 复用旧页。
     kv_cache_epoch: int | None = None
+    tensor_parallel_size: int = 1
 
 
 @dataclass(frozen=True, slots=True)
