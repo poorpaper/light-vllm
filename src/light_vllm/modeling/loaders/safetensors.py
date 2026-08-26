@@ -13,6 +13,8 @@ from torch import Tensor, nn
 
 from light_vllm.modeling.loaders.torch import ModelLoadError, _prepare_for_inference
 from light_vllm.modeling.models.interfaces import ModelFactory, ModelSpec
+from light_vllm.modeling.quantization.interfaces import QuantizationMethodFactory
+from light_vllm.modeling.registry import Registry
 from light_vllm.modeling.tensor_parallel import TensorShardSpec, checkpoint_shards
 
 
@@ -70,6 +72,71 @@ def _resolve_checkpoint(spec: ModelSpec) -> tuple[Path, tuple[Path, ...]]:
     return weights, shards
 
 
+def _quantization_config(
+    checkpoint_dir: Path,
+    checkpoint_args: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """读取 HF config 内嵌或 AutoAWQ 独立的量化配置。"""
+
+    embedded = checkpoint_args.get("quantization_config")
+    if embedded is not None:
+        if not isinstance(embedded, dict):
+            raise ModelLoadError("quantization_config must contain an object")
+        return embedded
+    for filename in ("quantize_config.json", "quant_config.json"):
+        path = checkpoint_dir / filename
+        if path.is_file():
+            return _read_json(path)
+    return None
+
+
+def _resolve_linear_method(
+    spec: ModelSpec,
+    checkpoint_dir: Path,
+    checkpoint_args: Mapping[str, object],
+    quantizations: Registry[QuantizationMethodFactory] | None,
+):
+    """在模型构造前把 checkpoint 格式解析成 LinearMethod。"""
+
+    if spec.linear_method is not None:
+        return spec.linear_method
+    config = _quantization_config(checkpoint_dir, checkpoint_args)
+    configured_name = None if config is None else config.get("quant_method")
+    if configured_name is not None and not isinstance(configured_name, str):
+        raise ModelLoadError("quantization method must be a string")
+    checkpoint_name = None if configured_name is None else configured_name.lower()
+    if not isinstance(spec.quantization, str):
+        raise ModelLoadError("quantization selection must be a string")
+    requested = spec.quantization.lower()
+    if requested == "none":
+        if checkpoint_name is not None:
+            raise ModelLoadError("quantization=none cannot load a quantized checkpoint")
+        return None
+    if requested == "auto":
+        selected = checkpoint_name
+    else:
+        selected = requested
+        if checkpoint_name is None:
+            raise ModelLoadError(
+                f"quantization={selected!r} requires checkpoint quantization metadata"
+            )
+        if checkpoint_name != selected:
+            raise ModelLoadError(
+                f"checkpoint quantization is {checkpoint_name!r}, not {selected!r}"
+            )
+    if selected is None:
+        return None
+    if config is None:
+        raise ModelLoadError("quantized checkpoint is missing quantization configuration")
+    if quantizations is None:
+        raise ModelLoadError("this loader has no quantization methods registered")
+    try:
+        factory = quantizations.get(selected)
+        return factory(config, spec)
+    except (LookupError, RuntimeError, TypeError, ValueError) as exc:
+        raise ModelLoadError(f"cannot configure quantization {selected!r}: {exc}") from exc
+
+
 def _optional_weight_keys(model: nn.Module) -> frozenset[str]:
     """返回可以不单独保存的共享权重名称。"""
 
@@ -113,13 +180,30 @@ def _copy_weight(
 class SafetensorsModelLoader:
     """从本地 HF 兼容目录读取配置和一个或多个权重分片。"""
 
+    def __init__(
+        self,
+        *,
+        quantizations: Registry[QuantizationMethodFactory] | None = None,
+    ) -> None:
+        self._quantizations = quantizations
+
     def load(self, spec: ModelSpec, factory: ModelFactory) -> nn.Module:
         checkpoint_dir, shards = _resolve_checkpoint(spec)
         config_path = checkpoint_dir / "config.json"
         checkpoint_args = dict(_read_json(config_path))
         # 显式 model_args 只用于小范围覆盖；真实模型尺寸仍会由权重形状校验。
         checkpoint_args.update(spec.model_args)
-        resolved_spec = replace(spec, model_args=checkpoint_args)
+        linear_method = _resolve_linear_method(
+            spec,
+            checkpoint_dir,
+            checkpoint_args,
+            self._quantizations,
+        )
+        resolved_spec = replace(
+            spec,
+            model_args=checkpoint_args,
+            linear_method=linear_method,
+        )
         # 先按配置创建空模型，权重文件只负责填充参数，不负责定义结构。
         model = factory(resolved_spec).to(device=spec.device, dtype=spec.dtype).eval()
         targets = model.state_dict()

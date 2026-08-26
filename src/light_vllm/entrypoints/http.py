@@ -677,6 +677,18 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture", default="tiny-causal-lm")
     parser.add_argument("--loader", default="init")
     parser.add_argument("--weights", type=Path)
+    parser.add_argument(
+        "--quantization",
+        choices=("auto", "none", "awq"),
+        default="auto",
+        help="weight format; auto reads quantization_config from the checkpoint",
+    )
+    parser.add_argument(
+        "--quantization-backend",
+        choices=("auto", "torch", "cuda"),
+        default="auto",
+        help="AWQ kernel selected once while the model is loaded",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=tuple(_DTYPES), default="float32")
     parser.add_argument("--model-args", type=_json_object, default={})
@@ -910,6 +922,8 @@ def _run_http_entrypoint(
         device=device,
         dtype=_DTYPES[args.dtype],
         tensor_parallel=tensor_parallel,
+        quantization=args.quantization,
+        quantization_backend=args.quantization_backend,
     )
     config = _engine_config_from_args(args)
 

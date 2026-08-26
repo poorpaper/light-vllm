@@ -176,6 +176,13 @@ def test_cli_selects_the_tensor_parallel_control_transport() -> None:
     assert args.distributed_control_transport == "gloo"
 
 
+def test_cli_selects_awq_format_and_cuda_kernel_once_at_load() -> None:
+    args = _create_parser().parse_args(["--quantization", "awq", "--quantization-backend", "cuda"])
+
+    assert args.quantization == "awq"
+    assert args.quantization_backend == "cuda"
+
+
 def test_cli_requires_torchrun_world_size_to_match_tensor_parallel_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

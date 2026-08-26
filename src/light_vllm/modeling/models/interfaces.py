@@ -3,13 +3,16 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch import Tensor, nn
 
 from light_vllm.modeling.attention.interfaces import AttentionContext, ModelKVCacheSpec
 from light_vllm.modeling.tensor_parallel import TensorParallelContext
+
+if TYPE_CHECKING:
+    from light_vllm.modeling.quantization.interfaces import LinearMethod
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +26,11 @@ class ModelSpec:
     device: str | torch.device = "cpu"
     dtype: torch.dtype = torch.float32
     tensor_parallel: TensorParallelContext | None = None
+    # 这两个字段只描述模型加载策略。loader 解析 checkpoint 元数据后把已经
+    # 选好的 LinearMethod 交给模型 factory；Runner 和执行热路径无需理解量化名。
+    quantization: str = "auto"
+    quantization_backend: str = "auto"
+    linear_method: LinearMethod | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
