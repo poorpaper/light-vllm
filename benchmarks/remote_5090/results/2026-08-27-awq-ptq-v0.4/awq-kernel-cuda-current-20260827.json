@@ -1,0 +1,82 @@
+{
+  "torch": "2.11.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "in_features": 3584,
+  "out_features": 3584,
+  "group_size": 128,
+  "dtype": "float16",
+  "results": [
+    {
+      "implementation": "light-vllm-cuda",
+      "num_tokens": 1,
+      "latency_ms_median": 0.02542399987578392,
+      "latency_ms_min": 0.024191999807953835,
+      "effective_tflops": 1.0104669652893425,
+      "peak_temporary_mib": 0.0615234375,
+      "max_abs_error": 0.0078125
+    },
+    {
+      "implementation": "vllm-awq",
+      "num_tokens": 1,
+      "latency_ms_median": 0.02550400048494339,
+      "latency_ms_min": 0.02425600029528141,
+      "effective_tflops": 1.007297345966037,
+      "peak_temporary_mib": 0.0615234375,
+      "max_abs_error": 0.0078125
+    },
+    {
+      "implementation": "light-vllm-cuda",
+      "num_tokens": 8,
+      "latency_ms_median": 0.025040000677108765,
+      "latency_ms_min": 0.024320000782608986,
+      "effective_tflops": 8.207703292431797,
+      "peak_temporary_mib": 0.4921875,
+      "max_abs_error": 0.0078125
+    },
+    {
+      "implementation": "vllm-awq",
+      "num_tokens": 8,
+      "latency_ms_median": 0.025599999353289604,
+      "latency_ms_min": 0.02505600079894066,
+      "effective_tflops": 8.028160202808385,
+      "peak_temporary_mib": 0.4921875,
+      "max_abs_error": 0.0078125
+    },
+    {
+      "implementation": "light-vllm-cuda",
+      "num_tokens": 64,
+      "latency_ms_median": 0.0331679992377758,
+      "latency_ms_min": 0.03161599859595299,
+      "effective_tflops": 49.570887776897315,
+      "peak_temporary_mib": 3.9375,
+      "max_abs_error": 0.015625
+    },
+    {
+      "implementation": "vllm-awq",
+      "num_tokens": 64,
+      "latency_ms_median": 0.03363199904561043,
+      "latency_ms_min": 0.03311999887228012,
+      "effective_tflops": 48.88698901811466,
+      "peak_temporary_mib": 3.9375,
+      "max_abs_error": 0.015625
+    },
+    {
+      "implementation": "light-vllm-cuda",
+      "num_tokens": 256,
+      "latency_ms_median": 0.12240000069141388,
+      "latency_ms_min": 0.12083200365304947,
+      "effective_tflops": 53.73095289909864,
+      "peak_temporary_mib": 26.25,
+      "max_abs_error": 0.0
+    },
+    {
+      "implementation": "vllm-awq",
+      "num_tokens": 256,
+      "latency_ms_median": 0.12516799569129944,
+      "latency_ms_min": 0.12355200201272964,
+      "effective_tflops": 52.54273375296327,
+      "peak_temporary_mib": 26.25,
+      "max_abs_error": 0.0
+    }
+  ]
+}

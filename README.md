@@ -18,6 +18,7 @@
   <img alt="PyTorch 2.2+" src="https://img.shields.io/badge/PyTorch-2.2%2B-EE4C2C?logo=pytorch&logoColor=white">
   <img alt="Qwen2 and Qwen2.5" src="https://img.shields.io/badge/Models-Qwen2%20%7C%20Qwen2.5-6F42C1">
   <img alt="Paged KV cache" src="https://img.shields.io/badge/KV%20cache-Contiguous%20%7C%20Paged-0F766E">
+  <img alt="AWQ W4A16" src="https://img.shields.io/badge/Quantization-AWQ%20W4A16-0F766E">
   <img alt="Optional Triton backend" src="https://img.shields.io/badge/Triton-Optional-5B45FF">
   <img alt="Project status: experimental" src="https://img.shields.io/badge/Status-Experimental-F59E0B">
 </p>
@@ -39,6 +40,7 @@
 一个新能力该放在哪里，这里尽量给出直白的答案：
 
 - 新模型和新权重格式走注册表，不修改 `ModelRunner` 的分发逻辑。
+- 新量化格式替换 `LinearMethod`，新算子后端替换量化 Scheme，不修改 Engine、Scheduler 或 Worker。
 - 新采样策略替换 `Sampler`，不新增一套 Executor。
 - 连续 KV 与分页 KV 共用 Worker 和模型，只替换 Step Handler。
 - HTTP、Prometheus 和进程通信留在边界上，不进入推理核心。
@@ -50,13 +52,18 @@
 | 范围 | 当前实现 |
 | --- | --- |
 | 模型与权重 | 原生 Qwen2/Qwen2.5；full attention、default RoPE、GQA、tied embedding；读取 HF/ModelScope 兼容的本地 safetensors 快照 |
+| 量化 | Qwen2/Qwen2.5 AWQ W4A16 离线 PTQ、AutoAWQ 兼容导出、自动加载、Torch correctness 与 CUDA GEMM；支持 TP checkpoint 分片 |
 | 执行 | token-major packed query、chunked prefill、连续与分页 KV、PyTorch correctness attention、可选 Triton fused paged attention |
 | 单机并行 | torchrun + NCCL Tensor Parallel；列/行/词表并行、rank-local 权重与 KV；已完成双 RTX 5090 短序列正确性、显存、性能与故障退出验收 |
 | 调度 | 统一 token budget、严格非抢占 completion claim、prefix cache、短请求资源池、TTFT 早拒、可选 self-resubmit |
 | 解码 | Greedy、temperature、top-k、top-p、逐请求 seed；N-Gram Chain/Trie proposer 共用树形验证和 KV compact |
 | 服务 | 本地 tokenizer、OpenAI-compatible Completion/Chat 流式与非流式 API、token-ID 调试 API、独立 Engine 进程、取消与异常清理、Prometheus 指标 |
 
-暂时没有 sliding-window/RoPE scaling、量化权重、第三方 victim preemption、多节点通信或 MaaS 控制面。v0.2 文本接口首版不支持 tools、多个 choice、logprobs 或批量 prompt，随机 sampling 也不与投机解码组合。单机 TP/NCCL 已在双 RTX 5090 上完成短序列正确性、显存、性能和故障退出验收；BF16 长生成的跨 TP size 逐 token 一致性、长上下文、跨节点、更多 GPU 拓扑和更多模型仍未完成验收。
+暂时没有 FP8、sliding-window/RoPE scaling、第三方 victim preemption、多节点通信或 MaaS 控制面。AWQ 首版只支持
+Qwen2/Qwen2.5、W4A16 和 FP16 activation，实机验收使用 group size 128；它不是通用量化框架。v0.2 文本接口首版不支持 tools、
+多个 choice、logprobs 或批量 prompt，随机 sampling 也不与投机解码组合。单机 TP/NCCL 已在双 RTX 5090 上完成
+Dense 短序列正确性、显存、性能和故障退出验收；AWQ 双卡真实模型验收、BF16 长生成的跨 TP size 逐 token 一致性、
+长上下文、跨节点、更多 GPU 拓扑和更多模型仍未完成验收。
 
 ## 一张图看懂
 
@@ -148,6 +155,44 @@ python -m venv .venv
   --paged-attention-backend triton
 ```
 
+### 量化并启动 AWQ W4A16
+
+首版 PTQ 只接收本地 Qwen2/Qwen2.5 Dense checkpoint 和 JSONL 校准集。每行至少包含一个 `text` 字段：
+
+```bash
+.venv/bin/python -m pip install -e ".[serve,triton,validation]"
+
+.venv/bin/light-vllm-quantize-awq \
+  --model /models/Qwen2.5-0.5B-Instruct \
+  --output /models/Qwen2.5-0.5B-Instruct-AWQ \
+  --calibration-data /data/calibration.jsonl \
+  --max-calibration-samples 128 \
+  --calibration-sequence-length 512 \
+  --group-size 128 \
+  --device cuda \
+  --dtype float16
+
+.venv/bin/light-vllm-serve \
+  --architecture qwen2.5 \
+  --loader safetensors \
+  --weights /models/Qwen2.5-0.5B-Instruct-AWQ \
+  --tokenizer /models/Qwen2.5-0.5B-Instruct-AWQ \
+  --served-model-name Qwen2.5-0.5B-Instruct-AWQ \
+  --quantization auto \
+  --quantization-backend cuda \
+  --device cuda \
+  --dtype float16 \
+  --runtime engine \
+  --engine-process \
+  --kv-reservation blocks \
+  --paged-attention-backend triton
+```
+
+`auto` 从 checkpoint 的 `quantization_config` 选择 AWQ；`none` 会明确拒绝量化 checkpoint；`awq` 可用于要求
+checkpoint 必须是 AWQ。`torch` backend 是便于 CPU/数值测试的慢速正确性实现，GPU 服务应使用 `cuda` 或
+`auto`。CUDA backend 首次加载会编译一个小型扩展，需要 C++ 编译器、Ninja 和 CUDA toolkit；仓库 Dockerfile
+已经包含这些工具。AWQ 当前必须显式使用 `--dtype float16`，不能沿用 Dense 示例里的 BF16。
+
 单机两卡 TP 使用 torchrun 启动一张 GPU 一个 Rank。Rank 0 运行原有 Engine，并自动 spawn 不持有 CUDA 的 HTTP/
 tokenizer 前端；其他 Rank 只运行模型 Worker。前端通过已有 Engine IPC 协议连接 Rank 0，因此不要再传
 `--engine-process`：
@@ -202,6 +247,19 @@ curl -X POST http://127.0.0.1:8000/generate \
 [生产部署骨架](docs/deployment.md)。三种方式复用同一个服务入口，部署配置不进入推理热路径。
 
 ## RTX 5090 上的一组实测
+
+### AWQ W4A16 PTQ 与推理
+
+Qwen2.5-0.5B-Instruct 的 4096-token 校准结果中，AWQ 模型权重显存从 950.17 MiB 降到 454.61 MiB
+（47.85%）；固定 2040 个 WikiText-2 next-token 目标上，PPL 从 24.87 变为 27.49（+10.52%）。
+`K=N=3584` 的 CUDA AWQ GEMM 在 M=1/8/64/256 四个 shape 上，中位延迟均未劣于同源的 vLLM
+legacy `awq_gemm` kernel。端到端对照使用 vLLM 0.26 默认选出的 Marlin：16 个 16→512 请求中 light-vllm 为
+1880.93 tok/s，vLLM 为 1529.49 tok/s；64 个 256→64 burst 请求中 light-vllm 为 3509.91 tok/s，vLLM 为
+4568.09 tok/s。也就是说 decode-heavy 负载没有观察到退化，但大 batch prefill/服务路径仍有 23.16% 吞吐差距。
+
+完整 PTQ 参数、对照边界、逐请求 JSON、Prometheus 快照与哈希见
+[AWQ W4A16 验收报告](benchmarks/remote_5090/results/2026-08-27-awq-ptq-v0.4/REPORT.md)。这组结果不能外推为
+“所有 workload 与 vLLM 持平”。
 
 最终对比使用 Qwen2.5-Coder-7B-Instruct BF16、RTX 5090 和同一组 ShareGPT 首轮回放。light-vllm 使用 strict completion claim，不启用 prefix cache、TTFT admission 或 speculative decoding；对照组是关闭 prefix cache 与 speculation 的 vLLM eager。每个实现运行 3 轮，每轮 64 个请求，表中是逐轮指标的中位数。
 
