@@ -20,12 +20,15 @@ from pathlib import Path
 from typing import Any
 
 from light_vllm.entrypoints import http as http_entrypoint
+from light_vllm.runtime.engine import core as engine_core_module
 from light_vllm.runtime.engine.core import EngineCore
+from light_vllm.runtime.engine.execution_lane import ExecutionLane
 from light_vllm.runtime.execution.distributed import (
     TensorParallelModelExecutor,
     TorchDistributedGroup,
     _GlooCommandChannel,
     _SocketCommandChannel,
+    _TensorParallelLease,
 )
 from light_vllm.runtime.execution.local import LocalModelExecutor
 from light_vllm.runtime.execution.worker import (
@@ -33,7 +36,9 @@ from light_vllm.runtime.execution.worker import (
     PagedStepHandler,
     StandardDecodeHandler,
 )
+from light_vllm.runtime.observability.performance import InMemoryPerformanceObserver
 from light_vllm.runtime.sampling import ConfigurableSampler
+from light_vllm.runtime.scheduler.token_budget import TokenBudgetScheduler
 
 
 def _percentile(values: list[float], quantile: float) -> float:
@@ -175,8 +180,23 @@ def main() -> None:
         (PagedStepHandler, "forward", "model_step.forward"),
         (ConfigurableSampler, "sample", "sampler.sample"),
         (EngineCore, "_advance_locked", "engine.advance_locked"),
+        (EngineCore, "_apply_output_locked", "engine.apply_output"),
+        (EngineCore, "_finish_execution_locked", "engine.finish_execution"),
+        (EngineCore, "_build_execution_batch_locked", "engine.build_batch"),
+        (EngineCore, "_publish_scheduler_stats", "engine.publish_scheduler_stats"),
+        (TokenBudgetScheduler, "schedule", "scheduler.schedule"),
+        (TokenBudgetScheduler, "complete", "scheduler.complete"),
+        (TensorParallelModelExecutor, "acquire", "tp_executor.acquire"),
+        (_TensorParallelLease, "release", "tp_executor.lease_release"),
+        (ExecutionLane, "_finish", "execution_lane.finish"),
+        (InMemoryPerformanceObserver, "step_completed", "observer.step_completed"),
+        (InMemoryPerformanceObserver, "scheduler_updated", "observer.scheduler_updated"),
+        (InMemoryPerformanceObserver, "tokens_generated", "observer.tokens_generated"),
+        (engine_core_module, "_validated_output", "engine.validate_output"),
     ):
         _timed_sync(profiler, owner, attribute, name)
+    _timed_async(profiler, ExecutionLane, "execute", "execution_lane.execute")
+    _timed_async(profiler, EngineCore, "_execute_batch", "engine.execute_batch")
     _timed_async(
         profiler,
         EngineCore,

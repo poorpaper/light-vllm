@@ -23,6 +23,9 @@ if [[ -e "$OUTPUT_DIR" ]]; then
 fi
 mkdir -p "$OUTPUT_DIR"
 cd "$ROOT"
+mapfile -t baseline_gpu_memory < <(
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
+)
 
 leader=""
 request_pid=""
@@ -170,7 +173,10 @@ for _ in $(seq 1 100); do
   mapfile -t gpu_memory < <(
     nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
   )
-  if (( ${gpu_memory[0]} < 64 && ${gpu_memory[1]} < 64 )); then
+  if ((
+    ${gpu_memory[0]} <= ${baseline_gpu_memory[0]} + 64
+    && ${gpu_memory[1]} <= ${baseline_gpu_memory[1]} + 64
+  )); then
     gpu_memory_released=true
     break
   fi
@@ -186,6 +192,7 @@ done
   "$port_released" \
   "$gpu_memory_released" \
   "${remaining[*]}" \
+  "${baseline_gpu_memory[*]}" \
   "${gpu_memory[*]}" <<'PY'
 import json
 import sys
@@ -200,6 +207,7 @@ from pathlib import Path
     port_released,
     gpu_memory_released,
     remaining,
+    baseline_gpu_memory,
     gpu_memory,
 ) = sys.argv[1:]
 payload = {
@@ -211,6 +219,7 @@ payload = {
     "port_released": port_released == "true",
     "gpu_memory_released": gpu_memory_released == "true",
     "remaining_server_pids": remaining.split(),
+    "gpu_memory_baseline_mib": [int(value) for value in baseline_gpu_memory.split()],
     "gpu_memory_used_mib": [int(value) for value in gpu_memory.split()],
 }
 Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")

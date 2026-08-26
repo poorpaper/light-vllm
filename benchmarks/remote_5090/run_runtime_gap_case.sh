@@ -33,8 +33,10 @@ if [[ ! "$TENSOR_PARALLEL_SIZE" =~ ^[1-9][0-9]*$ ]]; then
   echo "TENSOR_PARALLEL_SIZE must be a positive integer" >&2
   exit 2
 fi
-if (( TENSOR_PARALLEL_SIZE > 1 )) && [[ "$PROFILE_DETAIL" != off ]]; then
-  echo "tensor-parallel benchmark currently requires PROFILE_DETAIL=off" >&2
+if (( TENSOR_PARALLEL_SIZE > 1 )) \
+  && [[ "$PROFILE_DETAIL" != off ]] \
+  && [[ "$MODE" == light-* ]]; then
+  echo "light-vllm tensor-parallel profiling uses TP_RUNTIME_PROFILE_OUTPUT" >&2
   exit 2
 fi
 if [[ -n "$TP_RUNTIME_PROFILE_OUTPUT" ]] && (( TENSOR_PARALLEL_SIZE == 1 )); then
