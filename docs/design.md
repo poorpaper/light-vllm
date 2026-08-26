@@ -116,6 +116,10 @@ flowchart TB
 两种组合共用一个 `LocalModelWorker`。`LocalModelExecutor`、Worker、Scheduler 和 Engine 不包含 KV 模式判断。
 Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者表示一个设备 rank 内的模型版本和请求生命周期；
 `TensorParallelModelExecutor` 已经用这个边界管理 torchrun Rank Worker，而没有改变 Engine 的批次语义。
+单 Rank CUDA Engine 在模型与物理 KV 初始化后、服务 ready 前，复用同一个 `ModelExecutor` 临时请求做至多 256 token
+的有界 prefill 和一次单 token decode。这样统一触发大矩阵、小 batch GEMM、attention、LM head 与采样的首次加载，
+不在模型或量化实现里维护 shape 表；临时请求始终沿 lease/free 边界清理，也不进入 Scheduler 和 Observer。首版不向
+TP 命令流插入额外步骤，避免与分布式执行生命周期交叉；预热也不改变 Engine、Scheduler 和模型契约。
 `TorchDenseAttention` 是 reference 与连续缓存共用的 dense correctness backend；`TorchPagedAttention` 直接读取
 物理页。可选 `TritonPagedAttention` 复用同一批次事实和物理页池，在一个 kernel 中完成 QK、在线 softmax 与
 PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改变模型、Worker 或 Scheduler 契约。

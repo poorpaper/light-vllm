@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import os
 import signal
@@ -550,6 +551,29 @@ def _timed_async(
 
 
 def _install(profiler: _StageProfiler, *, detail: str) -> None:
+    gc_started: list[tuple[int, int, int] | None] = [None]
+
+    def record_gc(phase: str, info: dict[str, int]) -> None:
+        if phase == "start":
+            gc_started[0] = (
+                time.perf_counter_ns(),
+                time.thread_time_ns(),
+                info.get("generation", -1),
+            )
+            return
+        started = gc_started[0]
+        gc_started[0] = None
+        if started is None:
+            return
+        wall_started, cpu_started, generation = started
+        profiler.record(
+            f"python.gc.generation_{generation}",
+            time.perf_counter_ns() - wall_started,
+            time.thread_time_ns() - cpu_started,
+            started_ns=wall_started,
+        )
+
+    gc.callbacks.append(record_gc)
     stages = [
         (EngineCore, "_advance_locked", "engine.advance_locked"),
         (EngineCore, "_build_execution_batch_locked", "engine.build_batch"),

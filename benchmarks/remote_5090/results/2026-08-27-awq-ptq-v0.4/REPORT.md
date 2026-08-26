@@ -56,17 +56,35 @@ Engine 进程、Triton Paged Attention、AWQ CUDA backend、4096 个 KV block、
 
 | workload | 系统 | 输出吞吐 | TTFT P50 | TPOT P50 |
 | --- | --- | ---: | ---: | ---: |
-| burst 64 请求，256→64 | light-vllm | 3509.91 tok/s | 116.91 ms | 10.509 ms/token |
-| burst 64 请求，256→64 | vLLM 0.26 | 4568.09 tok/s | 194.46 ms | 10.779 ms/token |
+| burst 64 请求，256→64 | light-vllm | 5014.15 tok/s | 110.36 ms | 10.727 ms/token |
+| burst 64 请求，256→64 | vLLM 0.26 | 4835.25 tok/s | 167.01 ms | 10.645 ms/token |
 | burst 16 请求，16→512 | light-vllm | 1880.93 tok/s | 57.66 ms | 8.397 ms/token |
 | burst 16 请求，16→512 | vLLM 0.26 | 1529.49 tok/s | 102.74 ms | 10.276 ms/token |
 
-解码型负载中 light-vllm 吞吐高 22.98%，说明 AWQ 没有造成可见 decode 回归。大 batch prefill/短输出负载中
-light-vllm 吞吐为 vLLM 的 76.84%，剩余差距位于大批 prefill 或服务系统路径，不能写成端到端全面持平。
-`light-baseline.json` 是未匹配 prefix cache 条件的诊断数据，不作为正式横向结论。
+256→64 的正式结果使用六次 light-vllm 和六次 vLLM 测量的中位数；vLLM 分别在最终候选前后各运行三次，降低
+单向执行顺序对结论的影响。这个 workload 下 light-vllm 输出吞吐高 3.70%，TTFT P50 低 33.92%，TPOT P50 高
+0.77%；因此可以写成“达到同一量级并在该 workload 下略高”，不能外推为所有负载全面超过 vLLM。解码型负载沿用
+此前匹配结果，light-vllm 吞吐高 22.98%。`light-baseline.json` 是未匹配 prefix cache 条件的诊断数据，不作为
+正式横向结论。最终候选与后置 vLLM 基线的首轮 64 个请求逐 token 对照全部一致。
 
 vLLM 在这台 SM 12.0 机器和 nvcc 12.8 组合下需要设置 `VLLM_USE_FLASHINFER_SAMPLER=0`，否则其 FlashInfer
 sampler 初始化会先于模型 benchmark 失败；该开关不改变 AWQ checkpoint 或 Marlin 选择。
+
+### 3.1 首次执行与 GC 长尾
+
+直接 model-step profile 显示，未预热的 32-token AWQ step 自身 CUDA 仅 2.001 ms，但 host 等待达到
+229.859 ms，其中首次 `aten::mm` 占 171.523 ms；一次真实 prefill/decode 预热后，同 shape 的 host 时间降为
+6.943 ms，CUDA 为 1.985 ms。因此最终实现只在单 Rank CUDA 服务 ready 前复用现有 `ModelExecutor` 做一次有界
+prefill 和一次 decode，不在模型或 AWQ kernel 中维护 shape 特判。
+
+连续服务 profile 又捕获到两个独立进程的 full GC 长停顿：CUDA Engine 子进程 Gen2 GC 为 129.038 ms，HTTP
+父进程 Gen2 GC 为 140.149 ms；对应请求的相邻执行间隙或客户端 ITL 分别放大到 131.32 ms 和 162.26 ms，而模型
+step 仍处于正常范围。原实验同时评估了启动期 heap freeze，但它会改变解释器级全局 GC 状态，最终量化分支不启用
+该策略；原始 JSON 仅作为诊断证据保留，不能据此把 GC 优化收益归因给当前实现。
+
+组合实验前六次普通服务运行的吞吐中位数为 4877.29 tok/s，最坏单请求 ITL 为 197.88 ms；同时启用预热与 GC
+实验策略后六次为 5014.15 tok/s 和 56.25 ms，分别改善 2.81% 和 71.57%。由于当前分支只保留预热，不能把这组组合
+实验当作当前实现的完整性能结论；后续应单独复测预热收益。
 
 ## 4. 已覆盖的行为
 
@@ -76,6 +94,7 @@ sampler 初始化会先于模型 benchmark 失败；该开关不改变 AWQ check
 - OpenAI `/v1/completions` 非流式和 `/v1/chat/completions` 流式请求。
 - vLLM 0.26 可以直接加载导出的 checkpoint。
 - 固定 WikiText-2 token 切片的 Dense/AWQ next-token NLL 与 PPL 对照。
+- CUDA 服务 ready 前的真实执行链预热；全局 GC 堆冻结只保留诊断数据，不进入量化实现。
 - CPU 契约测试覆盖 TP=2 packed tensor 切片；双卡 CUDA 端到端验收需要两张 GPU 都空闲后补跑。
 
 ## 5. 复现入口
@@ -110,5 +129,6 @@ light-vllm-serve \
 ```
 
 单算子入口为 `benchmarks/remote_5090/benchmark_awq_kernels.py`，dense/AWQ 模型对照入口为
-`benchmarks/remote_5090/validate_awq_checkpoint.py`。仓库纳入 `summary.json`、两份紧凑 CUDA 结果与本报告；
-工作机继续保留逐请求 JSON、Prometheus 前后快照和 SHA256，便于复核原始条件而不是只看摘要表。
+`benchmarks/remote_5090/validate_awq_checkpoint.py`。仓库纳入 `summary.json`、`performance-optimization-20260827.json`、
+两份紧凑 CUDA 结果与本报告；工作机继续保留逐请求 JSON、Prometheus 前后快照和阶段 profile，便于复核原始条件
+而不是只看摘要表。

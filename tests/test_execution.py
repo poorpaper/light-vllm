@@ -42,6 +42,7 @@ from light_vllm.runtime.execution.layout import (
     linear_model_step_request,
     linear_query_layout,
 )
+from light_vllm.runtime.execution.local import warmup_model_executor
 from light_vllm.runtime.execution.worker import (
     ContiguousStepHandler,
     PagedStepHandler,
@@ -898,3 +899,98 @@ def test_local_model_executor_attaches_completed_step_latency() -> None:
 
     assert output.step_elapsed_seconds == pytest.approx(0.125)
     assert output.num_model_tokens_computed == 1
+
+
+def test_model_executor_warmup_reuses_request_lifecycle_and_real_batches() -> None:
+    class Lease:
+        released = False
+
+        def release(self) -> None:
+            self.released = True
+
+    class Executor:
+        ready = True
+        capabilities = ExecutionCapabilities(512, 512)
+
+        def __init__(self) -> None:
+            self.capacity = None
+            self.batches: list[ExecutionBatch] = []
+            self.lease = Lease()
+            self.freed = False
+
+        def initialize(self) -> None:
+            return
+
+        def add_request(self, request_id: str, *, capacity: int) -> None:
+            assert request_id == "__light_vllm_startup_warmup__"
+            self.capacity = capacity
+
+        def free_request(self, request_id: str) -> bool:
+            assert request_id == "__light_vllm_startup_warmup__"
+            self.freed = True
+            return True
+
+        def acquire(self, request_ids: tuple[str, ...]):
+            assert request_ids == ("__light_vllm_startup_warmup__",)
+            return self.lease
+
+        def execute(self, batch: ExecutionBatch) -> ExecutionOutput:
+            self.batches.append(batch)
+            return ExecutionOutput(
+                requests=tuple(
+                    RequestOutput(
+                        request_id=request.request_id,
+                        num_input_tokens_computed=len(request.input_token_ids),
+                    )
+                    for request in batch.requests
+                ),
+                num_model_tokens_computed=sum(
+                    len(request.input_token_ids) for request in batch.requests
+                ),
+            )
+
+    executor = Executor()
+
+    warmup_model_executor(
+        executor,
+        max_num_scheduled_tokens=512,
+        block_size=16,
+    )
+
+    assert executor.capacity == 257
+    assert executor.lease.released
+    assert executor.freed
+    prefill = executor.batches[0].requests[0]
+    decode = executor.batches[1].requests[0]
+    assert len(prefill.input_token_ids) == 256
+    assert prefill.num_computed_tokens == 0
+    assert prefill.max_output_tokens == 0
+    assert prefill.block_ids == tuple(range(16))
+    assert decode.input_token_ids == (0,)
+    assert decode.num_computed_tokens == 256
+    assert decode.max_output_tokens == 1
+    assert decode.block_ids == tuple(range(17))
+
+
+@pytest.mark.parametrize("paged", (False, True))
+def test_model_executor_warmup_runs_through_real_step_handlers(paged: bool) -> None:
+    model = CountingAttentionForwarder()
+    provider = StaticSessionProvider(model)
+    worker = (
+        _paged_worker(provider, num_blocks=8, block_size=2)
+        if paged
+        else _contiguous_worker(provider)
+    )
+    executor = LocalModelExecutor(worker)
+    executor.initialize()
+
+    warmup_model_executor(
+        executor,
+        max_num_scheduled_tokens=4,
+        block_size=2 if paged else None,
+    )
+
+    assert model.calls == 2
+    # 预热请求已经释放，固定名字不会污染后续真实请求生命周期。
+    executor.add_request("__light_vllm_startup_warmup__", capacity=1)
+    assert executor.free_request("__light_vllm_startup_warmup__")

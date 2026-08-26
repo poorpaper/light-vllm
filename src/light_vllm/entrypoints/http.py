@@ -45,7 +45,11 @@ from light_vllm.runtime.execution.distributed import (
     run_tensor_parallel_worker,
 )
 from light_vllm.runtime.execution.interfaces import ExecutionTimer
-from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
+from light_vllm.runtime.execution.local import (
+    LocalModelExecutor,
+    LocalTokenExecutor,
+    warmup_model_executor,
+)
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionBackend,
     TorchPagedAttentionBackend,
@@ -333,6 +337,16 @@ def _create_engine_runtime(
             components.worker,
             timer=_create_execution_timer(spec),
         )
+        startup_warmup = (
+            partial(
+                warmup_model_executor,
+                model_executor,
+                max_num_scheduled_tokens=config.max_num_scheduled_tokens,
+                block_size=(config.kv_block_size if config.kv_reservation == "blocks" else None),
+            )
+            if torch.device(spec.device).type == "cuda"
+            else None
+        )
 
         def shutdown() -> None:
             return None
@@ -345,6 +359,8 @@ def _create_engine_runtime(
             timer=_create_execution_timer(spec),
         )
         shutdown = model_executor.shutdown
+        # TP 初始化和性能优化由分布式 Executor 统一演进；这里不额外插入单卡预热命令。
+        startup_warmup = None
     scheduler = TokenBudgetScheduler(
         components.logical_cache,
         max_num_sequences=config.max_num_sequences,
@@ -385,6 +401,8 @@ def _create_engine_runtime(
     def start() -> None:
         components.runner.load(spec)
         model_executor.initialize()
+        if startup_warmup is not None:
+            startup_warmup()
         # CUDA KV 容量直到 executor 初始化后才确定。
         engine.refresh_performance_metrics()
 
