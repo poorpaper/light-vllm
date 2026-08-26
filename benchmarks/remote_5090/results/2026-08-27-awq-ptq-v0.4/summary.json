@@ -65,13 +65,18 @@
     "baseline": "vLLM 0.26 eager with auto-selected Marlin",
     "matched_prefix_cache": true,
     "burst_64_256_to_64": {
-      "light_vllm_output_tokens_per_s": 3509.914194,
-      "vllm_output_tokens_per_s": 4568.085490,
-      "light_to_vllm_percent": 76.836,
-      "light_vllm_ttft_p50_ms": 116.9067,
-      "vllm_ttft_p50_ms": 194.4637,
-      "light_vllm_tpot_p50_ms": 10.5088,
-      "vllm_tpot_p50_ms": 10.7787
+      "statistic": "median of six runs per system, with vLLM runs bracketing light-vllm",
+      "light_vllm_output_tokens_per_s": 5014.154295,
+      "vllm_output_tokens_per_s": 4835.254429,
+      "light_vs_vllm_percent": 3.699906,
+      "light_vllm_ttft_p50_ms": 110.361442,
+      "vllm_ttft_p50_ms": 167.011775,
+      "light_vllm_tpot_p50_ms": 10.726871,
+      "vllm_tpot_p50_ms": 10.644817,
+      "light_vllm_worst_max_itl_ms": 56.253139,
+      "vllm_worst_max_itl_ms": 37.038498,
+      "greedy_output_requests_compared": 64,
+      "greedy_output_mismatches": 0
     },
     "burst_16_16_to_512": {
       "light_vllm_output_tokens_per_s": 1880.927253,
@@ -83,7 +88,32 @@
       "vllm_tpot_p50_ms": 10.2762
     }
   },
-  "remaining_acceptance": [
+  "runtime_optimization": {
+    "startup_warmup": {
+      "cold_step_host_ms": 229.859,
+      "cold_step_cuda_ms": 2.001,
+      "cold_aten_mm_host_ms": 171.523,
+      "warmed_step_host_ms": 6.943,
+      "warmed_step_cuda_ms": 1.985,
+      "first_request_after_ready_ttft_ms": 18.701706
+    },
+    "full_gc_profile": {
+      "engine_child_generation_2_ms": 129.038316,
+      "engine_child_adjacent_step_gap_ms": 131.32,
+      "http_parent_generation_2_ms": 140.148513,
+      "http_parent_observed_max_itl_ms": 162.257936
+    },
+    "before_after_six_run": {
+      "before_throughput_median": 4877.286631,
+      "after_throughput_median": 5014.154295,
+      "throughput_delta_percent": 2.806226,
+      "before_worst_max_itl_ms": 197.881255,
+      "after_worst_max_itl_ms": 56.253139,
+      "worst_max_itl_delta_percent": -71.572275
+    }
+  },
+  "first_stage_acceptance_status": "complete",
+  "deferred_later_stage_validation": [
     "real-checkpoint TP=1/2 CUDA comparison when both GPUs are free",
     "Docker image build on a host with Docker"
   ]

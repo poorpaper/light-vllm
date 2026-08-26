@@ -46,6 +46,10 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   `ModelStepHandler`；该选择不得进入 Engine、Executor 或 Worker 热路径。
 - `LocalModelExecutor` 只把执行端口委托给一个 `LocalModelWorker`。Worker 固定当前模型版本和请求生命周期；
   `ContiguousStepHandler` / `PagedStepHandler` 分别负责连续与分页 KV 的输入准备、物理缓存和模型 forward。
+- 单 Rank CUDA Engine 在对外 ready 前复用 `ModelExecutor` 请求生命周期完成一次有界 prefill 和一次 decode 预热；
+  预热不经过 Scheduler/Observer、不按模型或量化方式分支，并在返回前释放临时请求。独立 Engine 的 HTTP 父进程
+  与 CUDA 子进程随后各自冻结启动期 GC 堆，避免 full collection 扫描长期存活对象，并在关闭时解冻；TP 启动路径
+  保持不变。
 - 单机 TP 由 `TensorParallelModelExecutor` 表达：Rank 0 独占现有 Engine、Scheduler 和 serving，按顺序广播原有
   `ExecutionBatch`；每个 Rank 复用同一套 `LocalModelWorker` 和物理 KV。NCCL 只承载 device tensor collective，
   可替换命令通道承载 Worker 控制；单机 POSIX 默认使用 Unix socket，Gloo 只负责启动期协调、容量事实与显式回退。
@@ -252,6 +256,11 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 52. 离线 PTQ 不得进入在线 Engine 或模型 forward。校准与搜索必须有显式样本/显存分块上限，导出必须原子完成并
     写入可复核配置、校准 token 哈希和逐层报告；源 tokenizer、chat template 与 generation 资产必须逐字节保留，
     不得通过重新序列化改变文本服务语义。
+53. 单 Rank CUDA 启动预热只能复用既有 `ModelExecutor`、请求、lease 和 KV 生命周期；prefill 必须受单轮 token、
+    模型长度和 KV 容量共同约束，随后只执行一次单 token decode。预热在 ready 前完成且不进入 Scheduler、Observer
+    或量化分支；失败必须阻止服务 ready，并释放临时请求。独立 Engine 的 HTTP 父进程与 CUDA 子进程只可在各自
+    ready 前冻结启动期 GC 堆，并在关闭时解冻；不得把进程级 GC 策略扩散到同进程或 TP 路径。TP 启动路径不得被
+    单卡预热隐式改变。
 
 ## 锁与资源的准确含义
 

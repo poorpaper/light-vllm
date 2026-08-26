@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 from collections.abc import Awaitable, Callable
@@ -38,7 +39,11 @@ from light_vllm.runtime.execution.distributed import (
     run_tensor_parallel_worker,
 )
 from light_vllm.runtime.execution.interfaces import ExecutionTimer
-from light_vllm.runtime.execution.local import LocalModelExecutor, LocalTokenExecutor
+from light_vllm.runtime.execution.local import (
+    LocalModelExecutor,
+    LocalTokenExecutor,
+    warmup_model_executor,
+)
 from light_vllm.runtime.execution.paged_attention import (
     PagedAttentionBackend,
     TorchPagedAttentionBackend,
@@ -316,6 +321,16 @@ def _create_engine_runtime(
             components.worker,
             timer=_create_execution_timer(spec),
         )
+        startup_warmup = (
+            partial(
+                warmup_model_executor,
+                model_executor,
+                max_num_scheduled_tokens=config.max_num_scheduled_tokens,
+                block_size=(config.kv_block_size if config.kv_reservation == "blocks" else None),
+            )
+            if torch.device(spec.device).type == "cuda"
+            else None
+        )
 
         def shutdown() -> None:
             return None
@@ -328,6 +343,8 @@ def _create_engine_runtime(
             timer=_create_execution_timer(spec),
         )
         shutdown = model_executor.shutdown
+        # TP 初始化和性能优化由分布式 Executor 统一演进；这里不额外插入单卡预热命令。
+        startup_warmup = None
     scheduler = TokenBudgetScheduler(
         components.logical_cache,
         max_num_sequences=config.max_num_sequences,
@@ -368,6 +385,8 @@ def _create_engine_runtime(
     def start() -> None:
         components.runner.load(spec)
         model_executor.initialize()
+        if startup_warmup is not None:
+            startup_warmup()
         # CUDA KV 容量直到 executor 初始化后才确定。
         engine.refresh_performance_metrics()
 
@@ -384,6 +403,14 @@ async def _close_engine_runtime(runtime: _EngineRuntime) -> None:
         await runtime.engine.close()
     finally:
         runtime.shutdown()
+
+
+def _freeze_startup_gc_heap() -> None:
+    """让 serving 期间的 full GC 跳过启动期长期存活对象。"""
+
+    for generation in range(3):
+        gc.collect(generation)
+    gc.freeze()
 
 
 def _run_tensor_parallel_rank(
@@ -412,10 +439,24 @@ def _create_started_engine_process_runtime(
 ) -> EngineProcessRuntime:
     runtime = _create_engine_runtime(spec, config, cooperative_inline=True)
     runtime.start()
+
+    # 模型、KV cache 和已预热的 CUDA 对象在 serving 期间长期存活。把它们从
+    # 后续 GC 扫描中移出，避免 full collection 在 decode step 之间制造长停顿。
+    frozen_startup_heap = torch.device(spec.device).type == "cuda"
+    if frozen_startup_heap:
+        _freeze_startup_gc_heap()
+
+    async def close() -> None:
+        try:
+            await _close_engine_runtime(runtime)
+        finally:
+            if frozen_startup_heap:
+                gc.unfreeze()
+
     return EngineProcessRuntime(
         engine=runtime.engine,
         performance_metrics=runtime.performance_metrics,
-        close=partial(_close_engine_runtime, runtime),
+        close=close,
     )
 
 
@@ -565,12 +606,23 @@ def create_serving_app(
             start_runtime()
         if start_engine is not None:
             await start_engine()
+        # 独立 Engine 模式下，HTTP 父进程也持有长期存活的 FastAPI、tokenizer
+        # 与 IPC 对象；只冻结这一进程边界，不改变同进程或 TP 的 GC 生命周期。
+        freeze_http_heap = engine_process and torch.device(spec.device).type == "cuda"
+        frozen_http_heap = False
         try:
+            if freeze_http_heap:
+                _freeze_startup_gc_heap()
+                frozen_http_heap = True
             yield
         finally:
-            # close 会先拒绝新请求，再等待正在运行的同步模型步骤安全结束。
-            if close_engine is not None:
-                await close_engine()
+            try:
+                # close 会先拒绝新请求，再等待正在运行的同步模型步骤安全结束。
+                if close_engine is not None:
+                    await close_engine()
+            finally:
+                if frozen_http_heap:
+                    gc.unfreeze()
 
     openai_config = (
         OpenAIServingConfig(

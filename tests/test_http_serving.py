@@ -5,6 +5,7 @@ from contextlib import suppress
 import pytest
 from fastapi.testclient import TestClient
 
+import light_vllm.entrypoints.http as http_entrypoint
 from light_vllm import (
     EngineCapabilities,
     GenerateRequest,
@@ -19,6 +20,7 @@ from light_vllm import (
 )
 from light_vllm.entrypoints.http import (
     _create_parser,
+    _create_started_engine_process_runtime,
     _initialize_tensor_parallel,
     create_serving_app,
 )
@@ -86,6 +88,100 @@ class CloseTrackingAsyncIterator(AsyncIterator[GenerationEvent]):
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+def test_cuda_engine_process_freezes_static_heap_until_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Engine:
+        ready = True
+
+        async def close(self) -> None:
+            events.append("engine.close")
+
+    engine = Engine()
+    runtime = http_entrypoint._EngineRuntime(
+        engine=engine,
+        performance_metrics=object(),
+        start=lambda: events.append("runtime.start"),
+        shutdown=lambda: events.append("runtime.shutdown"),
+    )
+    monkeypatch.setattr(
+        http_entrypoint, "_create_engine_runtime", lambda *_args, **_kwargs: runtime
+    )
+    monkeypatch.setattr(
+        http_entrypoint.gc,
+        "collect",
+        lambda generation: events.append(f"gc.collect.{generation}"),
+    )
+    monkeypatch.setattr(http_entrypoint.gc, "freeze", lambda: events.append("gc.freeze"))
+    monkeypatch.setattr(http_entrypoint.gc, "unfreeze", lambda: events.append("gc.unfreeze"))
+
+    process_runtime = _create_started_engine_process_runtime(
+        ModelSpec(architecture="tiny-causal-lm", device="cuda:0"),
+        object(),
+    )
+
+    assert events == [
+        "runtime.start",
+        "gc.collect.0",
+        "gc.collect.1",
+        "gc.collect.2",
+        "gc.freeze",
+    ]
+    asyncio.run(process_runtime.close())
+    assert events[-3:] == ["engine.close", "runtime.shutdown", "gc.unfreeze"]
+
+
+def test_cuda_engine_process_http_parent_freezes_heap_during_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class ProcessClient:
+        ready = True
+        capabilities = EngineCapabilities()
+
+        async def start(self) -> None:
+            events.append("client.start")
+
+        async def close(self) -> None:
+            events.append("client.close")
+
+        def snapshot(self):
+            raise AssertionError("metrics are not read in this test")
+
+    process_client = ProcessClient()
+    monkeypatch.setattr(
+        http_entrypoint,
+        "ProcessEngineClient",
+        lambda *_args, **_kwargs: process_client,
+    )
+    monkeypatch.setattr(
+        http_entrypoint.gc,
+        "collect",
+        lambda generation: events.append(f"gc.collect.{generation}"),
+    )
+    monkeypatch.setattr(http_entrypoint.gc, "freeze", lambda: events.append("gc.freeze"))
+    monkeypatch.setattr(http_entrypoint.gc, "unfreeze", lambda: events.append("gc.unfreeze"))
+
+    app = create_serving_app(
+        ModelSpec(architecture="tiny-causal-lm", device="cuda:0"),
+        runtime="engine",
+        engine_process=True,
+    )
+    with TestClient(app):
+        assert events == [
+            "client.start",
+            "gc.collect.0",
+            "gc.collect.1",
+            "gc.collect.2",
+            "gc.freeze",
+        ]
+
+    assert events[-2:] == ["client.close", "gc.unfreeze"]
 
 
 class DisconnectTrackingEngineClient(StubEngineClient):
