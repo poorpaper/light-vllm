@@ -38,6 +38,8 @@ packages and must not change runtime behavior.
   when invoking `run_runtime_gap_case.sh` to enable it.
 - `render_tp_control_comparison.py`: renders the checked-in TP control-path
   summary as a PNG and SVG with per-run points and median bars.
+- `render_tp_driver_dispatch.py`: renders the Lane baseline, rejected same-loop
+  inline experiment, and vLLM comparison from a compact checked-in summary.
 - `test_tp_failure_exit.sh`: kills one active Rank and verifies bounded process
   exit, port release, and GPU-memory cleanup.
 
