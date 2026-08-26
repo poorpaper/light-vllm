@@ -1,0 +1,101 @@
+{
+  "date": "2026-08-26",
+  "status": "throughput and steady TPOT matched; TTFT and tail ITL remain follow-up work",
+  "hardware": {
+    "gpus": "2 x NVIDIA GeForce RTX 5090 32607 MiB",
+    "topology": "SYS",
+    "cuda_p2p": false,
+    "driver": "580.95.05"
+  },
+  "software": {
+    "python": "3.12.13",
+    "torch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "nccl": "2.28.9",
+    "triton": "3.6.0",
+    "vllm": "0.26.0"
+  },
+  "workload": {
+    "model": "Qwen2.5-Coder-7B-Instruct",
+    "model_config_sha256": "c0242402ad6a13b331ea320feea8c7e3776ffb7a4eff0757b9cd667e116d9a28",
+    "fixed_workload_sha256": "e47f4f9148fd6d91d81a4fd6fc17a0eaf3988f264e34c9fc77191e24a81e12b0",
+    "dtype": "bfloat16",
+    "requests": 16,
+    "output_tokens_per_request": 512,
+    "output_tokens_per_run": 8192,
+    "formal_runs": 3,
+    "service_restarts_per_system": 3,
+    "run_order": "light-r1, vllm-r1, light-r2, vllm-r2, light-r3, vllm-r3",
+    "warmup_excluded": true,
+    "light_control_transport": "unix socket",
+    "light_attention_backend": "triton",
+    "vllm_enforce_eager": true
+  },
+  "tp2": {
+    "light_engine_process": {
+      "throughput_runs": [1325.039334, 1209.415770, 1288.106075],
+      "throughput_median": 1288.106075,
+      "tpot_p50_ms_runs": [12.008419, 13.084148, 12.279827],
+      "tpot_p50_ms_median": 12.279827,
+      "ttft_p95_ms_runs": [44.490216, 86.980493, 82.203463],
+      "ttft_p95_ms_median": 82.203463,
+      "max_itl_p95_ms_runs": [20.506162, 27.611224, 30.475670],
+      "max_itl_p95_ms_median": 27.611224,
+      "successful_requests_per_run": 16,
+      "failed_requests_per_run": 0
+    },
+    "vllm_eager": {
+      "throughput_runs": [1312.137953, 1225.760464, 1287.759762],
+      "throughput_median": 1287.759762,
+      "tpot_p50_ms_runs": [12.072685, 12.922945, 12.299810],
+      "tpot_p50_ms_median": 12.299810,
+      "ttft_p95_ms_runs": [72.329572, 77.684818, 74.699407],
+      "ttft_p95_ms_median": 74.699407,
+      "max_itl_p95_ms_runs": [21.641044, 21.535985, 16.749117],
+      "max_itl_p95_ms_median": 21.535985,
+      "successful_requests_per_run": 16,
+      "failed_requests_per_run": 0
+    }
+  },
+  "comparison": {
+    "light_vs_vllm_throughput_percent": 100.026893,
+    "light_vs_vllm_throughput_delta_percent": 0.026893,
+    "light_vs_vllm_tpot_delta_percent": -0.162470,
+    "light_vs_vllm_ttft_p95_delta_ms": 7.504056,
+    "light_vs_vllm_max_itl_p95_delta_ms": 6.075239,
+    "previous_lane_vs_vllm_throughput_percent": 92.588973,
+    "normalized_throughput_ratio_improvement_percent": 8.033267,
+    "previous_lane_max_itl_gap_ms": 16.037883,
+    "current_max_itl_gap_ms": 6.075239,
+    "max_itl_gap_reduction_percent": 62.119447
+  },
+  "correctness": {
+    "formal_repeats": 2,
+    "requests_per_repeat": 4,
+    "tokens_per_request": 8,
+    "unique_outputs_per_repeat": 1,
+    "matches_previous_tp1_baseline": true,
+    "generated_token_ids": [3190, 262, 38893, 279, 1584, 315, 264, 1681]
+  },
+  "failure_exit": {
+    "killed_local_rank": 1,
+    "torchrun_exit_code": 1,
+    "exit_elapsed_ms": 957,
+    "exit_timed_out": false,
+    "port_released": true,
+    "gpu_memory_released": true,
+    "remaining_server_pids": []
+  },
+  "profile": {
+    "formal_decode_steps": 512,
+    "rank0_inter_step_gap_p50_ms": 0.536986,
+    "rank0_inter_step_gap_p95_ms": 0.583129,
+    "rank0_model_step_p50_ms": 10.784,
+    "rank0_model_step_p95_ms": 14.680,
+    "gc_generation_0_max_ms": 0.283,
+    "gc_generation_1_max_ms": 0.254,
+    "gc_generation_2_count": 0,
+    "finding": "remaining formal tail is in model/device steps and burst prefill, not Python GC"
+  },
+  "cloud_raw_root": "/root/autodl-tmp/tp-engine-process-20260826"
+}

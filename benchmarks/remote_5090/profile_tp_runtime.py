@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import os
 import signal
@@ -90,6 +91,8 @@ class _Profiler:
                 "wall_mean_ms": statistics.fmean(wall_ms),
                 "wall_p50_ms": _percentile(wall_ms, 0.5),
                 "wall_p95_ms": _percentile(wall_ms, 0.95),
+                "wall_p99_ms": _percentile(wall_ms, 0.99),
+                "wall_max_ms": max(wall_ms),
                 "thread_cpu_mean_ms": statistics.fmean(cpu_ms),
             }
 
@@ -108,6 +111,8 @@ class _Profiler:
                 "mean_ms": statistics.fmean(inter_step_ms),
                 "p50_ms": _percentile(inter_step_ms, 0.5),
                 "p95_ms": _percentile(inter_step_ms, 0.95),
+                "p99_ms": _percentile(inter_step_ms, 0.99),
+                "max_ms": max(inter_step_ms),
             }
         self._output.parent.mkdir(parents=True, exist_ok=True)
         self._output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -164,6 +169,25 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     output = Path(raw_output.format(rank=rank))
     profiler = _Profiler(output)
+    gc_started: dict[int, tuple[int, int]] = {}
+
+    def record_gc(phase: str, info: dict[str, int]) -> None:
+        """把 GC 暂停计入同一条时间线，确认偶发长尾是否来自 Python。"""
+
+        generation = info["generation"]
+        if phase == "start":
+            gc_started[generation] = (time.perf_counter_ns(), time.thread_time_ns())
+            return
+        started = gc_started.pop(generation, None)
+        if started is not None:
+            profiler.record(
+                f"gc.generation_{generation}",
+                started[0],
+                time.perf_counter_ns(),
+                time.thread_time_ns() - started[1],
+            )
+
+    gc.callbacks.append(record_gc)
 
     for owner, attribute, name in (
         (TensorParallelModelExecutor, "execute", "tp_executor.execute"),
