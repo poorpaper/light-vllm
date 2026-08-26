@@ -66,7 +66,7 @@ flowchart LR
     Text --> HTTP["FastAPI adapter<br/>JSON · SSE"]
     Debug["token-ID debug API"] --> HTTP
     HTTP --> Client["EngineClient"]
-    Client --> Process["ProcessEngineClient"]
+    Client --> Process["Process / Connection<br/>EngineClient"]
     Client -. correctness baseline .-> Reference["ReferenceGenerationService"]
     Process -->|IPC| Core["EngineCore<br/>schedule → execute → update"]
 
@@ -148,8 +148,9 @@ python -m venv .venv
   --paged-attention-backend triton
 ```
 
-单机两卡 TP 使用 torchrun 启动一张 GPU 一个进程。Rank 0 运行原有 Engine 和 HTTP，其他 Rank 只运行模型 Worker；
-TP 已经提供独立进程边界，因此不要再传 `--engine-process`：
+单机两卡 TP 使用 torchrun 启动一张 GPU 一个 Rank。Rank 0 运行原有 Engine，并自动 spawn 不持有 CUDA 的 HTTP/
+tokenizer 前端；其他 Rank 只运行模型 Worker。前端通过已有 Engine IPC 协议连接 Rank 0，因此不要再传
+`--engine-process`：
 
 ```bash
 torchrun --standalone --nproc-per-node=2 \
