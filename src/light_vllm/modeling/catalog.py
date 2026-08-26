@@ -5,6 +5,7 @@ from typing import Protocol
 
 from light_vllm.modeling.loaders.interfaces import ModelLoader
 from light_vllm.modeling.models.interfaces import ModelFactory
+from light_vllm.modeling.quantization.interfaces import QuantizationMethodFactory
 from light_vllm.modeling.registry import Registry
 
 
@@ -18,6 +19,9 @@ class Catalog:
 
     models: Registry[ModelFactory] = field(default_factory=lambda: Registry("model"))
     loaders: Registry[ModelLoader] = field(default_factory=lambda: Registry("loader"))
+    quantizations: Registry[QuantizationMethodFactory] = field(
+        default_factory=lambda: Registry("quantization")
+    )
 
     def install(self, plugin: Plugin) -> None:
         plugin.register(self)

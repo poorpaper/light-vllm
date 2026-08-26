@@ -39,6 +39,7 @@ triton = [
 
 [project.scripts]
 light-vllm-serve = "light_vllm.entrypoints.http:main"
+light-vllm-quantize-awq = "light_vllm.entrypoints.quantize_awq:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/light_vllm"]

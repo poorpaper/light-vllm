@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import sqrt
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -25,9 +26,14 @@ from light_vllm.modeling.models.interfaces import (
     ModelSpec,
     select_query_states,
 )
+from light_vllm.modeling.quantization.dense import DenseLinearMethod
+from light_vllm.modeling.quantization.interfaces import (
+    DirectLinear,
+    LinearMethod,
+    LinearOperation,
+    RowParallelLayer,
+)
 from light_vllm.modeling.tensor_parallel import (
-    ColumnParallelLinear,
-    RowParallelLinear,
     TensorParallelContext,
     VocabParallelEmbedding,
     VocabParallelLinear,
@@ -177,66 +183,86 @@ class Qwen2MLP(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
+        layer_index: int,
         parallel: TensorParallelContext,
+        linear_method: LinearMethod,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.gate_proj = ColumnParallelLinear(
+        self._linear_method = linear_method
+        self.gate_proj = linear_method.create_column(
             config.hidden_size,
             config.intermediate_size,
             parallel,
+            prefix=f"model.layers.{layer_index}.mlp.gate_proj",
             bias=False,
             **factory_kwargs,
         )
-        self.up_proj = ColumnParallelLinear(
+        self.up_proj = linear_method.create_column(
             config.hidden_size,
             config.intermediate_size,
             parallel,
+            prefix=f"model.layers.{layer_index}.mlp.up_proj",
             bias=False,
             **factory_kwargs,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = linear_method.create_row(
             config.intermediate_size,
             config.hidden_size,
             parallel,
+            prefix=f"model.layers.{layer_index}.mlp.down_proj",
             bias=False,
             **factory_kwargs,
         )
         self._needs_output_reduction = parallel.world_size > 1
-        self.register_buffer("_merged_gate_up_weight", None, persistent=False)
         self.register_buffer("_merged_gate_up_weight_t", None, persistent=False)
         self.register_buffer("_down_proj_weight_t", None, persistent=False)
+        self._merged_gate_up_operation: LinearOperation | None = None
+        self._down_proj_operation: LinearOperation | None = None
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        merged_weight = self._merged_gate_up_weight
         merged_weight_t = self._merged_gate_up_weight_t
         down_weight_t = self._down_proj_weight_t
-        if merged_weight is None or merged_weight_t is None or down_weight_t is None:
+        if merged_weight_t is not None:
+            gate, up = torch.mm(hidden_states, merged_weight_t).chunk(2, dim=-1)
+        elif self._merged_gate_up_operation is not None:
+            gate, up = self._merged_gate_up_operation(hidden_states).chunk(2, dim=-1)
+        else:
             gate = self.gate_proj(hidden_states)
             up = self.up_proj(hidden_states)
-            return self.down_proj(silu_and_mul(gate, up))
+        activated = silu_and_mul(gate, up)
+        if down_weight_t is not None:
+            local_output = torch.mm(activated, down_weight_t)
+        elif self._down_proj_operation is not None:
+            local_output = self._down_proj_operation(activated)
         else:
-            gate, up = torch.mm(hidden_states, merged_weight_t).chunk(2, dim=-1)
-        local_output = torch.mm(silu_and_mul(gate, up), down_weight_t)
+            return self.down_proj(activated)
         if not self._needs_output_reduction:
             # TP=1 保留原来的直通热路径，不为无通信场景调用 collective 适配层。
             return local_output
-        return self.down_proj.reduce_output(local_output)
+        down_proj = cast(RowParallelLayer, self.down_proj)
+        return down_proj.reduce_output(local_output)
 
     def prepare_for_inference(self) -> None:
         """Pack checkpoint-compatible Gate/Up weights into one inference GEMM."""
 
-        with torch.no_grad():
-            self._merged_gate_up_weight = torch.cat(
-                (self.gate_proj.weight, self.up_proj.weight),
-                dim=0,
-            ).contiguous()
-            # 只缓存共享存储的转置 view，避免每个 step 为固定权重重复建 view。
-            self._merged_gate_up_weight_t = self._merged_gate_up_weight.t()
-            self._down_proj_weight_t = self.down_proj.weight.t()
+        merged = self._linear_method.prepare_merged((self.gate_proj, self.up_proj))
+        down = self._linear_method.prepare_local(self.down_proj)
+        if isinstance(merged, DirectLinear):
+            if merged.bias is not None:
+                raise ValueError("Qwen2 gate/up projections must not have bias")
+            self._merged_gate_up_weight_t = merged.weight_t
+        else:
+            self._merged_gate_up_operation = merged
+        if isinstance(down, DirectLinear):
+            if down.bias is not None:
+                raise ValueError("Qwen2 down projection must not have bias")
+            self._down_proj_weight_t = down.weight_t
+        else:
+            self._down_proj_operation = down
 
 
 class Qwen2Attention(nn.Module):
@@ -247,6 +273,7 @@ class Qwen2Attention(nn.Module):
         config: Qwen2Config,
         layer_index: int,
         parallel: TensorParallelContext,
+        linear_method: LinearMethod,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -281,41 +308,47 @@ class Qwen2Attention(nn.Module):
             kv_rank,
             kv_world_size,
         )
-        self.q_proj = ColumnParallelLinear(
+        self._linear_method = linear_method
+        self.q_proj = linear_method.create_column(
             config.hidden_size,
             config.num_attention_heads * config.head_size,
             parallel,
+            prefix=f"model.layers.{layer_index}.self_attn.q_proj",
             bias=True,
             **factory_kwargs,
         )
-        self.k_proj = ColumnParallelLinear(
+        self.k_proj = linear_method.create_column(
             config.hidden_size,
             config.num_key_value_heads * config.head_size,
             parallel,
+            prefix=f"model.layers.{layer_index}.self_attn.k_proj",
             bias=True,
             output_partition=kv_output_partition,
             **factory_kwargs,
         )
-        self.v_proj = ColumnParallelLinear(
+        self.v_proj = linear_method.create_column(
             config.hidden_size,
             config.num_key_value_heads * config.head_size,
             parallel,
+            prefix=f"model.layers.{layer_index}.self_attn.v_proj",
             bias=True,
             output_partition=kv_output_partition,
             **factory_kwargs,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = linear_method.create_row(
             config.num_attention_heads * config.head_size,
             config.hidden_size,
             parallel,
+            prefix=f"model.layers.{layer_index}.self_attn.o_proj",
             bias=False,
             **factory_kwargs,
         )
         self._needs_output_reduction = parallel.world_size > 1
-        self.register_buffer("_merged_qkv_weight", None, persistent=False)
         self.register_buffer("_merged_qkv_weight_t", None, persistent=False)
         self.register_buffer("_merged_qkv_bias", None, persistent=False)
         self.register_buffer("_o_proj_weight_t", None, persistent=False)
+        self._merged_qkv_operation: LinearOperation | None = None
+        self._o_proj_operation: LinearOperation | None = None
 
     def forward(
         self,
@@ -325,20 +358,10 @@ class Qwen2Attention(nn.Module):
         sines: Tensor,
     ) -> Tensor:
         num_tokens = hidden_states.shape[0]
-        merged_weight = self._merged_qkv_weight
         merged_weight_t = self._merged_qkv_weight_t
         merged_bias = self._merged_qkv_bias
         output_weight_t = self._o_proj_weight_t
-        if (
-            merged_weight is None
-            or merged_weight_t is None
-            or merged_bias is None
-            or output_weight_t is None
-        ):
-            query_projection = self.q_proj(hidden_states)
-            key_projection = self.k_proj(hidden_states)
-            value_projection = self.v_proj(hidden_states)
-        else:
+        if merged_weight_t is not None and merged_bias is not None:
             projections = torch.addmm(merged_bias, hidden_states, merged_weight_t)
             query_size = self._num_query_heads * self._head_size
             kv_size = self._num_kv_heads * self._head_size
@@ -346,6 +369,18 @@ class Qwen2Attention(nn.Module):
                 (query_size, kv_size, kv_size),
                 dim=-1,
             )
+        elif self._merged_qkv_operation is not None:
+            projections = self._merged_qkv_operation(hidden_states)
+            query_size = self._num_query_heads * self._head_size
+            kv_size = self._num_kv_heads * self._head_size
+            query_projection, key_projection, value_projection = projections.split(
+                (query_size, kv_size, kv_size),
+                dim=-1,
+            )
+        else:
+            query_projection = self.q_proj(hidden_states)
+            key_projection = self.k_proj(hidden_states)
+            value_projection = self.v_proj(hidden_states)
         queries = query_projection.view(
             num_tokens,
             self._num_query_heads,
@@ -371,27 +406,35 @@ class Qwen2Attention(nn.Module):
             scale=self._scale,
         )
         attended = attended.reshape(num_tokens, -1)
-        if output_weight_t is None:
+        if output_weight_t is not None:
+            local_output = torch.mm(attended, output_weight_t)
+        elif self._o_proj_operation is not None:
+            local_output = self._o_proj_operation(attended)
+        else:
             return self.o_proj(attended)
-        local_output = torch.mm(attended, output_weight_t)
         if not self._needs_output_reduction:
             return local_output
-        return self.o_proj.reduce_output(local_output)
+        o_proj = cast(RowParallelLayer, self.o_proj)
+        return o_proj.reduce_output(local_output)
 
     def prepare_for_inference(self) -> None:
         """Pack checkpoint-compatible Q/K/V weights into one inference GEMM."""
 
-        with torch.no_grad():
-            self._merged_qkv_weight = torch.cat(
-                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
-                dim=0,
-            ).contiguous()
-            self._merged_qkv_weight_t = self._merged_qkv_weight.t()
-            self._merged_qkv_bias = torch.cat(
-                (self.q_proj.bias, self.k_proj.bias, self.v_proj.bias),
-                dim=0,
-            ).contiguous()
-            self._o_proj_weight_t = self.o_proj.weight.t()
+        merged = self._linear_method.prepare_merged((self.q_proj, self.k_proj, self.v_proj))
+        output = self._linear_method.prepare_local(self.o_proj)
+        if isinstance(merged, DirectLinear):
+            if merged.bias is None:
+                raise ValueError("Qwen2 Q/K/V projections require bias")
+            self._merged_qkv_weight_t = merged.weight_t
+            self._merged_qkv_bias = merged.bias
+        else:
+            self._merged_qkv_operation = merged
+        if isinstance(output, DirectLinear):
+            if output.bias is not None:
+                raise ValueError("Qwen2 output projection must not have bias")
+            self._o_proj_weight_t = output.weight_t
+        else:
+            self._o_proj_operation = output
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -402,14 +445,17 @@ class Qwen2DecoderLayer(nn.Module):
         config: Qwen2Config,
         layer_index: int,
         parallel: TensorParallelContext,
+        linear_method: LinearMethod,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.self_attn = Qwen2Attention(config, layer_index, parallel, **factory_kwargs)
-        self.mlp = Qwen2MLP(config, parallel, **factory_kwargs)
+        self.self_attn = Qwen2Attention(
+            config, layer_index, parallel, linear_method, **factory_kwargs
+        )
+        self.mlp = Qwen2MLP(config, layer_index, parallel, linear_method, **factory_kwargs)
         self.input_layernorm = Qwen2RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -465,6 +511,7 @@ class Qwen2Model(nn.Module):
         self,
         config: Qwen2Config,
         parallel: TensorParallelContext,
+        linear_method: LinearMethod,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -479,7 +526,7 @@ class Qwen2Model(nn.Module):
             **factory_kwargs,
         )
         self.layers = nn.ModuleList(
-            Qwen2DecoderLayer(config, layer_index, parallel, **factory_kwargs)
+            Qwen2DecoderLayer(config, layer_index, parallel, linear_method, **factory_kwargs)
             for layer_index in range(config.num_hidden_layers)
         )
         self.norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps, **factory_kwargs)
@@ -492,19 +539,21 @@ class Qwen2ForCausalLM(nn.Module):
         self,
         config: Qwen2Config,
         parallel: TensorParallelContext | None = None,
+        linear_method: LinearMethod | None = None,
         *,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         parallel = parallel or TensorParallelContext()
+        linear_method = linear_method or DenseLinearMethod()
         if config.intermediate_size % parallel.world_size:
             raise ValueError("Qwen2 intermediate size must be divisible by tensor parallel size")
         factory_kwargs = {"device": device, "dtype": dtype}
         self.config = config
         self._parallel = parallel
         self._needs_logits_gather = parallel.world_size > 1
-        self.model = Qwen2Model(config, parallel, **factory_kwargs)
+        self.model = Qwen2Model(config, parallel, linear_method, **factory_kwargs)
         self.lm_head = VocabParallelLinear(
             config.hidden_size,
             config.vocab_size,
@@ -525,6 +574,7 @@ class Qwen2ForCausalLM(nn.Module):
         return cls(
             Qwen2Config.from_mapping(spec.model_args),
             parallel=spec.tensor_parallel,
+            linear_method=spec.linear_method,
             device=spec.device,
             dtype=spec.dtype,
         )
