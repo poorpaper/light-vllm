@@ -22,6 +22,11 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
 - 原生 `Qwen2ForCausalLM` 支持 Qwen2/Qwen2.5 的 full-attention、default-RoPE 配置；HF 与 ModelScope 下载的
   兼容目录共用 `SafetensorsModelLoader`，不进入 Runner 或 Worker 分支。loader 在权重就绪后调用可选的模型自有
   `prepare_for_inference()` hook；Qwen 用它准备打包权重和 RoPE table。
+- 模型 Linear 通过 `LinearMethod` 创建并在加载后准备：Dense 保留直接 GEMM；AWQ 持有 AutoAWQ GEMM 兼容的
+  `qweight/qzeros/scales`，再由一次性选择的 `AWQScheme` 装配 Torch correctness 或 CUDA backend。量化 factory
+  注册在 `Catalog`，Runner、Engine、Scheduler、Executor、Worker 和 HTTP 热路径不理解量化格式。
+- AWQ 离线 PTQ 独立于在线运行时，按层执行 activation-aware scale/clip search、W4A16 pack 和原子 checkpoint
+  导出；校准 token、配置与逐层报告一并记录，tokenizer/chat/generation 资产从 Dense 源逐字节复制。
 - 模型通过显式 `TensorParallelContext` 组合列并行、行并行、词表并行和集合通信；并行层声明 checkpoint 切片，
   `SafetensorsModelLoader` 通用地读取本 Rank 权重，不按 Qwen 参数名分支。TP=1 使用同一套模型 forward。
 - `ReferenceGenerationService` 保留无调度、全序列重算的同步正确性基线。
@@ -82,7 +87,10 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   `PerformanceMetricsReader`；这些路由都不知道 scheduler、runner、torch 或具体模型。
 - 一级包按 `modeling`、`runtime`、`serving` 收敛；稳定契约位于对应子领域的 `interfaces.py`。
 
-当前尚未实现第三方 victim preemption、sliding-window/rope-scaling Qwen 配置、量化、多节点通信和 MaaS 控制面。
+当前尚未实现第三方 victim preemption、sliding-window/rope-scaling Qwen 配置、FP8、多节点通信和 MaaS 控制面。
+量化第一阶段只实现并验收 Qwen2/Qwen2.5 AWQ W4A16、AutoAWQ GEMM checkpoint 和 FP16 activation；不宣称
+支持其他模型、量化格式或通用 PTQ。AWQ 已完成单卡 PTQ、加载、CUDA kernel、OpenAI E2E 和 vLLM 对照，真实
+TP=2 CUDA checkpoint 验收仍需等待两张 GPU 同时空闲。
 单机 TP/NCCL 已完成双 RTX 5090 上的 TP=1/2 短序列逐 token 对照、显存、性能、取消与 Rank 故障退出验收；
 该机器无 CUDA P2P/NVLink，TP=2 降低单卡显存但不产生吞吐加速。BF16 长生成已观察到跨 TP size 和同一 TP=1
 重复运行的轨迹分叉；现象与数值路径差异的自回归放大相符，但尚未采集分叉点 logits，根因仍待量化，也未完成
@@ -101,6 +109,12 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/modeling/loaders/safetensors.py` | HF/ModelScope 兼容的本地分片快照加载 |
 | `src/light_vllm/modeling/models/qwen2.py` | 原生 Qwen2/Qwen2.5 推理模型 |
 | `src/light_vllm/modeling/tensor_parallel.py` | 显式 TP 上下文、并行层与 checkpoint 切片描述 |
+| `src/light_vllm/modeling/quantization/interfaces.py` | LinearMethod、PreparedLinear 与量化 factory 契约 |
+| `src/light_vllm/modeling/quantization/awq.py` | AutoAWQ packed tensor、AWQ 并行层与 LinearMethod |
+| `src/light_vllm/modeling/quantization/awq_schemes.py` | AWQ Torch/CUDA backend 的加载期选择 |
+| `src/light_vllm/modeling/quantization/awq_ptq.py` | Qwen2/Qwen2.5 逐层 AWQ scale/clip PTQ |
+| `src/light_vllm/modeling/quantization/awq_export.py` | AutoAWQ 兼容 checkpoint 原子导出 |
+| `src/light_vllm/entrypoints/quantize_awq.py` | AWQ 离线 PTQ CLI |
 | `src/light_vllm/modeling/runner.py` | 模型生命周期与固定 `ModelSession` |
 | `src/light_vllm/modeling/catalog.py` | model/loader 扩展点集合 |
 | `src/light_vllm/runtime/generation/interfaces.py` | 生成请求、结果和事件 |
@@ -226,6 +240,18 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
     必须以相同顺序执行 initialize、请求生命周期、model step 和 shutdown；任一通道故障后整组状态不得继续复用。
 47. Qwen query heads 和 MLP 中间维按 TP 切分；KV heads 足够时切分，不足时按完整 head 复制。不得把一个 attention
     head 切到两个 Rank，也不得让 attention backend 理解复制策略。
+48. 量化方法必须由 `Catalog` 中的 factory 在 loader 阶段解析为 `LinearMethod`；Runner、Engine、Scheduler、
+    Executor、Worker 和 serving 不得按 AWQ、FP8 或 backend 写分支。Dense 和 TP>1 必须继续使用同一模型 forward。
+49. `LinearMethod` 负责创建 checkpoint 参数布局和准备本地/融合算子；具体 AWQ kernel 只通过 `AWQScheme` 接入。
+    Scheme 必须在模型 `prepare_for_inference()` 阶段选定，逐 token 热路径不得重复查询 backend、GPU capability 或
+    checkpoint metadata。
+50. 量化并行层必须像 Dense 并行层一样声明 `checkpoint_shards`。列并行按 packed 输出维切分，行并行按输入维和
+    group 切分；loader 只消费切片事实，不得出现 Qwen 参数名或量化格式专用 TP 条件树。
+51. Qwen 继续拥有 QKV 与 Gate/Up 的语义融合。量化层准备融合权重后，子层必须重绑为同一 packed storage 的 view，
+    不得长期保留融合前后两份 INT4 权重；Row Parallel bias 仍只能在 AllReduce 后添加一次。
+52. 离线 PTQ 不得进入在线 Engine 或模型 forward。校准与搜索必须有显式样本/显存分块上限，导出必须原子完成并
+    写入可复核配置、校准 token 哈希和逐层报告；源 tokenizer、chat template 与 generation 资产必须逐字节保留，
+    不得通过重新序列化改变文本服务语义。
 
 ## 锁与资源的准确含义
 
@@ -270,6 +296,11 @@ collective 中途释放远端物理 KV；Engine 越过原有 lease 安全边界�
 `checkpoint_shards`；不得修改 safetensors loader 增加模型专用参数名。新增 collective 后端只实现
 `TensorCollectives` 并在 composition root 注入。
 
+新增量化格式：实现 `LinearMethod` 及其 checkpoint 层，通过 `QuantizationMethodFactory` 注册到 `Catalog`；
+不要修改 Runner、Engine、Scheduler、Executor、Worker 或 Qwen forward 增加格式判断。新增同一权重格式的计算
+后端只实现对应 Scheme，并在加载/prepare 阶段选择。新增离线 PTQ 算法留在 `modeling/quantization` 和独立入口，
+不得与在线 loader 或服务请求生命周期耦合。
+
 新增本地 KV 布局或 attention 后端：实现 `ModelStepHandler`，创建相应 `AttentionContext`，分页 kernel 再通过
 `PagedAttentionBackend` 组合；模型保持唯一调用入口，并继续只声明 `ModelKVCacheSpec`。
 
@@ -296,6 +327,6 @@ git diff --check
 
 ## 下一步
 
-先补齐有容器运行权限的双 GPU Docker/Kubernetes A/B，并在更大模型或具备 P2P 的拓扑上补充“单卡无法加载、
-双卡可加载”和通信收益边界。之后按路线图进入量化、显存治理和长上下文，再推进多机通信、Prefill/Decode 分离
-与 MaaS 控制面。
+当前分支只收口 AWQ 第一阶段：补齐两张 GPU 同时空闲时的真实 AWQ TP=1/2 对照和容器构建验收。FP8、显存治理、
+长上下文、多机通信、Prefill/Decode 分离与 MaaS 控制面不得混入这批改动；后续按路线图
+另起阶段和分支。
