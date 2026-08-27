@@ -43,8 +43,9 @@ light-vllm 是一个以可维护性为第一约束的轻量 LLM 推理运行时�
   `ContiguousStepHandler` / `PagedStepHandler` 分别负责连续与分页 KV 的输入准备、物理缓存和模型 forward。
 - 单机 TP 由 `TensorParallelModelExecutor` 表达：Rank 0 独占现有 Engine、Scheduler 和逻辑 KV，HTTP/tokenizer 在
   独立 spawn 进程中通过 `ConnectionEngineClient` 连接 Rank 0；其他 Rank 只执行顺序一致的 Worker 命令。每个
-  Rank 复用同一套 `LocalModelWorker` 和物理 KV。NCCL 只承载 device tensor collective，可替换命令通道承载
-  Worker 控制；单机 POSIX 默认使用 Unix socket，Gloo 只负责启动期协调、容量事实与显式回退。多主机 `auto`
+  Rank 复用同一套 `LocalModelWorker` 和物理 KV。模型 NCCL collective 使用同一个 communicator 在当前模型 CUDA
+  stream 上执行；可替换命令通道承载 Worker 控制。单机 POSIX 默认使用 Unix socket，Gloo 只负责启动期协调、
+  容量事实与显式回退。多主机 `auto`
   自动保留 Gloo，避免把单机 IPC 假装成跨节点传输。各 Rank 的 KV 规划统一取最小页数。
 - `StandardDecodeHandler` 负责普通单 token 解码；`SpeculativeDecodeHandler` 组合 `DraftProposer`、目标验证和
   `AcceptanceSampler`。`NGramChainProposer` 与 `NGramTrieProposer` 共用同一树形执行流程，不新增模式专用 Worker。
@@ -114,6 +115,7 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
 | `src/light_vllm/runtime/execution/layout.py` | 从父链推导线性/树形 query 的位置和可见性 |
 | `src/light_vllm/runtime/execution/local.py` | 本地 Executor 与 reference token 执行 |
 | `src/light_vllm/runtime/execution/distributed.py` | torchrun 进程组、TP Executor 与 Rank Worker 循环 |
+| `src/light_vllm/runtime/execution/nccl.py` | 当前模型 CUDA stream 上的最小 NCCL collective backend |
 | `src/light_vllm/runtime/execution/worker.py` | 本地 Worker、Step Handler 与普通 Decode Handler |
 | `src/light_vllm/runtime/execution/dense_attention.py` | reference/连续缓存共用的 dense attention 上下文 |
 | `src/light_vllm/runtime/execution/paged_cache.py` | 分页 Step Handler 拥有的物理 K/V tensor |
@@ -224,8 +226,9 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
     和 Scheduler 不得感知 rank 或 NCCL，只有 composition root 组装该拓扑。
 45. 每个 Rank 持有本地参数与物理 KV；同一请求在各 Rank 使用相同逻辑 block ID。自动容量规划必须采用所有 Rank
     都能满足的最小页数，不得让 Rank 0 暴露更大的逻辑容量。
-46. 模型 tensor collective 与控制通信必须分组。NCCL 只接收当前 Rank CUDA device 上的 tensor；Worker 命令通过
-    可替换命令通道传输，单机 POSIX 默认使用 Unix socket，Gloo 保留启动期协调、容量事实和跨节点回退。所有 Rank
+46. 模型 tensor collective 与控制通信必须分组。NCCL 只接收当前 Rank CUDA device 上的 tensor，并在模型当前
+    CUDA stream 上执行，不能让每层 collective 经独立通信 stream 引入跨 stream 同步；Worker 命令通过可替换命令
+    通道传输，单机 POSIX 默认使用 Unix socket，Gloo 保留启动期协调、容量事实和跨节点回退。所有 Rank
     必须以相同顺序执行 initialize、请求生命周期、model step 和 shutdown；任一通道故障后整组状态不得继续复用。
 47. Qwen query heads 和 MLP 中间维按 TP 切分；KV heads 足够时切分，不足时按完整 head 复制。不得把一个 attention
     head 切到两个 Rank，也不得让 attention backend 理解复制策略。

@@ -171,10 +171,12 @@ AllGather 恢复完整 logits。KV head 数不少于 TP 时按 head 切分；少
 
 进程拓扑也保持单一职责：Rank 0 独占 Engine、Scheduler 和逻辑 KV；HTTP/tokenizer 在独立 spawn 进程中通过
 `ConnectionEngineClient` 访问 Rank 0，避免同步模型 step 阻塞 ASGI writer。Rank 0 广播现有 `ExecutionBatch`，
-每个 Rank 用同一 `LocalModelWorker` 管理本地分片参数和物理 KV。设备 tensor 用 NCCL，Worker 命令走可替换命令
-通道：单机 POSIX 默认使用有序 Unix socket，跨主机或显式配置时回退 Gloo。Gloo 仍负责启动期地址协调和容量事实，
-避免在每个 decode step 上执行 Python object collective。KV 自动规划先在每张卡本地计算，再取所有 Rank 的最小
-页数，使逻辑容量不会超过任一物理页池。请求取消先进入 Rank 0 已有 lease 边界，远端 free 只在当前 model step
+每个 Rank 用同一 `LocalModelWorker` 管理本地分片参数和物理 KV。模型 tensor 通过一个独立 communicator 在当前
+模型 CUDA stream 上执行 NCCL，保持计算和每层 collective 的自然依赖，避免 ProcessGroup 独立通信 stream 的
+跨 stream 同步。Worker 命令走可替换命令通道：单机 POSIX 默认使用有序 Unix socket，跨主机或显式配置时回退
+Gloo。Gloo 仍负责启动期地址协调和容量事实，避免在每个 decode step 上执行 Python object collective。KV 自动
+规划先在每张卡本地计算，再取所有 Rank 的最小页数，使逻辑容量不会超过任一物理页池。请求取消先进入 Rank 0
+已有 lease 边界，远端 free 只在当前 model step
 结束后按序送达；HTTP、Rank 或命令通道任一侧失败后连接关闭，整组状态直接作废。
 
 ## 5. 一次迭代
@@ -419,6 +421,7 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也�
 | chain/trie 树形投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
 | torchrun / TP Executor | `src/light_vllm/runtime/execution/distributed.py` |
+| current-stream NCCL backend | `src/light_vllm/runtime/execution/nccl.py` |
 | 执行 step 计时 | `src/light_vllm/runtime/execution/timing.py` |
 | 本地 Worker | `src/light_vllm/runtime/execution/worker.py` |
 | Dense Attention | `src/light_vllm/runtime/execution/dense_attention.py` |

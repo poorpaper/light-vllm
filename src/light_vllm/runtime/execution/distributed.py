@@ -8,6 +8,7 @@ import socket
 import struct
 import tempfile
 from collections.abc import Callable
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from math import isfinite
@@ -30,6 +31,10 @@ from light_vllm.runtime.execution.interfaces import (
     ExecutionTimer,
     ModelExecutor,
 )
+from light_vllm.runtime.execution.nccl import (
+    CurrentStreamNCCL,
+    create_current_stream_nccl,
+)
 from light_vllm.runtime.execution.paged_cache import (
     PagedKVCacheConfig,
     PagedKVCachePlanner,
@@ -48,6 +53,7 @@ class TorchDistributedGroup(TensorCollectives):
         device: torch.device,
         control_group: dist.ProcessGroup,
         tensor_group: dist.ProcessGroup,
+        current_stream_nccl: CurrentStreamNCCL | None,
         owns_world_group: bool,
     ) -> None:
         self.rank = rank
@@ -56,6 +62,7 @@ class TorchDistributedGroup(TensorCollectives):
         self.device = device
         self._control_group = control_group
         self._tensor_group = tensor_group
+        self._current_stream_nccl = current_stream_nccl
         self._owns_world_group = owns_world_group
         self._command_channel: _CommandChannel | None = None
         self._closed = False
@@ -111,8 +118,8 @@ class TorchDistributedGroup(TensorCollectives):
         else:
             options = None
             if backend == "nccl":
-                # TP 的短 AllReduce 位于每层关键路径上，使用高优先级 NCCL
-                # stream，避免排在同 Rank 的普通计算 stream 后面。
+                # ProcessGroup 只保留给启动和低频容量事实；模型 collective
+                # 使用独立 communicator 在模型当前 CUDA stream 上执行。
                 options = dist.ProcessGroupNCCL.Options(is_high_priority_stream=True)
                 options._timeout = timeout
             dist.init_process_group(
@@ -133,6 +140,23 @@ class TorchDistributedGroup(TensorCollectives):
             if owns_world_group and dist.is_initialized():
                 dist.destroy_process_group()
             raise
+        try:
+            current_stream_nccl = (
+                create_current_stream_nccl(
+                    rank=rank,
+                    world_size=world_size,
+                    control_group=control_group,
+                )
+                if backend == "nccl"
+                else None
+            )
+        except Exception:
+            if control_group is not dist.group.WORLD:
+                dist.destroy_process_group(control_group)
+            if owns_world_group and dist.is_initialized():
+                dist.destroy_process_group()
+            raise
+
         group = cls(
             rank=rank,
             world_size=world_size,
@@ -140,6 +164,7 @@ class TorchDistributedGroup(TensorCollectives):
             device=device,
             control_group=control_group,
             tensor_group=dist.group.WORLD,
+            current_stream_nccl=current_stream_nccl,
             owns_world_group=owns_world_group,
         )
         try:
@@ -149,7 +174,9 @@ class TorchDistributedGroup(TensorCollectives):
                 timeout_seconds=timeout_seconds,
             )
         except Exception:
-            group.close()
+            # 初始化异常是主错误；close 已尽力释放全部已建资源。
+            with suppress(Exception):
+                group.close()
             raise
         return group
 
@@ -164,6 +191,8 @@ class TorchDistributedGroup(TensorCollectives):
         self._ensure_open()
         if tensor.device != self.device:
             raise ExecutionError("tensor collective received a tensor on the wrong device")
+        if self._current_stream_nccl is not None:
+            return self._current_stream_nccl.all_reduce_sum(tensor)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=self._tensor_group)
         return tensor
 
@@ -184,8 +213,11 @@ class TorchDistributedGroup(TensorCollectives):
         if tensor.shape[-1] < max_size:
             padding = tensor.new_zeros(*tensor.shape[:-1], max_size - tensor.shape[-1])
             tensor = torch.cat((tensor, padding), dim=-1)
-        gathered = [torch.empty_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(gathered, tensor, group=self._tensor_group)
+        if self._current_stream_nccl is None:
+            gathered = [torch.empty_like(tensor) for _ in range(self.world_size)]
+            dist.all_gather(gathered, tensor, group=self._tensor_group)
+        else:
+            gathered = self._current_stream_nccl.all_gather(tensor)
         return torch.cat(
             tuple(value[..., :size] for value, size in zip(gathered, partition_sizes, strict=True)),
             dim=-1,
@@ -225,12 +257,22 @@ class TorchDistributedGroup(TensorCollectives):
         if self._closed:
             return
         self._closed = True
-        if self._command_channel is not None:
-            self._command_channel.close()
-        if self._control_group is not dist.group.WORLD:
-            dist.destroy_process_group(self._control_group)
-        if self._owns_world_group and dist.is_initialized():
-            dist.destroy_process_group()
+        command_channel = self._command_channel
+        current_stream_nccl = self._current_stream_nccl
+        self._command_channel = None
+        self._current_stream_nccl = None
+
+        # ExitStack 即使某个 close 失败也会继续执行其余 callback，并保留
+        # command -> NCCL -> control -> world 的释放顺序。
+        with ExitStack() as cleanup:
+            if self._owns_world_group and dist.is_initialized():
+                cleanup.callback(dist.destroy_process_group)
+            if self._control_group is not dist.group.WORLD:
+                cleanup.callback(dist.destroy_process_group, self._control_group)
+            if current_stream_nccl is not None:
+                cleanup.callback(current_stream_nccl.close)
+            if command_channel is not None:
+                cleanup.callback(command_channel.close)
 
     def _ensure_open(self) -> None:
         if self._closed or not dist.is_initialized():

@@ -69,7 +69,8 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
 | `TensorParallelModelExecutor` | Rank 0 顺序广播批次与请求生命周期，汇总 Rank 结果 | 调度、模型专用切分、HTTP |
 | `TensorParallelContext` | 显式提供 rank、world size 与模型集合通信 | torchrun 启动、进程生命周期 |
-| `TorchDistributedGroup` | torchrun rank/device 映射、NCCL tensor、控制通道装配与 Gloo 协调 | Engine 状态、模型结构 |
+| `TorchDistributedGroup` | torchrun rank/device 映射、当前模型 stream 的 NCCL tensor、控制通道装配与 Gloo 协调 | Engine 状态、模型结构 |
+| `CurrentStreamNCCL` | 绑定最小 NCCL C API，并在调用方当前 CUDA stream 提交模型 collective | Rank 生命周期、控制通信、模型切分 |
 | `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
 | `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
 | `PagedStepHandler` | token-major batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
