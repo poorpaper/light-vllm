@@ -234,6 +234,16 @@ PY
   exit 1
 }
 
+reset_tp_runtime_profile() {
+  local rank output pid_file profile_pid
+  for rank in $(seq 0 $((TENSOR_PARALLEL_SIZE - 1))); do
+    output=${TP_RUNTIME_PROFILE_OUTPUT/'{rank}'/$rank}
+    pid_file=${output%.*}.pid
+    profile_pid=$(<"$pid_file")
+    kill -USR1 "$profile_pid"
+  done
+}
+
 MAX_SEQS=${MAX_NUM_SEQUENCES:-16}
 if [[ ! "$MAX_SEQS" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_NUM_SEQUENCES must be a positive integer" >&2
@@ -446,6 +456,10 @@ for benchmark_case in "${BENCHMARK_CASES[@]}"; do
   configure_case "$benchmark_case"
   PREFIX=${MODE}-${benchmark_case}
   run_case warmup "$WARMUP_LIMIT"
+  if [[ -n "$TP_RUNTIME_PROFILE_OUTPUT" ]]; then
+    # warmup 包含首次 kernel 编译；只记录随后正式轮次的 serving 热路径。
+    reset_tp_runtime_profile
+  fi
   for run in $(seq 1 "$RUNS"); do
     run_case "r${run}"
   done

@@ -1,7 +1,7 @@
 # 单节点双 GPU Tensor Parallel
 
 这个 overlay 让一个 Pod 申请两张 GPU，并由 `torchrun` 启动两个 Rank。Rank 0
-同时提供 HTTP 服务，Rank 1 只执行模型命令；它不是两个独立推理副本。
+运行 Engine 并 spawn 独立 HTTP/tokenizer 前端，Rank 1 只执行模型命令；它不是两个独立推理副本。
 
 ## 前置条件
 

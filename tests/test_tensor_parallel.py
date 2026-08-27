@@ -8,6 +8,7 @@ from threading import Event
 
 import pytest
 import torch
+import torch.distributed as dist
 from safetensors.torch import save_file
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -40,6 +41,7 @@ from light_vllm.runtime.execution.interfaces import (
     ExecutionRequest,
     RequestOutput,
 )
+from light_vllm.runtime.execution.nccl import CurrentStreamNCCL
 from light_vllm.runtime.execution.paged_cache import PagedKVCacheConfig
 
 
@@ -304,6 +306,101 @@ def test_distributed_kv_planner_uses_the_smallest_rank_capacity() -> None:
     assert planner.num_blocks == 7
     assert planner.block_size == 4
     assert planner.device == torch.device("cpu")
+
+
+def test_current_stream_nccl_uses_one_communicator_and_rank_major_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object, int]] = []
+    communicator = object()
+    stream_handle = 12345
+
+    class FakeStream:
+        cuda_stream = stream_handle
+
+    class FakeLibrary:
+        def all_reduce_sum(
+            self,
+            tensor: Tensor,
+            current_communicator: object,
+            stream: int,
+        ) -> None:
+            calls.append(("reduce", current_communicator, stream))
+            tensor.mul_(2)
+
+        def all_gather(
+            self,
+            tensor: Tensor,
+            output: Tensor,
+            current_communicator: object,
+            stream: int,
+        ) -> None:
+            calls.append(("gather", current_communicator, stream))
+            output[0].copy_(tensor)
+            output[1].copy_(tensor + 10)
+
+        def destroy(self, current_communicator: object) -> None:
+            calls.append(("destroy", current_communicator, 0))
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: FakeStream())
+    collectives = CurrentStreamNCCL(FakeLibrary(), communicator, 2)
+
+    reduced = torch.tensor([[1.0, 2.0]])
+    assert collectives.all_reduce_sum(reduced) is reduced
+    torch.testing.assert_close(reduced, torch.tensor([[2.0, 4.0]]))
+    gathered = collectives.all_gather(torch.tensor([[3.0, 4.0]]))
+    torch.testing.assert_close(
+        gathered,
+        torch.tensor([[[3.0, 4.0]], [[13.0, 14.0]]]),
+    )
+    collectives.close()
+    collectives.close()
+    assert calls == [
+        ("reduce", communicator, stream_handle),
+        ("gather", communicator, stream_handle),
+        ("destroy", communicator, 0),
+    ]
+
+
+def test_distributed_group_close_releases_all_resources_after_channel_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    destroyed: list[object] = []
+    control_group = object()
+    world_group = object()
+
+    class FailingChannel:
+        def close(self) -> None:
+            events.append("command")
+            raise RuntimeError("command close failed")
+
+    class FakeNCCL:
+        def close(self) -> None:
+            events.append("nccl")
+
+    def destroy_process_group(group: object = world_group) -> None:
+        destroyed.append(group)
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "destroy_process_group", destroy_process_group)
+    group = TorchDistributedGroup(
+        rank=0,
+        world_size=2,
+        local_rank=0,
+        device=torch.device("cpu"),
+        control_group=control_group,  # type: ignore[arg-type]
+        tensor_group=world_group,  # type: ignore[arg-type]
+        current_stream_nccl=FakeNCCL(),  # type: ignore[arg-type]
+        owns_world_group=True,
+    )
+    group._command_channel = FailingChannel()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="command close failed"):
+        group.close()
+
+    assert events == ["command", "nccl"]
+    assert destroyed == [control_group, world_group]
 
 
 def test_local_socket_command_channel_preserves_rank_order() -> None:

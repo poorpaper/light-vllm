@@ -69,7 +69,8 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 | `LocalModelExecutor` | 把执行端口委托给一个本地 Worker | KV 模式、谁能运行、block 分配策略 |
 | `TensorParallelModelExecutor` | Rank 0 顺序广播批次与请求生命周期，汇总 Rank 结果 | 调度、模型专用切分、HTTP |
 | `TensorParallelContext` | 显式提供 rank、world size 与模型集合通信 | torchrun 启动、进程生命周期 |
-| `TorchDistributedGroup` | torchrun rank/device 映射、NCCL tensor、控制通道装配与 Gloo 协调 | Engine 状态、模型结构 |
+| `TorchDistributedGroup` | torchrun rank/device 映射、当前模型 stream 的 NCCL tensor、控制通道装配与 Gloo 协调 | Engine 状态、模型结构 |
+| `CurrentStreamNCCL` | 绑定最小 NCCL C API，并在调用方当前 CUDA stream 提交模型 collective | Rank 生命周期、控制通信、模型切分 |
 | `LocalModelWorker` | 固定模型版本、请求生命周期、组合 Step 与 Decode Handler | KV 模式分支、调度策略 |
 | `ContiguousStepHandler` | 请求级连续 K/V、绝对位置与 dense attention 上下文 | 采样、逻辑 block |
 | `PagedStepHandler` | token-major batch、绝对位置、物理页池与 block table 消费 | 采样、逻辑 block 分配 |
@@ -88,11 +89,15 @@ Worker 表达一个设备 rank 内固定的模型版本与请求生命周期；K
 
 ## 单机 Tensor Parallel
 
-TP 只替换模型参数布局和 Executor 拓扑，不改变 `ExecutionBatch → ExecutionOutput`。Rank 0 独占 HTTP、Engine、
-Scheduler 和逻辑 KV；Rank 1..N-1 阻塞在 Worker 命令循环。一次 step 的数据流是：
+TP 只替换模型参数布局和 Executor 拓扑，不改变 `ExecutionBatch → ExecutionOutput`。Rank 0 独占 Engine、
+Scheduler 和逻辑 KV；HTTP/tokenizer 在独立进程中通过 `ConnectionEngineClient` 连接 Rank 0；Rank 1..N-1
+阻塞在 Worker 命令循环。一次 step 的数据流是：
 
 ```text
-EngineCore (rank 0)
+HTTP / tokenizer process
+    │ EngineClient request / event
+    ▼
+EngineCore (rank 0 process)
     │ ExecutionBatch
     ▼
 TensorParallelModelExecutor
@@ -113,9 +118,10 @@ logical block ID 保持一致。自动显存规划取所有 Rank 的最小页数
 
 设备 tensor collective 使用 NCCL，Worker 命令通过独立 `_CommandChannel` 传输。单机 POSIX 的 `auto` 选择有序
 Unix socket，命令只序列化一次并向各 Worker 扇出；跨主机、非 POSIX 或显式 `gloo` 使用原 CPU collective 通道。
-Gloo 仍负责启动期地址协调与容量事实。只有 Engine 的单在途 Execution Lane 执行 collective；add/free 先更新
-Rank 0 本地 Worker，再在下一 step 或 shutdown 前顺序发送。这样取消仍服从已有 lease 安全边界，不会在 collective
-中途回收远端 KV；任一 Rank 或命令通道失败后整组 Executor 不再复用。
+Gloo 仍负责启动期地址协调与容量事实。Rank 0 Engine 使用单在途 cooperative driver 执行 collective，HTTP
+进程不持有 CUDA/NCCL；进程内装配仍可使用 `ExecutionLane`。add/free 先更新 Rank 0 本地 Worker，再在下一 step
+或 shutdown 前顺序发送。这样取消仍服从已有 lease 安全边界，不会在 collective 中途回收远端 KV；HTTP、Rank
+或命令通道任一侧失败后整组 Executor 不再复用。
 
 ## 统一 token-budget 调度
 
@@ -365,8 +371,8 @@ HTTP 的 JSON、SSE 和状态码留在 adapter；容量上限来自 `EngineClien
 OpenAI Completion/Chat 在 adapter 内调用本地 `TextProcessor`，再构造仍以 token ID 驱动的 `GenerateRequest`。
 流式和非流式响应消费同一 Engine event stream；增量 decoder 与 stop matcher 共同保证跨 token/chunk 的 stop 不泄漏，
 timeout、stop 和断连都关闭 stream。tokenizer 禁止联网和 `trust_remote_code`，不会进入 Engine、Scheduler 或 Worker。
-进程拆分时可以新增 `ProcessEngineClient`，但不得
-改变 `EngineClient`、generation 事件或 HTTP adapter。
+进程拆分使用 `ProcessEngineClient` 或连接既有 Engine 的 `ConnectionEngineClient`，但不得改变 `EngineClient`、
+generation 事件或 HTTP adapter。TP 前端和普通 Engine 子进程复用同一请求、取消、指标和错误协议。
 
 ## 性能观察者与监控控制面
 

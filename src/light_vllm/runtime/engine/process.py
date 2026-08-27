@@ -100,7 +100,17 @@ class _Stopped:
     pass
 
 
-_Response = _Started | _StreamEvent | _StreamFailure | _MetricsResult | _ProcessFailure | _Stopped
+_SingleResponse = (
+    _Started | _StreamEvent | _StreamFailure | _MetricsResult | _ProcessFailure | _Stopped
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ResponseBatch:
+    responses: tuple[_SingleResponse, ...]
+
+
+_Response = _SingleResponse | _ResponseBatch
 
 
 @dataclass(slots=True)
@@ -131,7 +141,7 @@ def _remote_error(kind: str, detail: str) -> GenerationError:
 
 
 async def _forward_stream(
-    connection: Connection,
+    responses: asyncio.Queue[_SingleResponse | None],
     engine: EngineClient,
     request_id: int,
     request: GenerateRequest,
@@ -139,11 +149,11 @@ async def _forward_stream(
     events = engine.stream(request)
     try:
         async for event in events:
-            connection.send(_StreamEvent(request_id, event))
+            responses.put_nowait(_StreamEvent(request_id, event))
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        connection.send(
+        responses.put_nowait(
             _StreamFailure(
                 request_id=request_id,
                 kind=_failure_kind(exc),
@@ -156,6 +166,34 @@ async def _forward_stream(
             await close()
 
 
+async def _write_responses(
+    connection: Connection,
+    responses: asyncio.Queue[_SingleResponse | None],
+) -> None:
+    """把同一事件循环轮次已就绪的响应合并成一次 IPC 写入。"""
+
+    while True:
+        first = await responses.get()
+        if first is None:
+            return
+        ready = [first]
+        while not responses.empty():
+            response = responses.get_nowait()
+            if response is None:
+                _send_ready_responses(connection, ready)
+                return
+            ready.append(response)
+        _send_ready_responses(connection, ready)
+
+
+def _send_ready_responses(
+    connection: Connection,
+    responses: list[_SingleResponse],
+) -> None:
+    # 单请求不额外包一层；并发请求才共享一次 pickle、Pipe 写入和前端唤醒。
+    connection.send(responses[0] if len(responses) == 1 else _ResponseBatch(tuple(responses)))
+
+
 def _read_commands(
     connection: Connection,
     loop: asyncio.AbstractEventLoop,
@@ -163,47 +201,82 @@ def _read_commands(
 ) -> None:
     try:
         while True:
-            command = connection.recv()
-            loop.call_soon_threadsafe(commands.put_nowait, command)
+            ready = [connection.recv()]
+            # 一次唤醒交付 Pipe 中已经 ready 的完整 burst，避免第一个请求
+            # 单独启动 Engine；不等待未来命令，也不引入墙钟 batching 窗口。
+            while connection.poll():
+                ready.append(connection.recv())
+            loop.call_soon_threadsafe(_enqueue_commands, commands, tuple(ready))
     except (EOFError, OSError):
-        loop.call_soon_threadsafe(commands.put_nowait, None)
+        # server 可能已经完成关闭；此时 EOF 只是 reader 的最终清理信号。
+        with suppress(RuntimeError):
+            loop.call_soon_threadsafe(commands.put_nowait, None)
 
 
-async def _serve_engine_process(
+def _enqueue_commands(
+    queue: asyncio.Queue[_Command | None],
+    commands: tuple[_Command, ...],
+) -> None:
+    for command in commands:
+        queue.put_nowait(command)
+
+
+async def serve_engine_connection(
     connection: Connection,
     factory: EngineProcessFactory,
 ) -> None:
-    runtime = factory()
-    if not runtime.engine.ready:
-        raise GenerationNotReadyError("engine process did not become ready")
+    """在当前进程服务一条 Engine IPC 连接。"""
 
-    connection.send(
-        _Started(
-            capabilities=runtime.engine.capabilities,
-            snapshot=runtime.performance_metrics.snapshot(),
-        )
-    )
-    commands: asyncio.Queue[_Command | None] = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-    reader = threading.Thread(
-        target=_read_commands,
-        args=(connection, loop, commands),
-        name="light-vllm-engine-ipc-reader",
-        daemon=True,
-    )
-    reader.start()
+    runtime = factory()
     streams: dict[int, asyncio.Task[None]] = {}
+    responses: asyncio.Queue[_SingleResponse | None] | None = None
+    writer: asyncio.Task[None] | None = None
+    graceful_shutdown = False
     try:
+        if not runtime.engine.ready:
+            raise GenerationNotReadyError("engine process did not become ready")
+
+        connection.send(
+            _Started(
+                capabilities=runtime.engine.capabilities,
+                snapshot=runtime.performance_metrics.snapshot(),
+            )
+        )
+        commands: asyncio.Queue[_Command | None] = asyncio.Queue()
+        responses = asyncio.Queue()
+        writer = asyncio.create_task(
+            _write_responses(connection, responses),
+            name="light-vllm-engine-ipc-writer",
+        )
+
+        def wake_on_writer_failure(task: asyncio.Task[None]) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                commands.put_nowait(None)
+
+        writer.add_done_callback(wake_on_writer_failure)
+        loop = asyncio.get_running_loop()
+        reader = threading.Thread(
+            target=_read_commands,
+            args=(connection, loop, commands),
+            name="light-vllm-engine-ipc-reader",
+            daemon=True,
+        )
+        reader.start()
         while True:
             command = await commands.get()
-            if command is None or isinstance(command, _Shutdown):
+            if command is None:
+                if writer.done():
+                    await writer
+                break
+            if isinstance(command, _Shutdown):
+                graceful_shutdown = True
                 break
             if isinstance(command, _StartStream):
                 if command.request_id in streams:
                     raise RuntimeError("duplicate process-engine request ID")
                 task = asyncio.create_task(
                     _forward_stream(
-                        connection,
+                        responses,
                         runtime.engine,
                         command.request_id,
                         command.request,
@@ -221,7 +294,7 @@ async def _serve_engine_process(
                     task.cancel()
                 continue
             if isinstance(command, _ReadMetrics):
-                connection.send(
+                responses.put_nowait(
                     _MetricsResult(
                         call_id=command.call_id,
                         snapshot=runtime.performance_metrics.snapshot(),
@@ -234,8 +307,36 @@ async def _serve_engine_process(
             task.cancel()
         if streams:
             await asyncio.gather(*streams.values(), return_exceptions=True)
-        await runtime.close()
-        connection.send(_Stopped())
+        runtime_closed = False
+        try:
+            await runtime.close()
+            runtime_closed = True
+        finally:
+            if writer is not None and responses is not None:
+                if graceful_shutdown and runtime_closed:
+                    if not writer.done():
+                        responses.put_nowait(_Stopped())
+                        responses.put_nowait(None)
+                    await writer
+                else:
+                    writer.cancel()
+                    await asyncio.gather(writer, return_exceptions=True)
+
+
+def run_engine_server(
+    connection: Connection,
+    factory: EngineProcessFactory,
+) -> None:
+    """运行 Engine IPC server；异常会通知对端并继续向调用方传播。"""
+
+    try:
+        asyncio.run(serve_engine_connection(connection, factory))
+    except BaseException as exc:
+        with suppress(BrokenPipeError, EOFError, OSError):
+            connection.send(_ProcessFailure(f"engine process failed: {type(exc).__name__}: {exc}"))
+        raise
+    finally:
+        connection.close()
 
 
 def _engine_process_main(
@@ -243,39 +344,34 @@ def _engine_process_main(
     factory: EngineProcessFactory,
 ) -> None:
     try:
-        asyncio.run(_serve_engine_process(connection, factory))
-    except BaseException as exc:
-        with suppress(BrokenPipeError, EOFError, OSError):
-            connection.send(_ProcessFailure(f"engine process failed: {type(exc).__name__}: {exc}"))
-    finally:
-        connection.close()
+        run_engine_server(connection, factory)
+    except BaseException:
+        # 对端已经收到结构化失败；子进程只需结束，不重复打印 traceback。
+        return
 
 
-class ProcessEngineClient:
-    """通过一条双向管道访问独立进程中的 Engine。
+class ConnectionEngineClient:
+    """通过一条已建立的双向连接访问远端 Engine。
 
-    HTTP 进程只负责协议转换；Scheduler、KV 与 CUDA 生命周期都留在子进程。
-    每个请求仍保持独立事件流，取消只影响对应请求。
+    客户端不拥有远端进程，只负责请求流、取消、指标和关闭握手。进程由谁
+    创建属于 composition root；普通 Engine 子进程和 torchrun rank 0 共用
+    这一协议实现。
     """
 
     def __init__(
         self,
-        factory: EngineProcessFactory,
+        connection: Connection,
         *,
-        start_method: str = "spawn",
         startup_timeout_seconds: float = 600.0,
         shutdown_timeout_seconds: float = 30.0,
         metrics_timeout_seconds: float = 5.0,
     ) -> None:
-        self._factory = factory
-        self._context = multiprocessing.get_context(start_method)
+        self._connection = connection
         self._startup_timeout_seconds = startup_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._metrics_timeout_seconds = metrics_timeout_seconds
         self._capabilities = EngineCapabilities()
         self._snapshot: PerformanceSnapshot | None = None
-        self._connection: Connection | None = None
-        self._process: multiprocessing.Process | None = None
         self._reader: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._started_future: asyncio.Future[None] | None = None
@@ -290,14 +386,12 @@ class ProcessEngineClient:
 
     @property
     def ready(self) -> bool:
-        process = self._process
         return (
             not self._closing
             and self._started_future is not None
             and self._started_future.done()
             and self._started_future.exception() is None
-            and process is not None
-            and process.is_alive()
+            and not self._stopped.is_set()
         )
 
     @property
@@ -310,16 +404,6 @@ class ProcessEngineClient:
             return
         self._loop = asyncio.get_running_loop()
         self._started_future = self._loop.create_future()
-        parent, child = self._context.Pipe(duplex=True)
-        self._connection = parent
-        self._process = self._context.Process(
-            target=_engine_process_main,
-            args=(child, self._factory),
-            name="light-vllm-engine-process",
-            daemon=True,
-        )
-        self._process.start()
-        child.close()
         self._reader = threading.Thread(
             target=self._read_responses,
             name="light-vllm-engine-response-reader",
@@ -400,47 +484,44 @@ class ProcessEngineClient:
                 self._metric_waiters.pop(call_id, None)
 
     async def close(self) -> None:
-        process = self._process
-        if process is None:
+        if self._closing:
             return
         self._closing = True
-        if process.is_alive():
+        if not self._stopped.is_set():
             with suppress(BrokenPipeError, EOFError, OSError):
                 self._send(_Shutdown())
             await asyncio.to_thread(
                 self._stopped.wait,
                 self._shutdown_timeout_seconds,
             )
-            await asyncio.to_thread(process.join, self._shutdown_timeout_seconds)
-            if process.is_alive():
-                process.terminate()
-                await asyncio.to_thread(process.join, self._shutdown_timeout_seconds)
-        connection = self._connection
-        if connection is not None:
-            connection.close()
-        self._process = None
+        self._connection.close()
 
     def _send(self, command: _Command) -> None:
-        connection = self._connection
-        if connection is None:
-            raise GenerationNotReadyError("engine process is not started")
         with self._send_lock:
-            connection.send(command)
+            self._connection.send(command)
 
     def _read_responses(self) -> None:
-        connection = self._connection
         loop = self._loop
-        assert connection is not None and loop is not None
+        assert loop is not None
         try:
             while True:
-                response = connection.recv()
+                response = self._connection.recv()
                 loop.call_soon_threadsafe(self._dispatch, response)
-                if isinstance(response, _Stopped):
+                if isinstance(response, _Stopped) or (
+                    isinstance(response, _ResponseBatch)
+                    and any(isinstance(item, _Stopped) for item in response.responses)
+                ):
                     return
         except (EOFError, OSError):
-            loop.call_soon_threadsafe(self._lost)
+            # 客户端事件循环可能与连接同时关闭，reader 不应制造线程异常。
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._lost)
 
     def _dispatch(self, response: _Response) -> None:
+        if isinstance(response, _ResponseBatch):
+            for item in response.responses:
+                self._dispatch(item)
+            return
         if isinstance(response, _Started):
             self._capabilities = response.capabilities
             self._snapshot = response.snapshot
@@ -489,3 +570,93 @@ class ProcessEngineClient:
         for waiter in waiters:
             waiter.error = error
             waiter.ready.set()
+
+
+class ProcessEngineClient:
+    """创建并访问独立 Engine 子进程。"""
+
+    def __init__(
+        self,
+        factory: EngineProcessFactory,
+        *,
+        start_method: str = "spawn",
+        startup_timeout_seconds: float = 600.0,
+        shutdown_timeout_seconds: float = 30.0,
+        metrics_timeout_seconds: float = 5.0,
+    ) -> None:
+        self._factory = factory
+        self._context = multiprocessing.get_context(start_method)
+        self._startup_timeout_seconds = startup_timeout_seconds
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._metrics_timeout_seconds = metrics_timeout_seconds
+        self._client: ConnectionEngineClient | None = None
+        self._process: multiprocessing.Process | None = None
+
+    @property
+    def ready(self) -> bool:
+        process = self._process
+        return (
+            self._client is not None
+            and self._client.ready
+            and process is not None
+            and process.is_alive()
+        )
+
+    @property
+    def capabilities(self) -> EngineCapabilities:
+        if self._client is None:
+            return EngineCapabilities()
+        return self._client.capabilities
+
+    async def start(self) -> None:
+        if self._client is not None:
+            await self._client.start()
+            return
+        parent, child = self._context.Pipe(duplex=True)
+        process = self._context.Process(
+            target=_engine_process_main,
+            args=(child, self._factory),
+            name="light-vllm-engine-process",
+            daemon=True,
+        )
+        process.start()
+        child.close()
+        self._process = process
+        self._client = ConnectionEngineClient(
+            parent,
+            startup_timeout_seconds=self._startup_timeout_seconds,
+            shutdown_timeout_seconds=self._shutdown_timeout_seconds,
+            metrics_timeout_seconds=self._metrics_timeout_seconds,
+        )
+        try:
+            await self._client.start()
+        except BaseException:
+            await self.close()
+            raise
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        return await self._require_client().generate(request)
+
+    def stream(self, request: GenerateRequest) -> AsyncGenerator[GenerationEvent, None]:
+        return self._require_client().stream(request)
+
+    def snapshot(self) -> PerformanceSnapshot:
+        return self._require_client().snapshot()
+
+    async def close(self) -> None:
+        process = self._process
+        client = self._client
+        if process is None:
+            return
+        if client is not None:
+            await client.close()
+        await asyncio.to_thread(process.join, self._shutdown_timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            await asyncio.to_thread(process.join, self._shutdown_timeout_seconds)
+        self._process = None
+
+    def _require_client(self) -> ConnectionEngineClient:
+        if self._client is None:
+            raise GenerationNotReadyError("engine process is not started")
+        return self._client

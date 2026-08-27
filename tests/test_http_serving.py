@@ -1,8 +1,10 @@
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from types import SimpleNamespace
 
 import pytest
+import torch
 from fastapi.testclient import TestClient
 
 from light_vllm import (
@@ -17,8 +19,10 @@ from light_vllm import (
     ModelSpec,
     TokenGenerated,
 )
+from light_vllm.entrypoints import http as http_entrypoint
 from light_vllm.entrypoints.http import (
     _create_parser,
+    _HttpFrontendConfig,
     _initialize_tensor_parallel,
     create_serving_app,
 )
@@ -233,6 +237,56 @@ def test_cli_rejects_gloo_with_a_cuda_device(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(ValueError, match="Gloo.*cpu"):
         _initialize_tensor_parallel(args)
+
+
+def test_tensor_parallel_rank_zero_delegates_http_to_a_frontend_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _create_parser().parse_args(
+        [
+            "--runtime",
+            "engine",
+            "--loader",
+            "safetensors",
+            "--weights",
+            "test-model",
+            "--tokenizer",
+            "test-tokenizer",
+            "--device",
+            "cpu",
+            "--distributed-backend",
+            "gloo",
+            "--tensor-parallel-size",
+            "2",
+            "--num-kv-blocks",
+            "16",
+        ]
+    )
+    group = SimpleNamespace(rank=0, world_size=2, device=torch.device("cpu"))
+    captured: dict[str, object] = {}
+
+    def run_leader(spec, config, received_group, frontend) -> None:
+        captured.update(
+            spec=spec,
+            config=config,
+            group=received_group,
+            frontend=frontend,
+        )
+
+    monkeypatch.setattr(http_entrypoint, "_run_tensor_parallel_leader", run_leader)
+
+    http_entrypoint._run_http_entrypoint(args, group)  # type: ignore[arg-type]
+
+    spec = captured["spec"]
+    frontend = captured["frontend"]
+    assert isinstance(spec, ModelSpec)
+    assert isinstance(frontend, _HttpFrontendConfig)
+    assert spec.tensor_parallel is not None
+    assert spec.tensor_parallel.rank == 0
+    assert captured["group"] is group
+    assert frontend.tokenizer is not None
+    assert frontend.tokenizer.name == "test-tokenizer"
+    assert frontend.served_model_name == "test-model"
 
 
 @pytest.mark.parametrize("value", ("0", "nan", "inf", "-inf"))

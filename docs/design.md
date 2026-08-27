@@ -169,12 +169,15 @@ AllGather 恢复完整 logits。KV head 数不少于 TP 时按 head 切分；少
 只看到本 Rank 的普通 GQA 规格。并行层公开 `checkpoint_shards`，safetensors loader 据此取连续切片，不认识 Qwen
 参数名。TP=1 使用无通信 collective，保留相同参数名、形状和 forward。
 
-进程拓扑也保持单一职责：Rank 0 独占 Engine、Scheduler、逻辑 KV 和 HTTP；它广播现有 `ExecutionBatch`，每个
-Rank 用同一 `LocalModelWorker` 管理本地分片参数和物理 KV。设备 tensor 用 NCCL，Worker 命令走可替换命令通道：
-单机 POSIX 默认使用有序 Unix socket，跨主机或显式配置时回退 Gloo。Gloo 仍负责启动期地址协调和容量事实，避免
-在每个 decode step 上执行 Python object collective。KV 自动规划先在每张卡本地计算，再取所有 Rank 的最小页数，
-使逻辑容量不会超过任一物理页池。请求取消先进入 Rank 0 已有 lease 边界，远端 free 只在当前 model step 结束后
-按序送达；任一 Rank 或命令通道失败后整组状态直接作废。
+进程拓扑也保持单一职责：Rank 0 独占 Engine、Scheduler 和逻辑 KV；HTTP/tokenizer 在独立 spawn 进程中通过
+`ConnectionEngineClient` 访问 Rank 0，避免同步模型 step 阻塞 ASGI writer。Rank 0 广播现有 `ExecutionBatch`，
+每个 Rank 用同一 `LocalModelWorker` 管理本地分片参数和物理 KV。模型 tensor 通过一个独立 communicator 在当前
+模型 CUDA stream 上执行 NCCL，保持计算和每层 collective 的自然依赖，避免 ProcessGroup 独立通信 stream 的
+跨 stream 同步。Worker 命令走可替换命令通道：单机 POSIX 默认使用有序 Unix socket，跨主机或显式配置时回退
+Gloo。Gloo 仍负责启动期地址协调和容量事实，避免在每个 decode step 上执行 Python object collective。KV 自动
+规划先在每张卡本地计算，再取所有 Rank 的最小页数，使逻辑容量不会超过任一物理页池。请求取消先进入 Rank 0
+已有 lease 边界，远端 free 只在当前 model step
+结束后按序送达；HTTP、Rank 或命令通道任一侧失败后连接关闭，整组状态直接作废。
 
 ## 5. 一次迭代
 
@@ -225,9 +228,10 @@ sequenceDiagram
 ```
 
 Engine 每次只允许一个 `PreparedStep` 在模型侧执行。它在锁内完成 schedule、构造不可变 `ExecutionBatch` 并取得
-lease。默认路径由 Engine 私有的 `ExecutionLane` 交给同一个常驻线程执行；独立 Engine 进程则在自己的事件循环
-内协作式执行同步 Executor，避免每个 token 的跨线程提交开销。协作式路径在提交上一轮结果前推进已经到达的 IPC
-控制任务，并在下一步模型执行前推进已经发布的请求事件；检查点不等待墙钟，只给 ready task 公平执行机会。
+lease。默认路径由 Engine 私有的 `ExecutionLane` 交给同一个常驻线程执行；独立 Engine 进程以及 TP Rank 0
+Engine 则在自己的事件循环内协作式执行同步 Executor，避免每个 token 的跨线程提交开销。TP 的 HTTP writer 位于
+另一个进程，不和同步 collective 争用该事件循环。协作式路径在提交上一轮结果前推进已经到达的 IPC 控制任务，
+并在下一步模型执行前推进已经发布的请求事件；检查点不等待墙钟，只给 ready task 公平执行机会。
 设备越过安全边界并释放 lease 后，Engine 仍在一个锁区内提交上一轮 `CompletedStep`、应用可见 token 并准备
 下一轮。两条执行路径都只传递批次和结果，不拥有请求或 KV 状态。这个单在途状态机让取消与 KV 所有权保持明确，
 并把相邻轮次的 finish、apply、schedule 和 Scheduler 快照收敛成一次原子状态推进。
@@ -417,6 +421,7 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也�
 | chain/trie 树形投机解码 | `src/light_vllm/runtime/execution/speculative.py` |
 | 本地 Executor | `src/light_vllm/runtime/execution/local.py` |
 | torchrun / TP Executor | `src/light_vllm/runtime/execution/distributed.py` |
+| current-stream NCCL backend | `src/light_vllm/runtime/execution/nccl.py` |
 | 执行 step 计时 | `src/light_vllm/runtime/execution/timing.py` |
 | 本地 Worker | `src/light_vllm/runtime/execution/worker.py` |
 | Dense Attention | `src/light_vllm/runtime/execution/dense_attention.py` |
@@ -428,6 +433,7 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也�
 | EngineClient | `src/light_vllm/runtime/engine/interfaces.py` |
 | 性能观察契约 | `src/light_vllm/runtime/observability/interfaces.py` |
 | 进程内性能聚合 | `src/light_vllm/runtime/observability/performance.py` |
+| Engine 进程 IPC | `src/light_vllm/runtime/engine/process.py` |
 | 性能观察者隔离 | `src/light_vllm/runtime/observability/dispatch.py` |
 | HTTP adapter | `src/light_vllm/serving/http.py` |
 | 文本处理契约 | `src/light_vllm/serving/interfaces.py` |

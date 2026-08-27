@@ -5,6 +5,8 @@
 
 ```text
 HTTP 父进程 → ProcessEngineClient → Engine 子进程 → Worker → GPU
+
+TP: HTTP 子进程 → ConnectionEngineClient → torchrun Rank 0 Engine → Rank Worker → GPU
 ```
 
 部署配置只存在于控制面，不修改 `EngineCore`、Scheduler、Worker 或模型热路径。因此同一运行参数下，
@@ -78,7 +80,8 @@ docker compose \
 ```
 
 `compose.tp2.yaml` 使用 Compose 的 `!override` 标签把单卡 GPU 申请替换成两卡，避免列表合并后同时保留 1 卡和
-2 卡设备申请。TP 已经提供 torchrun 进程边界，因此覆盖后的命令不再使用 `--engine-process`。
+2 卡设备申请。TP 的 Rank 0 Engine 会自动 spawn 独立 HTTP/tokenizer 前端，因此覆盖后的命令不再使用
+`--engine-process`。
 
 ## 3. Kubernetes
 
@@ -94,8 +97,8 @@ kubectl apply -k deploy/kubernetes/base
 2. 根据集群 StorageClass 调整 PVC，并预先把模型放进 `light-vllm-models`；
 3. 根据 GPU 和 workload 调整并发、单轮 token budget、KV 比例以及 CPU/内存 requests。
 
-`startupProbe` 最多给模型加载 10 分钟；`readinessProbe` 检查模型与 Engine 子进程是否就绪；
-启动完成后的 `livenessProbe` 也检查 `/readyz`，Engine 子进程死亡时会重建 Pod。终止时 K8s 先摘除 Pod，
+`startupProbe` 最多给模型加载 10 分钟；`readinessProbe` 检查模型与 Engine 连接是否就绪；
+启动完成后的 `livenessProbe` 也检查 `/readyz`，Engine 或 TP 前端死亡时会重建 Pod。终止时 K8s 先摘除 Pod，
 再给进程 180 秒完成已有请求和释放 CUDA。
 已有的 Prometheus、Grafana 和 HPA 示例继续位于 `examples/monitoring/`。
 
