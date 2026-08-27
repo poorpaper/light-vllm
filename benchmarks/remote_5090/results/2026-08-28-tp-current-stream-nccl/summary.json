@@ -1,0 +1,124 @@
+{
+  "date": "2026-08-28",
+  "hardware": {
+    "gpus": "2 x NVIDIA GeForce RTX 5090 32607 MiB",
+    "topology": "NODE",
+    "cuda_p2p": false,
+    "driver": "580.105.08"
+  },
+  "software": {
+    "python": "3.12.13",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "torch_nccl": "2.28.9",
+    "triton": "3.6.0",
+    "vllm": "0.26.0"
+  },
+  "workload": {
+    "model": "Qwen2.5-Coder-7B-Instruct",
+    "dtype": "bfloat16",
+    "tensor_parallel_size": 2,
+    "requests": 16,
+    "output_tokens_per_request": 512,
+    "output_tokens_per_run": 8192,
+    "arrival": "burst",
+    "formal_runs": 3,
+    "warmup_excluded": true,
+    "workload_sha256": "e47f4f9148fd6d91d81a4fd6fc17a0eaf3988f264e34c9fc77191e24a81e12b0",
+    "model_config_sha256": "c0242402ad6a13b331ea320feea8c7e3776ffb7a4eff0757b9cd667e116d9a28"
+  },
+  "method": {
+    "primary": "three service-restart pairs in light-vllm then vLLM order",
+    "aggregation": "median of per-run metrics",
+    "vllm_enforce_eager": true,
+    "vllm_disable_custom_all_reduce": true,
+    "vllm_collective_backend": "PYNCCL",
+    "prefix_cache": false,
+    "speculative_decoding": false
+  },
+  "before": {
+    "light_vllm": {
+      "ttft_p95_ms": [85.409485, 82.015614, 82.796992],
+      "ttft_p95_median_ms": 82.796992,
+      "throughput_tokens_per_s": [1249.575645, 1230.235004, 1251.807813],
+      "throughput_median_tokens_per_s": 1249.575645
+    },
+    "vllm": {
+      "ttft_p95_ms": [77.035625, 71.912614, 84.208251],
+      "ttft_p95_median_ms": 77.035625,
+      "throughput_tokens_per_s": [1248.328686, 1295.168798, 1247.824704],
+      "throughput_median_tokens_per_s": 1248.328686
+    },
+    "light_minus_vllm_ttft_p95_ms": 5.761366
+  },
+  "backend_isolation": {
+    "process_group": {
+      "ttft_p95_median_ms": 80.407939,
+      "throughput_median_tokens_per_s": 1299.248493,
+      "tpot_p50_median_ms": 12.150113
+    },
+    "current_stream_pynccl": {
+      "ttft_p95_median_ms": 66.190120,
+      "throughput_median_tokens_per_s": 1543.911524,
+      "tpot_p50_median_ms": 10.226688
+    },
+    "vllm": {
+      "ttft_p95_median_ms": 73.916626,
+      "throughput_median_tokens_per_s": 1254.381844,
+      "tpot_p50_median_ms": 12.607980
+    }
+  },
+  "after": {
+    "light_vllm": {
+      "ttft_p95_ms": [42.622817, 73.812606, 84.993910],
+      "ttft_p95_median_ms": 73.812606,
+      "throughput_tokens_per_s": [1478.740983, 1477.873696, 1509.022019],
+      "throughput_median_tokens_per_s": 1478.740983
+    },
+    "vllm": {
+      "ttft_p95_ms": [74.555028, 90.482953, 73.796361],
+      "ttft_p95_median_ms": 74.555028,
+      "throughput_tokens_per_s": [1291.498863, 1236.046007, 1313.812242],
+      "throughput_median_tokens_per_s": 1291.498863
+    },
+    "light_minus_vllm_ttft_p95_ms": -0.742422,
+    "light_vs_vllm_throughput_percent": 114.498048,
+    "light_ttft_change_ms": -8.984386,
+    "light_throughput_change_percent": 18.339453
+  },
+  "exact_source_recheck": {
+    "source_files_sha256": {
+      "distributed.py": "2a83d2203aea5e57093d79c686cf1ef08f9cadf423f15d71f862752e816cd1ea",
+      "nccl.py": "d89331eec56f4268515828694c70330992b88d717009b711b909c7fd9cd68462"
+    },
+    "ttft_p95_ms": [70.341323, 50.116073, 48.585341],
+    "ttft_p95_median_ms": 50.116073,
+    "throughput_tokens_per_s": [1501.118449, 1535.524002, 1508.116494],
+    "throughput_median_tokens_per_s": 1508.116494,
+    "successful_requests_per_run": 16,
+    "output_tokens_per_run": 8192
+  },
+  "correctness": {
+    "prompts": 4,
+    "output_tokens_per_prompt": 8,
+    "formal_repeats": 2,
+    "mismatched_requests": 0,
+    "expected_token_ids": [3190, 262, 38893, 279, 1584, 315, 264, 1681]
+  },
+  "rank_failure": {
+    "killed_local_rank": 1,
+    "exit_elapsed_ms": 968,
+    "timed_out": false,
+    "port_released": true,
+    "gpu_memory_released": true,
+    "remaining_server_pids": []
+  },
+  "raw_evidence": {
+    "remote_before": "/root/autodl-tmp/tp-ttft-recheck-20260828-0138/",
+    "remote_backend_isolation": "/root/tp-ttft-candidate-20260828/",
+    "remote_after": "/root/tp-ttft-native-ab-20260828/",
+    "remote_exact_source": "/root/tp-ttft-cr-final-20260828/",
+    "remote_correctness": "/root/tp-ttft-cr-final-correctness-20260828/",
+    "remote_rank_failure": "/root/tp-ttft-cr-final-failure-20260828/"
+  }
+}

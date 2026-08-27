@@ -292,6 +292,19 @@ Unix socket 后降至约 `0.170 ms/step`，而 NCCL 仍只负责模型 tensor co
 释放且显存归零。完整条件与边界见
 [TP 控制路径优化验收](benchmarks/remote_5090/results/2026-08-26-tp-control-path/REPORT.md)。
 
+### TP=2 current-stream NCCL
+
+在双 RTX 5090（`NODE`、无 P2P）上进一步复核 TTFT 后，定位到 `ProcessGroupNCCL` 独立通信 stream 在逐层
+collective 关键路径上的同步开销。模型 AllReduce/AllGather 改为在当前 CUDA stream 上执行后，固定 `16×512`
+decode 的三轮服务重启 A/B 中，light-vllm 相对 vLLM eager 的 TTFT P95 中位数差值从 `+5.761 ms` 变为
+`-0.742 ms`；吞吐中位数为 `1478.74` 与 `1291.50 tok/s`。该结果只覆盖报告中的模型、硬件与负载，不外推到
+其他拓扑。
+
+![TP2 current-stream NCCL 与 vLLM 对比](benchmarks/remote_5090/results/2026-08-28-tp-current-stream-nccl/tp-ttft-vllm-comparison.png)
+
+逐轮散点、隔离实验、最终源码复测、正确性与 Rank 故障退出证据见
+[TP2 current-stream NCCL 实验报告](benchmarks/remote_5090/results/2026-08-28-tp-current-stream-nccl/REPORT.md)。
+
 ## 运行时边界
 
 - `reference` 是无调度、全序列重算的语义基线；`engine` 才使用 token budget、KV cache 和增量执行。
