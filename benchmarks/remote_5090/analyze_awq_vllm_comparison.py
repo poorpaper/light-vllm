@@ -6,8 +6,9 @@ import hashlib
 import json
 import statistics
 from collections import defaultdict
+from itertools import combinations, product
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 METRICS = {
     "output_tokens_per_s": ("Output throughput", "tok/s", True),
@@ -77,51 +78,79 @@ def _token_outputs(payload: dict[str, Any]) -> dict[str, list[int]]:
     }
 
 
-def _validate_outputs(grouped: dict[tuple[str, str], list[dict[str, Any]]]) -> None:
-    """同一实现的重复轮次必须产生完全相同的 greedy token。"""
-
-    for (workload, backend), runs in grouped.items():
-        expected = _token_outputs(runs[0]["payload"])
-        for run in runs[1:]:
-            actual = _token_outputs(run["payload"])
-            if actual != expected:
-                run_path = cast(Path, run["path"])
-                raise ValueError(
-                    f"non-deterministic output for {workload}/{backend}: "
-                    f"{run_path.relative_to(run_path.parents[2])}"
-                )
-
-
-def _compare_outputs(
-    grouped: dict[tuple[str, str], list[dict[str, Any]]], workload: str
+def _compare_output_pair(
+    left: dict[str, list[int]],
+    right: dict[str, list[int]],
+    workload: str,
 ) -> dict[str, Any]:
-    """记录实现间数值路径造成的 token 差异，不把它伪装成性能失败。"""
-
-    light = _token_outputs(grouped[(workload, "light-vllm")][0]["payload"])
-    vllm = _token_outputs(grouped[(workload, "vllm")][0]["payload"])
-    if light.keys() != vllm.keys():
-        raise ValueError(f"request IDs differ between backends for {workload}")
+    if left.keys() != right.keys():
+        raise ValueError(f"request IDs differ between output runs for {workload}")
 
     exact_requests = 0
     matching_positions = 0
     total_positions = 0
-    for request_id in light:
-        light_tokens = light[request_id]
-        vllm_tokens = vllm[request_id]
-        if len(light_tokens) != len(vllm_tokens):
+    for request_id in left:
+        left_tokens = left[request_id]
+        right_tokens = right[request_id]
+        if len(left_tokens) != len(right_tokens):
             raise ValueError(f"output lengths differ for {workload}/{request_id}")
-        exact_requests += light_tokens == vllm_tokens
+        exact_requests += left_tokens == right_tokens
         matching_positions += sum(
-            left == right for left, right in zip(light_tokens, vllm_tokens, strict=True)
+            left_token == right_token
+            for left_token, right_token in zip(left_tokens, right_tokens, strict=True)
         )
-        total_positions += len(light_tokens)
+        total_positions += len(left_tokens)
     return {
-        "requests": len(light),
-        "exact_request_matches": exact_requests,
-        "matching_token_positions": matching_positions,
-        "total_token_positions": total_positions,
+        "exact_output": exact_requests == len(left),
+        "exact_request_percent": exact_requests / len(left) * 100,
         "matching_token_percent": matching_positions / total_positions * 100,
     }
+
+
+def _pairwise_output_summary(
+    left_runs: list[dict[str, Any]],
+    right_runs: list[dict[str, Any]],
+    workload: str,
+    *,
+    same_backend: bool,
+) -> dict[str, Any]:
+    """汇总所有轮次对，避免挑选一轮掩盖 batch-sensitive greedy 差异。"""
+
+    left_outputs = [_token_outputs(run["payload"]) for run in left_runs]
+    right_outputs = [_token_outputs(run["payload"]) for run in right_runs]
+    if same_backend:
+        pairs = combinations(left_outputs, 2)
+        distinct_maps = len(
+            {
+                hashlib.sha256(
+                    json.dumps(output, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                for output in left_outputs
+            }
+        )
+    else:
+        pairs = product(left_outputs, right_outputs)
+        distinct_maps = None
+    comparisons = [_compare_output_pair(left, right, workload) for left, right in pairs]
+    request_percent = [comparison["exact_request_percent"] for comparison in comparisons]
+    token_percent = [comparison["matching_token_percent"] for comparison in comparisons]
+    result = {
+        "run_pairs": len(comparisons),
+        "exact_output_pairs": sum(comparison["exact_output"] for comparison in comparisons),
+        "exact_request_percent": {
+            "median": statistics.median(request_percent),
+            "min": min(request_percent),
+            "max": max(request_percent),
+        },
+        "matching_token_percent": {
+            "median": statistics.median(token_percent),
+            "min": min(token_percent),
+            "max": max(token_percent),
+        },
+    }
+    if distinct_maps is not None:
+        result["distinct_output_maps"] = distinct_maps
+    return result
 
 
 def _metric_value(summary: dict[str, Any], metric: str) -> float:
@@ -162,8 +191,26 @@ def _summarize(
     return {
         "measurement_runs_per_backend": EXPECTED_RUNS,
         "workloads": workloads,
+        "output_stability": {
+            workload: {
+                backend: _pairwise_output_summary(
+                    grouped[(workload, backend)],
+                    grouped[(workload, backend)],
+                    workload,
+                    same_backend=True,
+                )
+                for backend in BACKENDS
+            }
+            for workload in sorted(workloads)
+        },
         "output_comparison": {
-            workload: _compare_outputs(grouped, workload) for workload in sorted(workloads)
+            workload: _pairwise_output_summary(
+                grouped[(workload, "light-vllm")],
+                grouped[(workload, "vllm")],
+                workload,
+                same_backend=False,
+            )
+            for workload in sorted(workloads)
         },
     }
 
@@ -252,19 +299,32 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
                 item = values[metric]
                 cells.append(f"{item['median']:.2f} ({item['min']:.2f}–{item['max']:.2f})")
             lines.append(f"| {workload} | {backend} | " + " | ".join(cells) + " |")
-    lines.extend(("", "实现间 greedy 输出对照："))
+    lines.extend(("", "同一实现的 greedy 输出稳定性（全部 15 个轮次对）："))
+    for workload, systems in summary["output_stability"].items():
+        for backend in BACKENDS:
+            stability = systems[backend]
+            token_match = stability["matching_token_percent"]
+            lines.append(
+                f"- {workload} / {backend}: {stability['distinct_output_maps']} 个输出 map；"
+                f"{stability['exact_output_pairs']}/{stability['run_pairs']} 个轮次对完全一致；"
+                f"同位置 token-ID 匹配率中位数 {token_match['median']:.2f}% "
+                f"（{token_match['min']:.2f}%–{token_match['max']:.2f}%）。"
+            )
+    lines.extend(("", "实现间 greedy 输出对照（全部 36 个跨实现轮次对）："))
     for workload, comparison in summary["output_comparison"].items():
+        request_match = comparison["exact_request_percent"]
+        token_match = comparison["matching_token_percent"]
         lines.append(
-            f"- {workload}: {comparison['exact_request_matches']}/{comparison['requests']} "
-            f"个请求逐 token 完全一致；同位置 token-ID 匹配率 "
-            f"{comparison['matching_token_percent']:.2f}%。"
+            f"- {workload}: 完全一致请求比例中位数 {request_match['median']:.2f}% "
+            f"（{request_match['min']:.2f}%–{request_match['max']:.2f}%）；"
+            f"同位置 token-ID 匹配率中位数 {token_match['median']:.2f}% "
+            f"（{token_match['min']:.2f}%–{token_match['max']:.2f}%）。"
         )
     lines.extend(
         (
             "",
-            "所有测量轮次必须零请求失败、达到固定输出长度，并在同一实现的六轮间产生一致 token；"
-            "否则分析脚本直接失败。实现间差异单独如实记录，因为不同量化 kernel 的数值路径"
-            "可能改变长序列 greedy 输出。",
+            "所有测量轮次必须零请求失败、达到固定输出长度并保持相同请求集合；否则分析脚本"
+            "直接失败。轮次内或实现间的 token 差异不会被丢弃，而是用全部轮次对如实统计。",
             "同位置 token-ID 匹配率不是质量指标；logits、PPL 或任务质量需要由独立质量验收给出，"
             "不能由这组性能压测推断。",
             "该结果只覆盖记录中的机器、模型和 workload，不能外推为所有场景下普遍优于 vLLM。",
@@ -295,7 +355,6 @@ def main() -> None:
 
     result_dir = args.result_dir.resolve()
     grouped = _load_runs(result_dir)
-    _validate_outputs(grouped)
     summary = _summarize(grouped)
     (result_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
