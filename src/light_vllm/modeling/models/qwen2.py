@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import sqrt
-from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -217,6 +216,8 @@ class Qwen2MLP(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        if not isinstance(self.down_proj, RowParallelLayer):
+            raise TypeError("LinearMethod.create_row must return a row-parallel layer")
         self._needs_output_reduction = parallel.world_size > 1
         self.register_buffer("_merged_gate_up_weight_t", None, persistent=False)
         self.register_buffer("_down_proj_weight_t", None, persistent=False)
@@ -243,8 +244,7 @@ class Qwen2MLP(nn.Module):
         if not self._needs_output_reduction:
             # TP=1 保留原来的直通热路径，不为无通信场景调用 collective 适配层。
             return local_output
-        down_proj = cast(RowParallelLayer, self.down_proj)
-        return down_proj.reduce_output(local_output)
+        return self.down_proj.reduce_output(local_output)
 
     def prepare_for_inference(self) -> None:
         """Pack checkpoint-compatible Gate/Up weights into one inference GEMM."""
@@ -343,6 +343,8 @@ class Qwen2Attention(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        if not isinstance(self.o_proj, RowParallelLayer):
+            raise TypeError("LinearMethod.create_row must return a row-parallel layer")
         self._needs_output_reduction = parallel.world_size > 1
         self.register_buffer("_merged_qkv_weight_t", None, persistent=False)
         self.register_buffer("_merged_qkv_bias", None, persistent=False)
@@ -414,8 +416,7 @@ class Qwen2Attention(nn.Module):
             return self.o_proj(attended)
         if not self._needs_output_reduction:
             return local_output
-        o_proj = cast(RowParallelLayer, self.o_proj)
-        return o_proj.reduce_output(local_output)
+        return self.o_proj.reduce_output(local_output)
 
     def prepare_for_inference(self) -> None:
         """Pack checkpoint-compatible Q/K/V weights into one inference GEMM."""

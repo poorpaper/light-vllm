@@ -10,6 +10,16 @@ class ModelLoadError(RuntimeError):
     """模型加载失败时抛出。"""
 
 
+def _require_dense_quantization(spec: ModelSpec, loader_name: str) -> None:
+    """没有量化元数据解析能力的 loader 只能构造 Dense 模型。"""
+
+    if spec.quantization not in {"auto", "none"}:
+        raise ModelLoadError(
+            f"the {loader_name} loader does not support explicit quantization "
+            f"'{spec.quantization}'; use the safetensors loader"
+        )
+
+
 def _prepare_for_inference(model: nn.Module, spec: ModelSpec) -> nn.Module:
     model = model.to(device=spec.device, dtype=spec.dtype).eval()
     prepare = getattr(model, "prepare_for_inference", None)
@@ -24,6 +34,7 @@ class InitModelLoader:
     """创建新模型，不读取权重文件。"""
 
     def load(self, spec: ModelSpec, factory: ModelFactory) -> nn.Module:
+        _require_dense_quantization(spec, "init")
         return _prepare_for_inference(factory(spec), spec)
 
 
@@ -34,6 +45,7 @@ class StateDictModelLoader:
         self._strict = strict
 
     def load(self, spec: ModelSpec, factory: ModelFactory) -> nn.Module:
+        _require_dense_quantization(spec, "state-dict")
         if spec.weights is None:
             raise ModelLoadError("the state-dict loader requires ModelSpec.weights")
 

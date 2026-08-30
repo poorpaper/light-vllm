@@ -11,9 +11,11 @@ from torch import Tensor, nn
 
 from light_vllm.modeling.quantization.dense import DenseLinearMethod
 from light_vllm.modeling.quantization.interfaces import (
+    ColumnParallelLayer,
     DirectLinear,
     LinearOperation,
     PreparedLinear,
+    RowParallelLayer,
 )
 from light_vllm.modeling.tensor_parallel import (
     ColumnParallelLinear,
@@ -360,6 +362,30 @@ class QuantizedAWQWeight:
     dequantized: Tensor
 
 
+def _quantize_awq_groups(
+    weight: Tensor,
+    group_size: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """按输入维分组，返回 ``(INT4 值, zero, scale)``。
+
+    搜索阶段和 checkpoint 导出必须共用这套非对称量化规则；scale 先落到
+    权重 dtype，再据此计算 zero 和 INT4，保证伪量化结果与最终文件一致。
+    """
+
+    width = weight.shape[-1]
+    effective_group_size = width if group_size == -1 else group_size
+    if effective_group_size <= 0 or width % effective_group_size:
+        raise ValueError("AWQ group_size must divide the weight input dimension")
+    grouped = weight.float().reshape(*weight.shape[:-1], -1, effective_group_size)
+    minimum = grouped.amin(dim=-1, keepdim=True)
+    maximum = grouped.amax(dim=-1, keepdim=True)
+    scales = ((maximum - minimum).clamp_min(1e-5) / 15).to(weight.dtype)
+    float_scales = scales.float()
+    zeros = torch.round(-minimum / float_scales).clamp_(0, 15).to(torch.int32)
+    quantized = torch.round(grouped / float_scales + zeros).clamp_(0, 15).to(torch.int32)
+    return quantized, zeros, scales
+
+
 def pack_awq_checkpoint_weight(weight: Tensor, group_size: int) -> PackedAWQWeight:
     """按输出通道、输入分组生成 AutoAWQ checkpoint 张量。
 
@@ -377,12 +403,7 @@ def pack_awq_checkpoint_weight(weight: Tensor, group_size: int) -> PackedAWQWeig
     if out_features % _AWQ_PACK_FACTOR:
         raise ValueError("AWQ weight output dimension must be divisible by 8")
 
-    source = weight.float().reshape(out_features, -1, effective_group_size)
-    minimum = source.amin(dim=-1, keepdim=True)
-    maximum = source.amax(dim=-1, keepdim=True)
-    scales = ((maximum - minimum).clamp_min(1e-5) / 15).to(weight.dtype)
-    zeros = torch.round(-minimum / scales.float()).clamp_(0, 15).to(torch.int32)
-    quantized = torch.round(source / scales.float() + zeros).clamp_(0, 15).to(torch.int32)
+    quantized, zeros, scales = _quantize_awq_groups(weight, effective_group_size)
     natural_qweight = quantized.reshape_as(weight).t().contiguous()
     natural_qzeros = zeros.squeeze(-1).t().contiguous()
     checkpoint_scales = scales.squeeze(-1).t().contiguous()
@@ -546,7 +567,7 @@ class AWQLinearMethod:
         output_partition: TensorPartition | None = None,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> nn.Module:
+    ) -> ColumnParallelLayer:
         if self.config.skips(prefix):
             return self._dense.create_column(
                 in_features,
@@ -581,7 +602,7 @@ class AWQLinearMethod:
         bias: bool = True,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> nn.Module:
+    ) -> RowParallelLayer:
         if self.config.skips(prefix):
             return self._dense.create_row(
                 in_features,

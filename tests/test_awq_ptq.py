@@ -7,6 +7,7 @@ from torch.nn import functional as F
 
 from light_vllm.entrypoints.quantize_awq import _parser as awq_cli_parser
 from light_vllm.entrypoints.quantize_awq import main as quantize_awq_main
+from light_vllm.modeling.quantization.awq import quantize_awq_weight
 from light_vllm.modeling.quantization.awq_ptq import (
     AWQPTQConfig,
     apply_awq_clip,
@@ -35,6 +36,16 @@ def test_awq_scale_application_preserves_dense_math() -> None:
     actual = linear(norm(inputs))
 
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_pseudo_quantization_matches_exported_checkpoint_math() -> None:
+    torch.manual_seed(4)
+    weight = torch.randn(16, 24, dtype=torch.float16)
+
+    pseudo = pseudo_quantize_weight(weight, group_size=8)
+    exported = quantize_awq_weight(weight, group_size=8)
+
+    torch.testing.assert_close(pseudo, exported.dequantized, rtol=0, atol=0)
 
 
 def test_awq_scale_search_is_no_worse_than_unscaled_pseudo_quantization() -> None:

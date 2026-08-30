@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 from torch import Tensor, nn
@@ -52,6 +52,7 @@ class QuantizationMethodFactory(Protocol):
     ) -> LinearMethod: ...
 
 
+@runtime_checkable
 class ColumnParallelLayer(Protocol):
     """Qwen 需要的列并行 Linear 最小能力。"""
 
@@ -60,6 +61,7 @@ class ColumnParallelLayer(Protocol):
     def gather_output(self, local_output: Tensor) -> Tensor: ...
 
 
+@runtime_checkable
 class RowParallelLayer(Protocol):
     """Qwen 需要的行并行 Linear 最小能力。"""
 
@@ -88,7 +90,7 @@ class LinearMethod(Protocol):
         output_partition: TensorPartition | None = None,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> nn.Module: ...
+    ) -> ColumnParallelLayer: ...
 
     def create_row(
         self,
@@ -100,7 +102,7 @@ class LinearMethod(Protocol):
         bias: bool = True,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> nn.Module: ...
+    ) -> RowParallelLayer: ...
 
     def prepare_local(self, layer: nn.Module) -> PreparedLinear: ...
 

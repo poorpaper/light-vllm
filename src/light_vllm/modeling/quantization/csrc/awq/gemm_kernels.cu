@@ -18,6 +18,14 @@ Shang and Dang, Xingyu and Han, Song}, journal={arXiv}, year={2023}
 namespace light_vllm {
 namespace awq {
 
+/*
+直接 AWQ GEMM 的布局与边界：
+- Python 只把 1 <= M <= 255 的输入送到这里；更大的 M 先反量化，再交给 cuBLAS。
+- 每个 64-thread CTA 计算至多 16 行、N 列，N 只能是 64 或 128；尾行会显式屏蔽。
+- K 维每次推进 32，split-K 网格把部分和写入独立输出面，宿主端最后求和。
+- B 沿用 AutoAWQ GEMM 的 INT4 pack order；每个 int32 保存 8 个权重。
+这些约束是 checkpoint 兼容和索引正确性的基础，修改线程布局时必须同步验证。
+*/
 template <int N>
 __global__ void __launch_bounds__(64)
     gemm_forward_4bit_cuda_m16nXk32(int G, int split_k_iters,
@@ -25,7 +33,7 @@ __global__ void __launch_bounds__(64)
                                     half* __restrict__ scaling_factors,
                                     int* __restrict__ zeros, int M, int IC,
                                     int OC, half* __restrict__ C) {
-  // Only support matrix n = 64 or 128
+  // 模板只实例化两种 CTA 输出宽度。
   assert(N == 64 || N == 128);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
   assert(false);
@@ -49,11 +57,9 @@ __global__ void __launch_bounds__(64)
 
   static constexpr int row_stride_warp = 32 * 8 / 32;
   static constexpr int row_stride = 2 * 32 * 8 / N;
-  // TODO: Haotian: blockIdx_y / j_factors1 in A loading to support bsz > 16
   bool ld_A_flag =
       (blockIdx_y / j_factors1 * 16 + threadIdx.y * row_stride_warp +
        threadIdx.x * 8 / 32) < M;  // threadIdx.y is warp_id
-  // bool wb_C_flag = (threadIdx.x / 4) < M;
 
   half* A_ptr =
       A +
@@ -65,8 +71,7 @@ __global__ void __launch_bounds__(64)
   int* B_ptr = B + ((int)threadIdx.y) * (OC / 8) * (256 / N) +
                (((int)threadIdx.x) / (N / 8)) * (OC / 8) +
                (((int)blockIdx_y) % j_factors1) * (N / 8) +
-               (((int)threadIdx.x) % (N / 8)) * 1;
-  // Why * 1 in the above line?
+               (((int)threadIdx.x) % (N / 8));
 
   half* A_shared_ptr = A_shared +
                        ((int)threadIdx.y) * row_stride_warp * (32 + 8) +
@@ -91,52 +96,31 @@ __global__ void __launch_bounds__(64)
       + (((int)blockIdx_y) % j_factors1) * N + ((int)threadIdx.y) * (N / 2) +
       (((int)threadIdx.x) % 4) * 2;
 
-  // preload s.f. and zeros
+  // 每个 split-K 分片只遍历属于自己的 32-wide K tile。
   int k_bound = (IC / 32 + split_k_iters - 1) / split_k_iters;
   if ((k_bound - 1) * split_k_iters * 32 + blockIdx_z * 32 >= IC) k_bound -= 1;
   for (int _k_0_0 = 0; _k_0_0 < k_bound; ++_k_0_0) {
     int k_0_0 = _k_0_0 * split_k_iters + blockIdx_z;
     __syncthreads();
-    // TODO: Haotian: blockIdx_y / j_factors1 in A loading to support bsz > 16
     if (ld_A_flag) {
       *(uint4*)(A_shared_ptr) = *(uint4*)(A_ptr + (k_0_0 * 32));
     } else {
       *(uint4*)(A_shared_ptr) = make_uint4(0, 0, 0, 0);
     }
 
-    // for (int ax0_ax1_fused_0 = 0; ax0_ax1_fused_0 < 2; ++ax0_ax1_fused_0) {
     uint32_t zeros_loaded = *(uint32_t*)(zeros_ptr + k_0_0 * 32 / G * (OC / 8));
     uint4 B_loaded_zero = dequantize_s4_to_fp16x2(zeros_loaded);
     uint4 B_loaded_scale =
         *(uint4*)(scaling_factors_ptr + k_0_0 * 32 / G * (OC));
-    /*
-    if (blockIdx_z == 0 && blockIdx_y == 0 && k_0_0 == 0 && threadIdx.x == 0 &&
-    threadIdx.y == 0){ printf("%x %x %x %x %x %x %x %x\n", B_loaded_scale.x,
-    B_loaded_scale.y, B_loaded_scale.z, B_loaded_scale.w, B_loaded_zero.x,
-    B_loaded_zero.y, B_loaded_zero.z, B_loaded_zero.w);
-    }
-    */
-    // uint4 B_loaded_scale = make_uint4(0, 0, 0, 0);
     int* B_ptr_local = B_ptr + k_0_0 * 32 * (OC / 8);
 
     for (int ax0_ax1_fused_0 = 0; ax0_ax1_fused_0 < N / 16; ++ax0_ax1_fused_0) {
-      // B: 32 x 136 (128+8) float16
-      // each warp: 32 x 4
-      // each thr: read 32 bit -> convert to 8xFP16 (a UINT4) -> scale and minus
-      // zero -> WB UINT4
-      // *(uint4*)(B_shared + ((((ax0_ax1_fused_0 * 544) + (((int)threadIdx.y) *
-      // 272)) + ((((int)threadIdx.x) >> 4) * 136)) + ((((int)threadIdx.x) & 15)
-      // * 8))) = *(uint4*)(B + ((((((k_0_0 * 163840) + (ax0_ax1_fused_0 *
-      // 20480)) + (((int)threadIdx.y) * 10240)) + ((((int)threadIdx.x) >> 4) *
-      // 5120)) + (((int)blockIdx_y) * 128)) + ((((int)threadIdx.x) & 15) *
-      // 8))); row stride in shared memory: (NWARPS * 32 * 8 / cta_N)
+      // 每线程读取一个 packed int32，展开 8 个 FP16，再写入带 8 列偏移的 shared tile。
       uint32_t B_loaded =
           *(uint32_t*)(B_ptr_local + ax0_ax1_fused_0 * row_stride * (OC / 8));
       uint4 B_loaded_fp16 = dequantize_s4_to_fp16x2(B_loaded);
 
-      // - zero and * scale
-      // TODO (Haotian): can save 4 assembly instructions if sormulate as deq =
-      // q * scale - zero * scale.
+      // 按 (q - zero) * scale 反量化；half2 指令一次处理两个值。
       asm volatile("sub.f16x2 %0, %1, %2;\n"
                    : "=r"(B_loaded_fp16.x)
                    : "r"(B_loaded_fp16.x), "r"(B_loaded_zero.x));
@@ -161,14 +145,7 @@ __global__ void __launch_bounds__(64)
       asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
                    : "=r"(B_loaded_fp16.w)
                    : "r"(B_loaded_fp16.w), "r"(B_loaded_scale.w), "r"(ZERO));
-      /*
-      if (ax0_ax1_fused_0 == 0 && blockIdx_z == 0 && blockIdx_y == 0 && k_0_0 ==
-      0 && threadIdx.x == 17 && threadIdx.y == 0){ printf("[x] %X %X %X %X\n",
-      B_loaded_fp16.x, B_loaded_fp16.y, B_loaded_fp16.z, B_loaded_fp16.w);
-      }
-      */
-
-      // write back
+      // 写回 shared memory，供后续 ldmatrix/mma 读取。
       *(uint4*)(B_shared_ptr + ax0_ax1_fused_0 * row_stride * (N + 8)) =
           B_loaded_fp16;
     }
@@ -334,7 +311,7 @@ __global__ void __launch_bounds__(64)
     }
   }
 
-  // TODO: Shang: Hoist loop invariance.
+  // 将 FP32 累加结果写入当前 split-K 输出面；越过 M 的尾行不写。
   for (int ax1_0_1 = 0; ax1_0_1 < (N / 32); ++ax1_0_1) {
     for (int local_id = 0; local_id < 8; ++local_id) {
       int row_offset = (((int)blockIdx_y) / j_factors1) * 16 +
@@ -461,17 +438,16 @@ torch::Tensor awq_dequantize(torch::Tensor _kernel,
   return _de_kernel;
 }
 
-// in_feats: M, IC [float16]
-// kernel: IC, OC // 8 [int32] -> cast to IC, OC [uint4b]
-// scaling_factors: IC // G, OC [float16]
-// zeros: IC // G, OC // 8 [int32] -> cast to IC // G, OC [uint4b]
-// assume that batch_size < 16 for now
+// inputs: [M, IC] FP16；qweight/qzeros 每个 int32 打包 8 个 INT4。
+// 直接 kernel 明确支持 1 <= M <= 255；更大的 M 由 Python 后端走反量化 + cuBLAS。
 
 torch::Tensor awq_gemm(torch::Tensor _in_feats, torch::Tensor _kernel,
                        torch::Tensor _scaling_factors, torch::Tensor _zeros,
                        int64_t split_k_iters) {
   int num_in_feats = _in_feats.size(0);
   int num_in_channels = _in_feats.size(1);
+  if (num_in_feats <= 0 || num_in_feats > 255)
+    throw std::invalid_argument("AWQ direct GEMM requires M within [1, 255]");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(_in_feats));
 
   auto options = torch::TensorOptions()

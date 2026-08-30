@@ -6,6 +6,7 @@ from torch import nn
 
 from light_vllm import ForwardBatch, ModelOutput, ModelSpec, create_catalog, create_runner
 from light_vllm.modeling.attention import AttentionLayerSpec, ModelKVCacheSpec
+from light_vllm.modeling.loaders.torch import ModelLoadError
 from light_vllm.modeling.models.interfaces import ModelFactory, select_query_states
 
 
@@ -182,6 +183,22 @@ def test_state_dict_loader_round_trip(tmp_path: Path) -> None:
     restored_output = restored.open_session().forward(batch)
 
     torch.testing.assert_close(restored_output.logits, source_output.logits)
+
+
+@pytest.mark.parametrize("loader", ("init", "state-dict"))
+def test_dense_loaders_reject_explicit_quantization(loader: str) -> None:
+    with pytest.raises(ModelLoadError, match="does not support explicit quantization 'awq'"):
+        create_runner().load(tiny_spec(loader=loader, quantization="awq"))
+
+
+@pytest.mark.parametrize("quantization", ("auto", "none"))
+def test_init_loader_keeps_dense_auto_and_none_paths(quantization: str) -> None:
+    runner = create_runner()
+
+    runner.load(tiny_spec(quantization=quantization))
+    output = runner.open_session().forward(ForwardBatch(input_ids=torch.tensor([1])))
+
+    assert output.logits.shape == (1, 32)
 
 
 class ScaleModel(nn.Module):

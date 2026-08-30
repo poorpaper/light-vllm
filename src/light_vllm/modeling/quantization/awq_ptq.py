@@ -15,6 +15,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from light_vllm.modeling.quantization.awq import _quantize_awq_groups
+
 
 @dataclass(frozen=True, slots=True)
 class AWQPTQConfig:
@@ -71,18 +73,8 @@ def pseudo_quantize_weight(weight: Tensor, group_size: int) -> Tensor:
 
     if weight.ndim < 2 or not weight.is_floating_point():
         raise ValueError("AWQ pseudo quantization requires floating weights")
-    width = weight.shape[-1]
-    effective_group_size = width if group_size == -1 else group_size
-    if effective_group_size <= 0 or width % effective_group_size:
-        raise ValueError("AWQ group_size must divide the weight input dimension")
-    original_shape = weight.shape
-    grouped = weight.reshape(-1, effective_group_size)
-    maximum = grouped.amax(dim=1, keepdim=True)
-    minimum = grouped.amin(dim=1, keepdim=True)
-    scales = (maximum - minimum).clamp_min(1e-5) / 15
-    zeros = torch.round(-minimum / scales).clamp_(0, 15)
-    quantized = torch.round(grouped / scales + zeros).clamp_(0, 15)
-    return ((quantized - zeros) * scales).reshape(original_shape)
+    quantized, zeros, scales = _quantize_awq_groups(weight, group_size)
+    return ((quantized - zeros).to(scales.dtype) * scales).reshape_as(weight)
 
 
 def _channel_weight_importance(linears: Sequence[nn.Linear], group_size: int) -> Tensor:
