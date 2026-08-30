@@ -52,7 +52,8 @@ record_command() {
 }
 
 process_group_is_running() {
-  ps -o stat= --pgroup "$1" 2>/dev/null | awk '$1 !~ /^Z/ { found = 1 } END { exit !found }'
+  ps -eo pgid=,stat= 2>/dev/null |
+    awk -v target="$1" '$1 == target && $2 !~ /^Z/ { found = 1 } END { exit !found }'
 }
 
 cleanup_server() {
