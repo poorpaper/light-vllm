@@ -1,0 +1,39 @@
+{
+  "candidate_sha": "89afaefbab690d838c6631b7a4510069e2b83a24",
+  "candidate_status": "",
+  "candidate_remote": "/root/awq-validation-20260830/candidate-89afaef.bundle",
+  "model": "/root/autodl-tmp/models/Qwen2.5-0.5B-Instruct-light-vllm-AWQ-ptq-v2",
+  "model_files_sha256": "394b435c0917ba8c2171946a1f5d4d0fd3c1def7ccbc8be09aa9beef2152ef53  awq_ptq_report.json\n38f729479f7d01b22ac407c0d21b148e7ff7968948652873a33b61a385c44f0e  config.json\ne558847a8b4402616f1273797b015104dc266fe4b520056fca88823ba8f8ebe6  generation_config.json\n599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3  merges.txt\n74fd4ce982bde71f7423a969df70f7dec9043c4258d31848b429663381ac541b  model-00001-of-00001.safetensors\nf9248064d5ec3d23d5289c5546b7c7c85de040e7cd58b204757c098cbf224a7f  model.safetensors.index.json\n0ab45c62faadffea69098171516b1683bffb93b3358cb5cb116b01aa44350b18  quantize_config.json\nc0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539  tokenizer.json\n5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583  tokenizer_config.json\nca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910  vocab.json",
+  "python": "3.12.13",
+  "torch": "2.11.0+cu130",
+  "torch_cuda": "13.0",
+  "vllm": {
+    "version": "0.26.0",
+    "path": "/root/autodl-tmp/conda-envs/vllm/lib/python3.12/site-packages/vllm/__init__.py",
+    "direct_url": null
+  },
+  "vllm_binary_version": "0.26.0",
+  "gpu": "NVIDIA GeForce RTX 5090, GPU-88ba7823-c5e1-8d65-d557-f1e5c16107ce, 580.76.05, 32607 MiB",
+  "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Fri_Feb_21_20:23:50_PST_2025\nCuda compilation tools, release 12.8, V12.8.93\nBuild cuda_12.8.r12.8/compiler.35583870_0",
+  "platform": "Linux-5.15.0-94-generic-x86_64-with-glibc2.35",
+  "config": {
+    "cuda_visible_device": "0",
+    "num_kv_blocks": 4096,
+    "kv_block_size": 16,
+    "vllm_kv_cache_bytes": 805306368,
+    "max_num_sequences": 64,
+    "max_num_scheduled_tokens": 32768,
+    "prefix_cache": false,
+    "dtype": "float16",
+    "decoding": "greedy, ignore EOS",
+    "startup_order": [
+      "light-vllm",
+      "vllm",
+      "vllm",
+      "light-vllm",
+      "light-vllm",
+      "vllm"
+    ],
+    "measurement_runs_per_start": 2
+  }
+}

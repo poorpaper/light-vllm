@@ -1,0 +1,12 @@
+# 实验产物按采集时的字节保存，避免 checkout 换行转换破坏 SHA256 校验。
+* -text
+figures/** -text
+logs/** -text
+raw/** -text
+validation/** -text
+workloads/** -text
+
+# Prometheus 与 Matplotlib SVG 会产生有语义的行末空格，不作为源码风格问题检查。
+raw/** whitespace=-trailing-space
+logs/** whitespace=-trailing-space
+figures/*.svg whitespace=-trailing-space

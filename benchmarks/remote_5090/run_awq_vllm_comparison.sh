@@ -47,7 +47,13 @@ COMMANDS=$OUTPUT_DIR/commands.txt
 SERVER_PID=""
 
 record_command() {
-  printf '%q ' "$@" >>"$COMMANDS"
+  local argument
+  local separator=""
+  for argument in "$@"; do
+    printf '%s' "$separator" >>"$COMMANDS"
+    printf '%q' "$argument" >>"$COMMANDS"
+    separator=" "
+  done
   printf '\n' >>"$COMMANDS"
 }
 

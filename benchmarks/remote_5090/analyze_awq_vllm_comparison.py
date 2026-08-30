@@ -24,6 +24,13 @@ EXPECTED_SHAPES = {
 EXPECTED_WORKLOADS = set(EXPECTED_SHAPES)
 
 
+def _write_text(path: Path, content: str) -> None:
+    """固定 LF，保证 Windows 生成的哈希清单也能被 sha256sum 读取。"""
+
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
+
+
 def _load_runs(result_dir: Path) -> dict[tuple[str, str], list[dict[str, Any]]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     paths = sorted((result_dir / "raw").glob("*/*-r[12].json"))
@@ -217,7 +224,7 @@ def _summarize(
 
 def _write_csv(path: Path, summary: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
+        writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(("workload", "backend", "metric", "median", "min", "max", "unit"))
         for workload, systems in summary["workloads"].items():
             for backend in BACKENDS:
@@ -276,21 +283,44 @@ def _plot(path: Path, summary: dict[str, Any]) -> None:
     axes[0].legend(frameon=False)
     figure.suptitle("AWQ W4A16 end-to-end comparison (median and six-run range)")
     figure.savefig(path.with_suffix(".png"), dpi=180)
-    figure.savefig(path.with_suffix(".svg"))
+    svg_path = path.with_suffix(".svg")
+    with plt.rc_context({"svg.hashsalt": "light-vllm-awq-vllm-comparison"}):
+        figure.savefig(svg_path, metadata={"Date": None})
     plt.close(figure)
+    _write_text(svg_path, svg_path.read_text(encoding="utf-8"))
 
 
 def _write_report(path: Path, summary: dict[str, Any]) -> None:
+    environment_path = path.parent / "environment.json"
+    environment = (
+        json.loads(environment_path.read_text(encoding="utf-8"))
+        if environment_path.is_file()
+        else None
+    )
     lines = [
         "# AWQ W4A16 与 vLLM 端到端对照",
         "",
-        "这是两组固定 burst 压测：64 个 256→64 请求和 16 个 16→512 请求，不代表生产流量。",
-        "表中是每个系统 6 轮实测的中位数，括号内为最小值到最大值；两边使用 greedy、FP16、",
-        "同一 AWQ checkpoint。完整环境和执行顺序见 `environment.json` 与 `commands.txt`。",
-        "",
-        "| workload | 系统 | 输出吞吐 tok/s | TTFT P50 ms | TPOT P50 ms/token |",
-        "| --- | --- | ---: | ---: | ---: |",
     ]
+    if environment is not None:
+        lines.extend(
+            (
+                f"候选提交：`{environment['candidate_sha']}`（工作区状态："
+                f"`{environment['candidate_status'] or 'clean'}`）",
+                f"设备：{environment['gpu']}；PyTorch {environment['torch']}；"
+                f"vLLM {environment['vllm']['version']}。",
+                "",
+            )
+        )
+    lines.extend(
+        (
+            "这是两组固定 burst 压测：64 个 256→64 请求和 16 个 16→512 请求，不代表生产流量。",
+            "表中是每个系统 6 轮实测的中位数，括号内为最小值到最大值；两边使用 greedy、FP16、",
+            "同一 AWQ checkpoint。完整环境和执行顺序见 `environment.json` 与 `commands.txt`。",
+            "",
+            "| workload | 系统 | 输出吞吐 tok/s | TTFT P50 ms | TPOT P50 ms/token |",
+            "| --- | --- | ---: | ---: | ---: |",
+        )
+    )
     for workload, systems in summary["workloads"].items():
         for backend in BACKENDS:
             values = systems[backend]["metrics"]
@@ -299,14 +329,61 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
                 item = values[metric]
                 cells.append(f"{item['median']:.2f} ({item['min']:.2f}–{item['max']:.2f})")
             lines.append(f"| {workload} | {backend} | " + " | ".join(cells) + " |")
+    checkpoint_path = path.parent / "validation" / "checkpoint.json"
+    kernel_path = path.parent / "validation" / "kernel.json"
+    if checkpoint_path.is_file() and kernel_path.is_file():
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        kernel = json.loads(kernel_path.read_text(encoding="utf-8"))
+        dense = checkpoint["dense"]
+        awq = checkpoint["awq"]
+        comparison = checkpoint["comparison"]
+        lines.extend(
+            (
+                "",
+                "## 真实 checkpoint 与 CUDA kernel",
+                "",
+                "| 项目 | Dense | AWQ W4A16 |",
+                "| --- | ---: | ---: |",
+                f"| 模型权重显存 | {dense['model_memory_mib']:.2f} MiB | "
+                f"{awq['model_memory_mib']:.2f} MiB（{comparison['model_memory_ratio']:.2%}） |",
+                f"| 短 prompt 下一 token | {dense['next_token_id']} | {awq['next_token_id']} |",
+                f"| logits cosine similarity | - | {comparison['logits_cosine_similarity']:.6f} |",
+                "",
+                "`K=N=3584`、group size 128 的同源 CUDA AWQ kernel 对照：",
+                "",
+                "| 输入 token | light-vllm | vLLM legacy AWQ | light / vLLM |",
+                "| ---: | ---: | ---: | ---: |",
+            )
+        )
+        by_tokens: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
+        for result in kernel["results"]:
+            by_tokens[int(result["num_tokens"])][str(result["implementation"])] = result
+        for tokens, implementations in sorted(by_tokens.items()):
+            light = implementations["light-vllm-cuda"]["latency_ms_median"]
+            vllm = implementations["vllm-awq"]["latency_ms_median"]
+            lines.append(f"| {tokens} | {light:.6f} ms | {vllm:.6f} ms | {light / vllm:.2%} |")
+        lines.extend(
+            (
+                "",
+                "checkpoint 检查里的 Dense 使用 Hugging Face runtime，AWQ 使用 light-vllm runtime；"
+                "因此只报告权重显存和短 prompt 的 logits 诊断，不把跨 runtime forward 延迟当作"
+                "量化加速证据。该检查不是完整质量评测。kernel 表对照的是 vLLM legacy AWQ op，"
+                "端到端 vLLM "
+                "0.26 实际选择 Marlin。远端全量测试使用的提交与命令单独记录在 `validation/`；它与"
+                "端到端候选之间只改了 benchmark 进程清理脚本，模型和推理 runtime 未变化。",
+            )
+        )
     lines.extend(("", "同一实现的 greedy 输出稳定性（全部 15 个轮次对）："))
     for workload, systems in summary["output_stability"].items():
         for backend in BACKENDS:
             stability = systems[backend]
+            request_match = stability["exact_request_percent"]
             token_match = stability["matching_token_percent"]
             lines.append(
                 f"- {workload} / {backend}: {stability['distinct_output_maps']} 个输出 map；"
                 f"{stability['exact_output_pairs']}/{stability['run_pairs']} 个轮次对完全一致；"
+                f"完全一致请求比例中位数 {request_match['median']:.2f}% "
+                f"（{request_match['min']:.2f}%–{request_match['max']:.2f}%）；"
                 f"同位置 token-ID 匹配率中位数 {token_match['median']:.2f}% "
                 f"（{token_match['min']:.2f}%–{token_match['max']:.2f}%）。"
             )
@@ -333,7 +410,7 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
             "",
         )
     )
-    path.write_text("\n".join(lines), encoding="utf-8")
+    _write_text(path, "\n".join(lines))
 
 
 def _write_hashes(result_dir: Path) -> None:
@@ -345,7 +422,7 @@ def _write_hashes(result_dir: Path) -> None:
     for path in paths:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         lines.append(f"{digest}  {path.relative_to(result_dir).as_posix()}")
-    (result_dir / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text(result_dir / "SHA256SUMS", "\n".join(lines) + "\n")
 
 
 def main() -> None:
@@ -356,9 +433,7 @@ def main() -> None:
     result_dir = args.result_dir.resolve()
     grouped = _load_runs(result_dir)
     summary = _summarize(grouped)
-    (result_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    _write_text(result_dir / "summary.json", json.dumps(summary, indent=2, ensure_ascii=False))
     _write_csv(result_dir / "summary.csv", summary)
     figures = result_dir / "figures"
     figures.mkdir(exist_ok=True)

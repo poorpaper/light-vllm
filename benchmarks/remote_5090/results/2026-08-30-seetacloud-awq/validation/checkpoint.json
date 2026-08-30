@@ -1,0 +1,33 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "prompt_tokens": 10,
+  "dense": {
+    "model": "/root/autodl-tmp/models/Qwen2.5-0.5B-Instruct",
+    "next_token_id": 576,
+    "next_token_text": " The",
+    "load_seconds": 1.2146297730505466,
+    "first_forward_ms": 478.8962097167969,
+    "forward_ms_median": 16.563647270202637,
+    "model_memory_mib": 950.16650390625,
+    "peak_memory_mib": 966.05908203125
+  },
+  "awq": {
+    "model": "/root/autodl-tmp/models/Qwen2.5-0.5B-Instruct-light-vllm-AWQ-ptq-v2",
+    "backend": "cuda",
+    "tensor_parallel_size": 1,
+    "next_token_id": 576,
+    "next_token_text": " The",
+    "load_seconds": 0.2791891507804394,
+    "first_forward_ms": 1278.9459228515625,
+    "forward_ms_median": 12.23366403579712,
+    "model_memory_mib": 454.607421875,
+    "peak_memory_mib": 706.654296875
+  },
+  "comparison": {
+    "top1_equal": true,
+    "logits_mean_abs_error": 0.9679625630378723,
+    "logits_max_abs_error": 5.71142578125,
+    "logits_cosine_similarity": 0.9465143084526062,
+    "model_memory_ratio": 0.4784502716166626
+  }
+}

@@ -250,16 +250,29 @@ curl -X POST http://127.0.0.1:8000/generate \
 
 ### AWQ W4A16 PTQ 与推理
 
-Qwen2.5-0.5B-Instruct 的 4096-token 校准结果中，AWQ 模型权重显存从 950.17 MiB 降到 454.61 MiB
-（47.85%）；固定 2040 个 WikiText-2 next-token 目标上，PPL 从 24.87 变为 27.49（+10.52%）。
-`K=N=3584` 的 CUDA AWQ GEMM 在 M=1/8/64/256 四个 shape 上，中位延迟均未劣于同源的 vLLM
-legacy `awq_gemm` kernel。端到端对照使用 vLLM 0.26 默认选出的 Marlin：16 个 16→512 请求中 light-vllm 为
-1880.93 tok/s，vLLM 为 1529.49 tok/s；64 个 256→64 burst 请求中 light-vllm 为 3509.91 tok/s，vLLM 为
-4568.09 tok/s。也就是说 decode-heavy 负载没有观察到退化，但大 batch prefill/服务路径仍有 23.16% 吞吐差距。
+Qwen2.5-0.5B-Instruct 的 AWQ W4A16 checkpoint 把模型权重显存从 950.17 MiB 降到 454.61 MiB
+（Dense 的 47.85%）。在单张 RTX 5090 上，light-vllm 与 vLLM 0.26 使用同一个 AWQ checkpoint、FP16、
+greedy、eager、关闭 prefix cache，并各保留 65,536 个 KV token。每个系统先完整 warmup，再对两个固定 burst
+workload 各测 6 轮；下表给出中位数，以及 light-vllm 相对 vLLM 的变化：
 
-完整 PTQ 参数、对照边界、逐请求 JSON、Prometheus 快照与哈希见
-[AWQ W4A16 验收报告](benchmarks/remote_5090/results/2026-08-27-awq-ptq-v0.4/REPORT.md)。这组结果不能外推为
-“所有 workload 与 vLLM 持平”。
+| workload | light-vllm / vLLM 输出吞吐 | 吞吐变化 | light-vllm / vLLM TTFT P50 | TTFT 变化 | light-vllm / vLLM TPOT P50 | TPOT 变化 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64×256→64 | 5,065.79 / 4,851.69 tok/s | +4.41% | 162.77 / 152.83 ms | +6.50% | 9.96 / 10.88 ms/token | -8.53% |
+| 16×16→512 | 1,903.05 / 1,524.40 tok/s | +24.84% | 34.69 / 71.60 ms | -51.56% | 8.29 / 10.40 ms/token | -20.26% |
+
+<p align="center">
+  <img alt="AWQ W4A16 light-vllm 与 vLLM 对照" src="benchmarks/remote_5090/results/2026-08-30-seetacloud-awq/figures/awq-vllm.png" width="100%">
+</p>
+
+这组结果保留了所有有效轮次，包括 baseline 中 light-vllm 吞吐 3,007.99 tok/s、TTFT 449.66 ms 的低值；
+图中的误差线是 6 轮完整范围，不只展示有利结果。两边全部请求均零失败并达到固定输出长度。vLLM 的长 decode
+在 6 轮中出现 5 份 greedy 输出 map，因此报告同时保留轮次内和实现间 token-ID 差异；这种匹配率不是质量指标。
+
+完整环境、启动命令、逐请求 JSON、Prometheus 快照、输出稳定性、CUDA 测试日志和 SHA256 清单见
+[AWQ W4A16 与 vLLM 验收报告](benchmarks/remote_5090/results/2026-08-30-seetacloud-awq/REPORT.md)。运行时候选提交为
+`89afaefbab690d838c6631b7a4510069e2b83a24`；后续提交只补充分析、数据与文档。当前机器只有一张 GPU，所以这里是
+TP=1 的真实验收；AWQ TP=2 仍需在双卡机器上单独验证。结果只覆盖记录中的硬件、模型和 workload，不能外推为
+“所有场景都优于 vLLM”。
 
 最终对比使用 Qwen2.5-Coder-7B-Instruct BF16、RTX 5090 和同一组 ShareGPT 首轮回放。light-vllm 使用 strict completion claim，不启用 prefix cache、TTFT admission 或 speculative decoding；对照组是关闭 prefix cache 与 speculation 的 vLLM eager。每个实现运行 3 轮，每轮 64 个请求，表中是逐轮指标的中位数。
 
