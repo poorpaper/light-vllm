@@ -1,4 +1,4 @@
-# light-vllm 架构设计（v0.15）
+# light-vllm 架构设计（v0.16）
 
 这份文档记录当前已经落地的设计。更细的职责说明见 [architecture.md](architecture.md)。
 
@@ -10,7 +10,7 @@
 | --- | --- |
 | 轻量 | `EngineCore → Scheduler → Executor` 单向调用链 |
 | 高可读性 | 请求、调度、执行、采样、模型和协议各有唯一职责 |
-| 高扩展性 | 模型/loader 注册；Sampler、Executor 与 attention backend 通过组合替换 |
+| 高扩展性 | 模型/loader/量化注册；Sampler、Executor、LinearMethod 与 attention backend 通过组合替换 |
 | 少模式分支 | 不用 prefill/decode/greedy/KV 专用 Executor |
 | 成熟实践 | 采用统一 token budget、Scheduler/KV 协作和 Step Handler 物理缓存边界 |
 | 可观测 | 独立 PerformanceObserver 记录事实，Prometheus/Grafana 只做控制面消费 |
@@ -25,6 +25,7 @@ src/light_vllm/
 │   ├── attention/
 │   ├── models/
 │   ├── loaders/
+│   ├── quantization/
 │   ├── runner.py
 │   ├── catalog.py
 │   └── registry.py
@@ -100,6 +101,10 @@ flowchart TB
     Runner --> Catalog["Catalog"]
     Catalog --> Models["Model Registry"]
     Catalog --> Loaders["Loader Registry"]
+    Catalog --> Quant["Quantization Registry"]
+    Loaders --> Method["LinearMethod<br/>Dense / AWQ"]
+    Quant --> Method
+    Method --> Models
 ```
 
 `UnboundedKVCacheManager` 只维护 reservation/commit 生命周期，不限制容量或产生位置；
@@ -111,6 +116,10 @@ flowchart TB
 两种组合共用一个 `LocalModelWorker`。`LocalModelExecutor`、Worker、Scheduler 和 Engine 不包含 KV 模式判断。
 Executor 与 Worker 两层会保留：前者表示可替换执行拓扑，后者表示一个设备 rank 内的模型版本和请求生命周期；
 `TensorParallelModelExecutor` 已经用这个边界管理 torchrun Rank Worker，而没有改变 Engine 的批次语义。
+单 Rank CUDA Engine 在模型与物理 KV 初始化后、服务 ready 前，复用同一个 `ModelExecutor` 临时请求做至多 256 token
+的有界 prefill 和一次单 token decode。这样统一触发大矩阵、小 batch GEMM、attention、LM head 与采样的首次加载，
+不在模型或量化实现里维护 shape 表；临时请求始终沿 lease/free 边界清理，也不进入 Scheduler 和 Observer。首版不向
+TP 命令流插入额外步骤，避免与分布式执行生命周期交叉；预热也不改变 Engine、Scheduler 和模型契约。
 `TorchDenseAttention` 是 reference 与连续缓存共用的 dense correctness backend；`TorchPagedAttention` 直接读取
 物理页。可选 `TritonPagedAttention` 复用同一批次事实和物理页池，在一个 kernel 中完成 QK、在线 softmax 与
 PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改变模型、Worker 或 Scheduler 契约。
@@ -130,6 +139,9 @@ PV。它们都实现模型看到的 `AttentionContext`，切换 backend 不改�
 | `ModelExecutor` | 执行已可行批次并管理执行期物理资源 |
 | `TensorParallelContext` / `TensorCollectives` | rank、world size、张量切分和最小集合通信端口 |
 | `TensorShardSpec` | 完整 checkpoint tensor 到本 Rank 参数的连续切片事实 |
+| `LinearMethod` / `PreparedLinear` | 模型 Linear 的参数表示、TP 层创建和加载后算子准备边界 |
+| `QuantizationMethodFactory` | 把 checkpoint 量化元数据解析成一个 `LinearMethod`，由 Catalog 注册 |
+| `AWQScheme` | 消费同一份 AutoAWQ packed tensor，并在准备阶段选择 Torch 或 CUDA 算子 |
 | `ModelWorker` | 一个设备 rank 内固定模型版本并编排请求生命周期 |
 | `ModelStepHandler` | 准备模型输入，管理物理 KV，并返回连续有效 logits 与请求边界 |
 | `DecodeHandler` | 组织普通或投机解码，把 logits 转为确认 token |
@@ -169,6 +181,22 @@ AllGather 恢复完整 logits。KV head 数不少于 TP 时按 head 切分；少
 只看到本 Rank 的普通 GQA 规格。并行层公开 `checkpoint_shards`，safetensors loader 据此取连续切片，不认识 Qwen
 参数名。TP=1 使用无通信 collective，保留相同参数名、形状和 forward。
 
+量化也不复制第二套 Qwen。模型 factory 只接收 `LinearMethod`：Dense method 创建普通列/行并行层，AWQ method
+创建持有 `qweight/qzeros/scales` 的同类 TP 层；Qwen 仍负责 QKV、Gate/Up 的语义融合和 O/Down 的调用位置。
+`SafetensorsModelLoader` 从 checkpoint 元数据或显式配置选择量化 factory，再按层公开的 `checkpoint_shards`
+通用加载本 Rank packed tensor，不识别 Qwen 参数名。权重加载完成后，`prepare_for_inference()` 把各层变成已经
+固定的 `PreparedLinear`；AWQ 的 Torch/CUDA Scheme 也只在这里选择一次，生成热路径不再判断量化名或 backend。
+融合后的子层 buffer 会重绑到同一块 packed storage view，模型不会同时常驻融合前、融合后两份 INT4 权重。
+`LinearMethod.create_*()` 只返回可注册参数的 `nn.Module`；Qwen 在构造期另外验证行并行 output reduction 能力，
+不再通过类型强转猜测；
+不解析 checkpoint 量化元数据的 init/state-dict loader 对显式量化选择直接报错，避免静默回退 Dense。
+
+离线 PTQ 是独立入口，不进入在线 Engine：`JSONL 文本 → tokenizer → 固定校准 token → 首层输入捕获 → 逐层
+activation-aware scale search → clip search → INT4 pack → 原子导出`。校准样本按上限分块搬运，scale/clip 的
+参考输出留在 CPU，避免把整套校准激活和重复权重长期堆在 GPU。导出使用 AutoAWQ GEMM 兼容布局，记录完整 PTQ
+参数、校准 token 哈希和逐层搜索报告；tokenizer/chat template/generation 资产从源 checkpoint 逐字节复制，避免
+重新序列化悄悄改变服务语义。第一阶段只验收 Qwen2/Qwen2.5 W4A16、FP16 activation；FP8 不进入本阶段契约。
+
 进程拓扑也保持单一职责：Rank 0 独占 Engine、Scheduler 和逻辑 KV；HTTP/tokenizer 在独立 spawn 进程中通过
 `ConnectionEngineClient` 访问 Rank 0，避免同步模型 step 阻塞 ASGI writer。Rank 0 广播现有 `ExecutionBatch`，
 每个 Rank 用同一 `LocalModelWorker` 管理本地分片参数和物理 KV。模型 tensor 通过一个独立 communicator 在当前
@@ -176,8 +204,8 @@ AllGather 恢复完整 logits。KV head 数不少于 TP 时按 head 切分；少
 跨 stream 同步。Worker 命令走可替换命令通道：单机 POSIX 默认使用有序 Unix socket，跨主机或显式配置时回退
 Gloo。Gloo 仍负责启动期地址协调和容量事实，避免在每个 decode step 上执行 Python object collective。KV 自动
 规划先在每张卡本地计算，再取所有 Rank 的最小页数，使逻辑容量不会超过任一物理页池。请求取消先进入 Rank 0
-已有 lease 边界，远端 free 只在当前 model step
-结束后按序送达；HTTP、Rank 或命令通道任一侧失败后连接关闭，整组状态直接作废。
+已有 lease 边界，远端 free 只在当前 model step 结束后按序送达；HTTP、Rank 或命令通道任一侧失败后连接关闭，
+整组状态直接作废。
 
 ## 5. 一次迭代
 
@@ -409,6 +437,11 @@ Prometheus Adapter 消费 `light_vllm_waiting_max_remaining_tokens`，KEDA 也�
 | safetensors 快照 | `src/light_vllm/modeling/loaders/safetensors.py` |
 | Qwen2 模型 | `src/light_vllm/modeling/models/qwen2.py` |
 | Tensor Parallel 层与分片描述 | `src/light_vllm/modeling/tensor_parallel.py` |
+| 量化与 Linear 契约 | `src/light_vllm/modeling/quantization/interfaces.py` |
+| Dense / AWQ LinearMethod | `src/light_vllm/modeling/quantization/dense.py`、`awq.py` |
+| AWQ Torch/CUDA Scheme | `src/light_vllm/modeling/quantization/awq_schemes.py`、`cuda_awq.py` |
+| AWQ PTQ 与导出 | `src/light_vllm/modeling/quantization/awq_ptq.py`、`awq_export.py` |
+| AWQ 离线入口 | `src/light_vllm/entrypoints/quantize_awq.py` |
 | 模型生命周期 | `src/light_vllm/modeling/runner.py` |
 | 生成契约 | `src/light_vllm/runtime/generation/interfaces.py` |
 | reference 生成 | `src/light_vllm/runtime/generation/reference.py` |
@@ -460,6 +493,7 @@ flowchart LR
     Metrics --> SLO["短请求池 + TTFT 早拒 + 可选 self-resubmit<br/>完成"]
     SLO --> OpenAI["本地 tokenizer + OpenAI Completion / Chat<br/>CPU/E2E 测试完成"]
     OpenAI --> TP["单机 TP / NCCL<br/>短序列/显存/故障验收<br/>长生成待量化"]
+    TP --> AWQ["Qwen2/2.5 AWQ W4A16<br/>PTQ/导出/TP 契约/CUDA/服务完成<br/>双卡真实模型待空闲 GPU"]
 ```
 
 当前“完成”指契约、CPU 参考实现和行为测试完成，不代表已经具有生产吞吐。Triton backend 已在 RTX 5090、
@@ -470,6 +504,12 @@ CPU 测试外，已在双 RTX 5090 上覆盖 NCCL、TP=1/2 短序列逐 token �
 82.8%；这证明了分片容量，不证明该拓扑有加速收益。BF16 长生成已观察到跨 TP size 和同一 TP=1 重复运行的
 轨迹分叉；现象与数值路径差异的自回归放大相符，但分叉点 logits 尚未采集，根因仍待量化，也未完成逐步 logits
 容差和质量验收。Docker/Kubernetes TP=2 仍待有容器运行权限的双卡宿主机完成性能 A/B。
+AWQ 已完成离线校准、scale/clip search、AutoAWQ 兼容导出、自动加载、TP packed shard、Torch/CUDA 算子与
+OpenAI 单卡 E2E；RTX 5090 上模型权重显存为 Dense 的 47.85%。同源 legacy vLLM AWQ GEMM 微基准没有观察到
+退化；端到端 decode-heavy workload 高于 vLLM 0.26 Marlin 对照，但 64 请求大 batch prefill workload 吞吐仅为
+其 76.84%，因此不宣称普遍性能持平。固定 2040 个 WikiText-2 next-token 目标上 PPL 增加 10.52%，作为首个
+可复现质量基线；样本仍小，不外推为完整任务质量。完整边界见
+[`benchmarks/remote_5090/results/2026-08-27-awq-ptq-v0.4/REPORT.md`](../benchmarks/remote_5090/results/2026-08-27-awq-ptq-v0.4/REPORT.md)。
 
 ## 13. 验证要求
 
@@ -488,12 +528,16 @@ prefix 命中/LRU/epoch、草稿树约束/兄弟隔离/非连续路径验收/com
 别名拒绝、跨页 prefill/decode、GQA、Sampler 替换、逐请求固定 seed 与 batch 交错、tokenizer/chat template、
 Unicode 增量解码、跨 chunk stop、OpenAI SDK、流式/非流式一致性、usage、超时取消、标准错误码、
 TP 维度切分、列/行/词表并行数学、Qwen GQA KV head 切分或复制、rank-local safetensors 加载、
+量化 metadata 选择/拒绝、AutoAWQ pack/unpack、Dense/AWQ 混合跳过、PTQ 分块上限与确定性报告、原子导出、
+tokenizer 资产逐字节保留、AWQ TP packed shard 与 OpenAI adapter，
 短请求 token/KV/sequence 预留与 aging、TTFT 预测/冷启动/429、
 self-resubmit 的 prompt+1 block/global watermark、不重复输出/严格 fallback/资源归还、TTFT/ITL、step 延迟、
 两种 token backlog、KV 使用率、执行失败和
 取消资源释放。核心 CPU 测试不得依赖可选 GPU 环境。
 Triton 数值测试在没有 CUDA 或 Triton 时自动跳过；GPU 环境需覆盖 FP16/BF16、packed mixed GQA、decode 历史、
 共享 prefix、未使用 lookahead 和 packed mixed tree visibility。
+AWQ CUDA 环境还必须覆盖对 Torch dequant correctness baseline 的数值对照、典型 M/K/N shape、临时显存和
+真实 checkpoint 服务；质量结论必须使用固定 token 流及哈希，不能只用一个 prompt 的 top-1 或 logits cosine。
 
 双 GPU 验收必须覆盖 TP=1/2 的短序列逐 token 一致性、长序列逐步 logits 容差与质量、显存、吞吐、TTFT、
 TPOT、NCCL 通信占比，以及一个 Rank 失败时其余进程在超时内退出；更大模型还需覆盖单卡无法加载而双卡可加载。
@@ -510,4 +554,8 @@ Triton kernel 的在线 softmax 组织参考
 [vLLM Qwen2](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2.py)、
 [vLLM parallel layers](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/linear.py) 与
 [SGLang parallel layers](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/linear.py)；本项目没有
-引入它们的全局 parallel state，而是保留显式 context 注入。
+引入它们的全局 parallel state，而是保留显式 context 注入。量化层/计算 Scheme 的分层参考
+[vLLM quantization interface](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/base_config.py)、
+[vLLM AWQ](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/awq.py) 和
+[SGLang quantization package](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/layers/quantization)；
+首版 CUDA GEMM 从 Apache-2.0 的 vLLM legacy AWQ kernel 做最小适配，源码内保留许可和上游归属。

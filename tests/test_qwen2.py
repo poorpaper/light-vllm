@@ -6,9 +6,11 @@ from pathlib import Path
 import pytest
 import torch
 from safetensors.torch import save_file
+from torch import nn
 
 from light_vllm import ForwardBatch, ModelSpec, create_catalog, create_runner
 from light_vllm.modeling.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+from light_vllm.modeling.quantization.dense import DenseLinearMethod
 from light_vllm.modeling.tensor_parallel import TensorParallelContext
 from light_vllm.runtime.execution.dense_attention import (
     DenseAttentionMetadata,
@@ -115,6 +117,64 @@ def test_qwen2_exposes_model_limits_and_kv_shape() -> None:
     )
     assert all(layer.num_query_heads == 4 for layer in session.kv_cache_spec.layers)
     assert all(layer.num_kv_heads == 2 for layer in session.kv_cache_spec.layers)
+
+
+class _MissingRowReductionMethod(DenseLinearMethod):
+    def create_row(
+        self,
+        in_features: int,
+        out_features: int,
+        *_args: object,
+        **_kwargs: object,
+    ) -> nn.Module:
+        return nn.Linear(in_features, out_features, bias=False)
+
+
+class _NonModuleParallelLayer:
+    def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
+        return inputs
+
+    def gather_output(self, local_output: torch.Tensor) -> torch.Tensor:
+        return local_output
+
+    def reduce_output(self, local_output: torch.Tensor) -> torch.Tensor:
+        return local_output
+
+
+class _NonModuleColumnMethod(DenseLinearMethod):
+    def create_column(self, *_args: object, **_kwargs: object) -> object:
+        return _NonModuleParallelLayer()
+
+
+class _NonModuleRowMethod(DenseLinearMethod):
+    def create_row(self, *_args: object, **_kwargs: object) -> object:
+        return _NonModuleParallelLayer()
+
+
+def test_qwen2_rejects_linear_method_without_row_reduction_contract() -> None:
+    with pytest.raises(TypeError, match="create_row must return a row-parallel layer"):
+        Qwen2ForCausalLM(
+            Qwen2Config.from_mapping(qwen2_args(num_hidden_layers=1)),
+            linear_method=_MissingRowReductionMethod(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("method", "factory_method"),
+    (
+        (_NonModuleColumnMethod(), "create_column"),
+        (_NonModuleRowMethod(), "create_row"),
+    ),
+)
+def test_qwen2_rejects_non_module_linear_layers(
+    method: DenseLinearMethod,
+    factory_method: str,
+) -> None:
+    with pytest.raises(TypeError, match=rf"{factory_method} must return torch.nn.Module"):
+        Qwen2ForCausalLM(
+            Qwen2Config.from_mapping(qwen2_args(num_hidden_layers=1)),
+            linear_method=method,
+        )
 
 
 def test_qwen25_3b_official_config_builds_on_requested_device_and_dtype() -> None:

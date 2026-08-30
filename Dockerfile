@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # 默认版本与当前 RTX 5090 验证环境一致；其他 GPU 可在构建时替换基础镜像。
-ARG BASE_IMAGE=pytorch/pytorch:2.11.0-cuda13.0-cudnn9-runtime
+ARG BASE_IMAGE=pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
 
 FROM ${BASE_IMAGE}
 
@@ -23,6 +23,12 @@ ENV PYTHONUNBUFFERED=1 \
     TRITON_CACHE_DIR=/var/cache/light-vllm/triton \
     TORCHINDUCTOR_CACHE_DIR=/var/cache/light-vllm/torchinductor \
     TORCH_EXTENSIONS_DIR=/var/cache/light-vllm/torch-extensions
+
+# AWQ CUDA 算子在首次加载时按当前 GPU 架构编译并进入共享 extension cache。
+# TP Rank 会复用同一产物，因此镜像必须提供 nvcc、C++ 编译器和 Ninja。
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends build-essential ninja-build \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid "${LIGHT_VLLM_GID}" light-vllm \
     && useradd --uid "${LIGHT_VLLM_UID}" --gid "${LIGHT_VLLM_GID}" \

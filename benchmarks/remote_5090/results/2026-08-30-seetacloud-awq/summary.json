@@ -1,0 +1,319 @@
+{
+  "measurement_runs_per_backend": 6,
+  "workloads": {
+    "baseline-256-64": {
+      "light-vllm": {
+        "runs": [
+          "s01-baseline-r1.json",
+          "s01-baseline-r2.json",
+          "s04-baseline-r1.json",
+          "s04-baseline-r2.json",
+          "s05-baseline-r1.json",
+          "s05-baseline-r2.json"
+        ],
+        "metrics": {
+          "output_tokens_per_s": {
+            "median": 5065.787088069883,
+            "min": 3007.9871014499936,
+            "max": 5414.348535563473,
+            "values": [
+              3007.9871014499936,
+              5104.892986445216,
+              5026.68118969455,
+              4991.1897592963705,
+              5414.348535563473,
+              5239.723501528315
+            ]
+          },
+          "ttft_p50_s": {
+            "median": 162.76973485946655,
+            "min": 101.10865347087383,
+            "max": 449.6586639434099,
+            "values": [
+              449.6586639434099,
+              166.3726419210434,
+              134.50890965759754,
+              170.5593802034855,
+              101.10865347087383,
+              159.1668277978897
+            ]
+          },
+          "tpot_p50_s": {
+            "median": 9.956424508894248,
+            "min": 9.588288172842963,
+            "max": 10.320047064433021,
+            "values": [
+              10.058870686898155,
+              9.850676895843613,
+              10.320047064433021,
+              10.075611964104668,
+              9.853978330890339,
+              9.588288172842963
+            ]
+          }
+        }
+      },
+      "vllm": {
+        "runs": [
+          "s02-baseline-r1.json",
+          "s02-baseline-r2.json",
+          "s03-baseline-r1.json",
+          "s03-baseline-r2.json",
+          "s06-baseline-r1.json",
+          "s06-baseline-r2.json"
+        ],
+        "metrics": {
+          "output_tokens_per_s": {
+            "median": 4851.685364222017,
+            "min": 4705.930931711527,
+            "max": 5073.207912760425,
+            "values": [
+              4705.930931711527,
+              4929.984525285242,
+              4878.474634187932,
+              4739.307105956148,
+              4824.896094256102,
+              5073.207912760425
+            ]
+          },
+          "ttft_p50_s": {
+            "median": 152.8327837586403,
+            "min": 85.58556064963341,
+            "max": 164.95463252067566,
+            "values": [
+              164.95463252067566,
+              122.73160181939602,
+              144.29360628128052,
+              164.93008844554424,
+              161.37196123600006,
+              85.58556064963341
+            ]
+          },
+          "tpot_p50_s": {
+            "median": 10.884457075643162,
+            "min": 10.553922119831283,
+            "max": 11.243201496582182,
+            "values": [
+              10.976878216578848,
+              10.991879428426424,
+              10.615537800486127,
+              10.553922119831283,
+              10.792035934707476,
+              11.243201496582182
+            ]
+          }
+        }
+      },
+      "relative_percent": {
+        "output_tokens_per_s": 4.4129350478232965,
+        "ttft_p50_s": 6.501845256263272,
+        "tpot_p50_s": -8.526218260583995
+      }
+    },
+    "decode-steady-16-512": {
+      "light-vllm": {
+        "runs": [
+          "s01-decode-steady-r1.json",
+          "s01-decode-steady-r2.json",
+          "s04-decode-steady-r1.json",
+          "s04-decode-steady-r2.json",
+          "s05-decode-steady-r1.json",
+          "s05-decode-steady-r2.json"
+        ],
+        "metrics": {
+          "output_tokens_per_s": {
+            "median": 1903.0534953436606,
+            "min": 1861.5525613639688,
+            "max": 1969.6396890162962,
+            "values": [
+              1902.4638416731623,
+              1903.643149014159,
+              1861.5525613639688,
+              1892.4280696489468,
+              1969.6396890162962,
+              1967.5919501040134
+            ]
+          },
+          "ttft_p50_s": {
+            "median": 34.68582034111023,
+            "min": 26.10759809613228,
+            "max": 75.42256824672222,
+            "values": [
+              49.079954624176025,
+              75.42256824672222,
+              38.866810500621796,
+              26.96816436946392,
+              26.10759809613228,
+              30.504830181598663
+            ]
+          },
+          "tpot_p50_s": {
+            "median": 8.289831794375543,
+            "min": 8.084232960836761,
+            "max": 8.531483170920858,
+            "values": [
+              8.317600833634808,
+              8.262062755116277,
+              8.531483170920858,
+              8.412292318276462,
+              8.084509066085525,
+              8.084232960836761
+            ]
+          }
+        }
+      },
+      "vllm": {
+        "runs": [
+          "s02-decode-steady-r1.json",
+          "s02-decode-steady-r2.json",
+          "s03-decode-steady-r1.json",
+          "s03-decode-steady-r2.json",
+          "s06-decode-steady-r1.json",
+          "s06-decode-steady-r2.json"
+        ],
+        "metrics": {
+          "output_tokens_per_s": {
+            "median": 1524.3961363080443,
+            "min": 1487.3328605743536,
+            "max": 1561.721531676958,
+            "values": [
+              1561.721531676958,
+              1487.3328605743536,
+              1513.4114572694923,
+              1501.824500475199,
+              1538.6950256920832,
+              1535.3808153465966
+            ]
+          },
+          "ttft_p50_s": {
+            "median": 71.60387933254242,
+            "min": 44.07499171793461,
+            "max": 102.5377381592989,
+            "values": [
+              61.66127137839794,
+              102.5377381592989,
+              44.07499171793461,
+              78.79018597304821,
+              64.41757269203663,
+              87.35569380223751
+            ]
+          },
+          "tpot_p50_s": {
+            "median": 10.395690948208484,
+            "min": 10.140638474061532,
+            "max": 10.573119172961277,
+            "values": [
+              10.140638474061532,
+              10.573119172961277,
+              10.503819471119435,
+              10.516185995096563,
+              10.287562425297534,
+              10.265253692019709
+            ]
+          }
+        }
+      },
+      "relative_percent": {
+        "output_tokens_per_s": 24.839826736421134,
+        "ttft_p50_s": -51.55874141955006,
+        "tpot_p50_s": -20.25703884738753
+      }
+    }
+  },
+  "output_stability": {
+    "baseline-256-64": {
+      "light-vllm": {
+        "run_pairs": 15,
+        "exact_output_pairs": 15,
+        "exact_request_percent": {
+          "median": 100.0,
+          "min": 100.0,
+          "max": 100.0
+        },
+        "matching_token_percent": {
+          "median": 100.0,
+          "min": 100.0,
+          "max": 100.0
+        },
+        "distinct_output_maps": 1
+      },
+      "vllm": {
+        "run_pairs": 15,
+        "exact_output_pairs": 15,
+        "exact_request_percent": {
+          "median": 100.0,
+          "min": 100.0,
+          "max": 100.0
+        },
+        "matching_token_percent": {
+          "median": 100.0,
+          "min": 100.0,
+          "max": 100.0
+        },
+        "distinct_output_maps": 1
+      }
+    },
+    "decode-steady-16-512": {
+      "light-vllm": {
+        "run_pairs": 15,
+        "exact_output_pairs": 15,
+        "exact_request_percent": {
+          "median": 100.0,
+          "min": 100.0,
+          "max": 100.0
+        },
+        "matching_token_percent": {
+          "median": 100.0,
+          "min": 100.0,
+          "max": 100.0
+        },
+        "distinct_output_maps": 1
+      },
+      "vllm": {
+        "run_pairs": 15,
+        "exact_output_pairs": 1,
+        "exact_request_percent": {
+          "median": 37.5,
+          "min": 25.0,
+          "max": 100.0
+        },
+        "matching_token_percent": {
+          "median": 59.43603515625,
+          "min": 53.22265625,
+          "max": 100.0
+        },
+        "distinct_output_maps": 5
+      }
+    }
+  },
+  "output_comparison": {
+    "baseline-256-64": {
+      "run_pairs": 36,
+      "exact_output_pairs": 36,
+      "exact_request_percent": {
+        "median": 100.0,
+        "min": 100.0,
+        "max": 100.0
+      },
+      "matching_token_percent": {
+        "median": 100.0,
+        "min": 100.0,
+        "max": 100.0
+      }
+    },
+    "decode-steady-16-512": {
+      "run_pairs": 36,
+      "exact_output_pairs": 0,
+      "exact_request_percent": {
+        "median": 25.0,
+        "min": 18.75,
+        "max": 31.25
+      },
+      "matching_token_percent": {
+        "median": 30.712890625,
+        "min": 24.93896484375,
+        "max": 36.48681640625
+      }
+    }
+  }
+}

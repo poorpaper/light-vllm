@@ -1,0 +1,120 @@
+{
+  "date": "2026-08-27",
+  "implementation_base": "349787c",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "gpu_count_used": 1,
+    "gpu_memory_mib": 32607
+  },
+  "software": {
+    "python": "3.12",
+    "torch": "2.11.0+cu130",
+    "vllm": "0.26.0",
+    "transformers": "4.57.6"
+  },
+  "checkpoint": {
+    "dense": "Qwen2.5-0.5B-Instruct",
+    "quantization": "AWQ W4A16",
+    "activation_dtype": "float16",
+    "group_size": 128,
+    "calibration_samples": 16,
+    "calibration_sequence_length": 256,
+    "calibration_tokens": 4096,
+    "scale_search_steps": 20,
+    "clip_search_steps": 20,
+    "seed": 17,
+    "quantized_linears": 168,
+    "dense_directory_mb": 954,
+    "awq_directory_mb": 449
+  },
+  "model_validation": {
+    "prompt_tokens": 10,
+    "dense_next_token_id": 576,
+    "awq_next_token_id": 576,
+    "logits_cosine_similarity": 0.9465143085,
+    "logits_mean_abs_error": 0.9679625630,
+    "logits_max_abs_error": 5.7114257813,
+    "dense_model_memory_mib": 950.1665,
+    "awq_model_memory_mib": 454.6074,
+    "awq_to_dense_memory_ratio": 0.4784502716
+  },
+  "quality_validation": {
+    "dataset": "WikiText-2 test from pytorch/examples",
+    "dataset_sha256": "d790b833ef8cf03a90db7bf1271b7520b83c45ce07ba3c1a9699df81e239eca0",
+    "samples": 8,
+    "sequence_length": 256,
+    "next_token_targets": 2040,
+    "token_ids_sha256": "6d74ca2b362ae54b097ef5d49f951b2b3cdadf4e8baabce4b03259dd74444a8f",
+    "dense_mean_nll": 3.2136996999,
+    "dense_perplexity": 24.8709312009,
+    "awq_mean_nll": 3.3137647442,
+    "awq_perplexity": 27.4884177762,
+    "perplexity_delta_percent": 10.5242805514
+  },
+  "kernel_microbenchmark": {
+    "shape": "K=N=3584",
+    "baseline": "vLLM legacy awq_gemm/awq_dequantize, not Marlin",
+    "median_latency_ms": {
+      "m1": {"light_vllm": 0.025424, "vllm": 0.025504},
+      "m8": {"light_vllm": 0.025040, "vllm": 0.025600},
+      "m64": {"light_vllm": 0.033168, "vllm": 0.033632},
+      "m256": {"light_vllm": 0.122400, "vllm": 0.125168}
+    }
+  },
+  "service_benchmark": {
+    "baseline": "vLLM 0.26 eager with auto-selected Marlin",
+    "matched_prefix_cache": true,
+    "burst_64_256_to_64": {
+      "statistic": "median of six runs per system, with vLLM runs bracketing light-vllm",
+      "light_vllm_output_tokens_per_s": 5014.154295,
+      "vllm_output_tokens_per_s": 4835.254429,
+      "light_vs_vllm_percent": 3.699906,
+      "light_vllm_ttft_p50_ms": 110.361442,
+      "vllm_ttft_p50_ms": 167.011775,
+      "light_vllm_tpot_p50_ms": 10.726871,
+      "vllm_tpot_p50_ms": 10.644817,
+      "light_vllm_worst_max_itl_ms": 56.253139,
+      "vllm_worst_max_itl_ms": 37.038498,
+      "greedy_output_requests_compared": 64,
+      "greedy_output_mismatches": 0
+    },
+    "burst_16_16_to_512": {
+      "light_vllm_output_tokens_per_s": 1880.927253,
+      "vllm_output_tokens_per_s": 1529.489056,
+      "light_vs_vllm_percent": 22.977,
+      "light_vllm_ttft_p50_ms": 57.6617,
+      "vllm_ttft_p50_ms": 102.7428,
+      "light_vllm_tpot_p50_ms": 8.3975,
+      "vllm_tpot_p50_ms": 10.2762
+    }
+  },
+  "runtime_optimization": {
+    "startup_warmup": {
+      "cold_step_host_ms": 229.859,
+      "cold_step_cuda_ms": 2.001,
+      "cold_aten_mm_host_ms": 171.523,
+      "warmed_step_host_ms": 6.943,
+      "warmed_step_cuda_ms": 1.985,
+      "first_request_after_ready_ttft_ms": 18.701706
+    },
+    "full_gc_profile": {
+      "engine_child_generation_2_ms": 129.038316,
+      "engine_child_adjacent_step_gap_ms": 131.32,
+      "http_parent_generation_2_ms": 140.148513,
+      "http_parent_observed_max_itl_ms": 162.257936
+    },
+    "before_after_six_run": {
+      "before_throughput_median": 4877.286631,
+      "after_throughput_median": 5014.154295,
+      "throughput_delta_percent": 2.806226,
+      "before_worst_max_itl_ms": 197.881255,
+      "after_worst_max_itl_ms": 56.253139,
+      "worst_max_itl_delta_percent": -71.572275
+    }
+  },
+  "first_stage_acceptance_status": "complete",
+  "deferred_later_stage_validation": [
+    "real-checkpoint TP=1/2 CUDA comparison when both GPUs are free",
+    "Docker image build on a host with Docker"
+  ]
+}

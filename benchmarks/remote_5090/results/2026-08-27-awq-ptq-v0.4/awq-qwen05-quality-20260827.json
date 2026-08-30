@@ -1,0 +1,54 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "prompt_tokens": 10,
+  "dense": {
+    "model": "/root/autodl-tmp/models/Qwen2.5-0.5B-Instruct",
+    "next_token_id": 576,
+    "next_token_text": " The",
+    "load_seconds": 0.7596749179065228,
+    "first_forward_ms": 472.8837890625,
+    "forward_ms_median": 14.620879650115967,
+    "model_memory_mib": 950.16650390625,
+    "peak_memory_mib": 966.05908203125,
+    "quality": {
+      "tokens": 2040,
+      "mean_nll": 3.2136996998506433,
+      "perplexity": 24.870931200851576
+    }
+  },
+  "awq": {
+    "model": "/root/autodl-tmp/models/Qwen2.5-0.5B-Instruct-light-vllm-AWQ-ptq-v2",
+    "backend": "cuda",
+    "tensor_parallel_size": 1,
+    "next_token_id": 576,
+    "next_token_text": " The",
+    "load_seconds": 0.25153565406799316,
+    "first_forward_ms": 481.0550842285156,
+    "forward_ms_median": 11.443024158477783,
+    "model_memory_mib": 454.607421875,
+    "peak_memory_mib": 706.654296875,
+    "quality": {
+      "tokens": 2040,
+      "mean_nll": 3.3137647441789215,
+      "perplexity": 27.488417776163836
+    }
+  },
+  "evaluation": {
+    "source": "/root/autodl-tmp/wikitext-2-test-pytorch-examples-20260827.txt",
+    "samples": 8,
+    "sequence_length": 256,
+    "input_tokens": 2048,
+    "token_ids_sha256": "6d74ca2b362ae54b097ef5d49f951b2b3cdadf4e8baabce4b03259dd74444a8f"
+  },
+  "quality_comparison": {
+    "perplexity_delta": 2.6174865753122596,
+    "perplexity_delta_percent": 10.524280551355613
+  },
+  "comparison": {
+    "top1_equal": true,
+    "logits_mean_abs_error": 0.9679625630378723,
+    "logits_max_abs_error": 5.71142578125,
+    "logits_cosine_similarity": 0.9465143084526062,
+    "model_memory_ratio": 0.4784502716166626
+  }
+}

@@ -21,7 +21,9 @@ from light_vllm.runtime.execution.interfaces import (
     ExecutionLease,
     ExecutionNotReadyError,
     ExecutionOutput,
+    ExecutionRequest,
     ExecutionTimer,
+    ModelExecutor,
     ModelWorker,
     TokenExecutionSession,
 )
@@ -168,3 +170,77 @@ class LocalModelExecutor:
             num_model_tokens_computed=output.num_model_tokens_computed,
             step_elapsed_seconds=elapsed_seconds,
         )
+
+
+def warmup_model_executor(
+    executor: ModelExecutor,
+    *,
+    max_num_scheduled_tokens: int,
+    block_size: int | None,
+) -> None:
+    """在服务 ready 前复用真实执行链路预热常用 CUDA kernel。"""
+
+    if type(max_num_scheduled_tokens) is not int or max_num_scheduled_tokens <= 0:
+        raise ValueError("max_num_scheduled_tokens must be a positive integer")
+    if block_size is not None and (type(block_size) is not int or block_size <= 0):
+        raise ValueError("block_size must be a positive integer")
+
+    capabilities = executor.capabilities
+    limits = [256, max_num_scheduled_tokens]
+    if capabilities.max_model_tokens is not None:
+        limits.append(capabilities.max_model_tokens - 1)
+    if capabilities.max_kv_cache_tokens is not None:
+        limits.append(capabilities.max_kv_cache_tokens - 1)
+    prefill_tokens = max(0, min(limits))
+    capacity = prefill_tokens + 1
+
+    prefill_blocks = None
+    decode_blocks = None
+    if block_size is not None:
+        num_prefill_blocks = (prefill_tokens + block_size - 1) // block_size
+        num_decode_blocks = (capacity + block_size - 1) // block_size
+        prefill_blocks = tuple(range(num_prefill_blocks))
+        decode_blocks = tuple(range(num_decode_blocks))
+
+    # 先走一轮有界 prefill，再走一轮单 token decode；这同时覆盖大矩阵、
+    # 小 batch 量化 GEMM、attention、LM head 和采样，不需要识别具体模型或量化方式。
+    request_id = "__light_vllm_startup_warmup__"
+    executor.add_request(request_id, capacity=capacity)
+    lease = None
+    try:
+        lease = executor.acquire((request_id,))
+        if prefill_tokens:
+            executor.execute(
+                ExecutionBatch(
+                    requests=(
+                        ExecutionRequest(
+                            request_id=request_id,
+                            input_token_ids=(0,) * prefill_tokens,
+                            context_token_ids=None,
+                            num_computed_tokens=0,
+                            num_lookahead_tokens=0,
+                            max_output_tokens=0,
+                            block_ids=prefill_blocks,
+                        ),
+                    )
+                )
+            )
+        executor.execute(
+            ExecutionBatch(
+                requests=(
+                    ExecutionRequest(
+                        request_id=request_id,
+                        input_token_ids=(0,),
+                        context_token_ids=None,
+                        num_computed_tokens=prefill_tokens,
+                        num_lookahead_tokens=0,
+                        max_output_tokens=1,
+                        block_ids=decode_blocks,
+                    ),
+                )
+            )
+        )
+    finally:
+        if lease is not None:
+            lease.release()
+        executor.free_request(request_id)

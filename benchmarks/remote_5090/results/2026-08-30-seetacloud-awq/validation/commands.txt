@@ -1,0 +1,20 @@
+# CUDA validation candidate: c54cfdef3b96d99b6465d0109f6b88cdf213fcef
+# Git status: clean
+cd /root/awq-validation-20260830/repo
+export PATH=/root/autodl-tmp/conda-envs/vllm/bin:/usr/local/cuda-12.8/bin:$PATH
+export CUDA_HOME=/usr/local/cuda-12.8
+export PYTHON=/root/autodl-tmp/conda-envs/light-awq/bin/python
+export PYTHONPATH=/root/awq-validation-20260830/repo/src
+export TORCH_EXTENSIONS_DIR=/root/awq-validation-20260830/validation/torch_extensions
+export TRITON_CACHE_DIR=/root/awq-validation-20260830/validation/triton_cache
+export XDG_CACHE_HOME=/root/awq-validation-20260830/validation/cache
+export TMPDIR=/root/awq-validation-20260830/validation/tmp
+
+$PYTHON -m pytest 2>&1 | tee /root/awq-validation-20260830/validation/pytest.log
+ruff check . 2>&1 | tee /root/awq-validation-20260830/validation/ruff-check.log
+ruff format --check . 2>&1 | tee /root/awq-validation-20260830/validation/ruff-format.log
+git diff --check 2>&1 | tee /root/awq-validation-20260830/validation/git-diff-check.log
+$PYTHON benchmarks/remote_5090/validate_awq_checkpoint.py --model /root/autodl-tmp/models/Qwen2.5-0.5B-Instruct-light-vllm-AWQ-ptq-v2 --dense-model /root/autodl-tmp/models/Qwen2.5-0.5B-Instruct --output /root/awq-validation-20260830/validation/checkpoint.json 2>&1 | tee /root/awq-validation-20260830/validation/checkpoint.log
+$PYTHON benchmarks/remote_5090/benchmark_awq_kernels.py --output /root/awq-validation-20260830/validation/kernel.json 2>&1 | tee /root/awq-validation-20260830/validation/kernel.log
+
+# Every pipeline exit code was captured from PIPESTATUS[0]; all six were 0.

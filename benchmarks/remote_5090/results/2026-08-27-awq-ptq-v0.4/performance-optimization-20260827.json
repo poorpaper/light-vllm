@@ -1,0 +1,81 @@
+{
+  "date": "2026-08-27",
+  "gpu": "physical GPU1, NVIDIA GeForce RTX 5090",
+  "model": "Qwen2.5-0.5B-Instruct AWQ W4A16",
+  "workload": "burst, 64 requests, 256 input tokens, 64 output tokens",
+  "common_conditions": {
+    "dtype": "float16",
+    "eager": true,
+    "prefix_cache": true,
+    "kv_block_size": 16,
+    "kv_token_capacity": 65536,
+    "max_num_sequences": 64,
+    "max_num_scheduled_tokens": 32768
+  },
+  "light_vllm_final": {
+    "runs": 6,
+    "throughput_tokens_per_s": [
+      4783.198098,
+      5231.803376,
+      5022.991434,
+      5187.965102,
+      4994.600768,
+      5005.317156
+    ],
+    "throughput_median": 5014.154295,
+    "ttft_p50_median_ms": 110.361442,
+    "tpot_p50_median_ms": 10.726871,
+    "worst_max_itl_ms": 56.253139,
+    "first_request_after_ready_ttft_ms": 18.701706
+  },
+  "vllm_0_26_marlin": {
+    "runs": 6,
+    "placement": "three runs before and three runs after the final light-vllm candidate",
+    "throughput_tokens_per_s": [
+      4589.071227,
+      4832.816738,
+      4837.692120,
+      4673.315724,
+      4852.436122,
+      4891.343339
+    ],
+    "throughput_median": 4835.254429,
+    "ttft_p50_median_ms": 167.011775,
+    "tpot_p50_median_ms": 10.644817,
+    "worst_max_itl_ms": 37.038498
+  },
+  "light_vs_vllm": {
+    "throughput_delta_percent": 3.699906,
+    "ttft_p50_delta_percent": -33.919970,
+    "tpot_p50_delta_percent": 0.770828,
+    "greedy_output_requests_compared": 64,
+    "greedy_output_mismatches": 0
+  },
+  "profile_evidence": {
+    "cold_model_step": {
+      "host_ms": 229.859,
+      "cuda_ms": 2.001,
+      "aten_mm_host_ms": 171.523
+    },
+    "warmed_model_step": {
+      "host_ms": 6.943,
+      "cuda_ms": 1.985
+    },
+    "engine_child_generation_2_gc_ms": 129.038316,
+    "engine_child_adjacent_step_gap_ms": 131.32,
+    "http_parent_generation_2_gc_ms": 140.148513,
+    "http_parent_observed_max_itl_ms": 162.257936,
+    "conclusion": "startup warmup removes first-use host loading; freezing each independent serving process startup heap removes the reproduced full-GC pauses"
+  },
+  "before_after": {
+    "before_runs": 6,
+    "before_throughput_median": 4877.286631,
+    "before_worst_max_itl_ms": 197.881255,
+    "after_runs": 6,
+    "after_throughput_median": 5014.154295,
+    "after_worst_max_itl_ms": 56.253139,
+    "throughput_delta_percent": 2.806226,
+    "worst_max_itl_delta_percent": -71.572275
+  },
+  "raw_artifact_directory": "final-ab"
+}
