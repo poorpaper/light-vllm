@@ -11,11 +11,9 @@ from torch import Tensor, nn
 
 from light_vllm.modeling.quantization.dense import DenseLinearMethod
 from light_vllm.modeling.quantization.interfaces import (
-    ColumnParallelLayer,
     DirectLinear,
     LinearOperation,
     PreparedLinear,
-    RowParallelLayer,
 )
 from light_vllm.modeling.tensor_parallel import (
     ColumnParallelLinear,
@@ -567,7 +565,7 @@ class AWQLinearMethod:
         output_partition: TensorPartition | None = None,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> ColumnParallelLayer:
+    ) -> nn.Module:
         if self.config.skips(prefix):
             return self._dense.create_column(
                 in_features,
@@ -602,7 +600,7 @@ class AWQLinearMethod:
         bias: bool = True,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> RowParallelLayer:
+    ) -> nn.Module:
         if self.config.skips(prefix):
             return self._dense.create_row(
                 in_features,

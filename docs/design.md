@@ -187,7 +187,8 @@ AllGather 恢复完整 logits。KV head 数不少于 TP 时按 head 切分；少
 通用加载本 Rank packed tensor，不识别 Qwen 参数名。权重加载完成后，`prepare_for_inference()` 把各层变成已经
 固定的 `PreparedLinear`；AWQ 的 Torch/CUDA Scheme 也只在这里选择一次，生成热路径不再判断量化名或 backend。
 融合后的子层 buffer 会重绑到同一块 packed storage view，模型不会同时常驻融合前、融合后两份 INT4 权重。
-`LinearMethod.create_row()` 直接承诺返回可执行 output reduction 的行并行层，Qwen 不再通过类型强转猜测该能力；
+`LinearMethod.create_*()` 只返回可注册参数的 `nn.Module`；Qwen 在构造期另外验证行并行 output reduction 能力，
+不再通过类型强转猜测；
 不解析 checkpoint 量化元数据的 init/state-dict loader 对显式量化选择直接报错，避免静默回退 Dense。
 
 离线 PTQ 是独立入口，不进入在线 Engine：`JSONL 文本 → tokenizer → 固定校准 token → 首层输入捕获 → 逐层

@@ -256,8 +256,8 @@ PyTorch Paged Attention 是物理分页正确性基线；首版 Triton backend �
     必须直接拒绝，不能静默构造 Dense 模型；Dense 和 TP>1 必须继续使用同一模型 forward。
 50. `LinearMethod` 负责创建 checkpoint 参数布局和准备本地/融合算子；具体 AWQ kernel 只通过 `AWQScheme` 接入。
     Scheme 必须在模型 `prepare_for_inference()` 阶段选定，逐 token 热路径不得重复查询 backend、GPU capability 或
-    checkpoint metadata。`create_row()` 返回的稳定契约必须直接包含 TP output reduction，模型不得用类型强转掩盖
-    缺失能力。
+    checkpoint metadata。`create_*()` 必须返回可注册参数的 `nn.Module`；需要 TP output reduction 的模型还必须
+    在构造期验证行并行能力，不得用类型强转掩盖缺失能力。
 51. 量化并行层必须像 Dense 并行层一样声明 `checkpoint_shards`。列并行按 packed 输出维切分，行并行按输入维和
     group 切分；loader 只消费切片事实，不得出现 Qwen 参数名或量化格式专用 TP 条件树。
 52. Qwen 继续拥有 QKV 与 Gate/Up 的语义融合。量化层准备融合权重后，子层必须重绑为同一 packed storage 的 view，

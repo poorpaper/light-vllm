@@ -53,15 +53,6 @@ class QuantizationMethodFactory(Protocol):
 
 
 @runtime_checkable
-class ColumnParallelLayer(Protocol):
-    """Qwen 需要的列并行 Linear 最小能力。"""
-
-    def __call__(self, inputs: Tensor) -> Tensor: ...
-
-    def gather_output(self, local_output: Tensor) -> Tensor: ...
-
-
-@runtime_checkable
 class RowParallelLayer(Protocol):
     """Qwen 需要的行并行 Linear 最小能力。"""
 
@@ -73,9 +64,10 @@ class RowParallelLayer(Protocol):
 class LinearMethod(Protocol):
     """创建和准备模型 Linear 的可替换策略。
 
-    ``create_*`` 决定参数如何保存在 ``state_dict`` 中；``prepare_*`` 决定推理时
-    使用直接 Dense GEMM 还是打包量化 kernel。两个阶段由同一对象负责，避免
-    loader 根据具体模型参数名维护条件树。
+    ``create_*`` 必须返回 ``nn.Module``，让参数进入父模型的 ``state_dict``；
+    ``prepare_*`` 决定推理时使用直接 Dense GEMM 还是打包量化 kernel。两个阶段
+    由同一对象负责，避免 loader 根据具体模型参数名维护条件树。行并行 reduction
+    是额外的运行时能力，由使用它的模型按 ``RowParallelLayer`` 检查。
     """
 
     def create_column(
@@ -90,7 +82,7 @@ class LinearMethod(Protocol):
         output_partition: TensorPartition | None = None,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> ColumnParallelLayer: ...
+    ) -> nn.Module: ...
 
     def create_row(
         self,
@@ -102,7 +94,7 @@ class LinearMethod(Protocol):
         bias: bool = True,
         device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> RowParallelLayer: ...
+    ) -> nn.Module: ...
 
     def prepare_local(self, layer: nn.Module) -> PreparedLinear: ...
 

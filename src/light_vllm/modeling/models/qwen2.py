@@ -200,6 +200,8 @@ class Qwen2MLP(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        if not isinstance(self.gate_proj, nn.Module):
+            raise TypeError("LinearMethod.create_column must return torch.nn.Module")
         self.up_proj = linear_method.create_column(
             config.hidden_size,
             config.intermediate_size,
@@ -208,6 +210,8 @@ class Qwen2MLP(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        if not isinstance(self.up_proj, nn.Module):
+            raise TypeError("LinearMethod.create_column must return torch.nn.Module")
         self.down_proj = linear_method.create_row(
             config.intermediate_size,
             config.hidden_size,
@@ -216,6 +220,8 @@ class Qwen2MLP(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        if not isinstance(self.down_proj, nn.Module):
+            raise TypeError("LinearMethod.create_row must return torch.nn.Module")
         if not isinstance(self.down_proj, RowParallelLayer):
             raise TypeError("LinearMethod.create_row must return a row-parallel layer")
         self._needs_output_reduction = parallel.world_size > 1
@@ -317,6 +323,8 @@ class Qwen2Attention(nn.Module):
             bias=True,
             **factory_kwargs,
         )
+        if not isinstance(self.q_proj, nn.Module):
+            raise TypeError("LinearMethod.create_column must return torch.nn.Module")
         self.k_proj = linear_method.create_column(
             config.hidden_size,
             config.num_key_value_heads * config.head_size,
@@ -326,6 +334,8 @@ class Qwen2Attention(nn.Module):
             output_partition=kv_output_partition,
             **factory_kwargs,
         )
+        if not isinstance(self.k_proj, nn.Module):
+            raise TypeError("LinearMethod.create_column must return torch.nn.Module")
         self.v_proj = linear_method.create_column(
             config.hidden_size,
             config.num_key_value_heads * config.head_size,
@@ -335,6 +345,8 @@ class Qwen2Attention(nn.Module):
             output_partition=kv_output_partition,
             **factory_kwargs,
         )
+        if not isinstance(self.v_proj, nn.Module):
+            raise TypeError("LinearMethod.create_column must return torch.nn.Module")
         self.o_proj = linear_method.create_row(
             config.num_attention_heads * config.head_size,
             config.hidden_size,
@@ -343,6 +355,8 @@ class Qwen2Attention(nn.Module):
             bias=False,
             **factory_kwargs,
         )
+        if not isinstance(self.o_proj, nn.Module):
+            raise TypeError("LinearMethod.create_row must return torch.nn.Module")
         if not isinstance(self.o_proj, RowParallelLayer):
             raise TypeError("LinearMethod.create_row must return a row-parallel layer")
         self._needs_output_reduction = parallel.world_size > 1
